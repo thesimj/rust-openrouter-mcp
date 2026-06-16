@@ -1,40 +1,42 @@
 # rust-openrouter-mcp
 
-MCP (stdio) server for OpenRouter: chat with LLMs, generate images, and generate
-videos from a single Rust binary.
+MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
+single Rust binary. Discover models, generate and edit images (with parallel
+variants and a sidecar manifest), describe images with a vision model, and track
+per-process usage — all behind one `openrouter-mcp` executable.
 
-Version `0.0.1` is the first test slice. It starts the MCP server and exposes
-model discovery only, so agents can inspect OpenRouter models, capabilities, and
-pricing before generation tools are added.
+## Features
 
-## Current Features
-
-- MCP stdio server with a `list_models` tool.
-- CLI model browser with JSON or table output.
-- Server-side OpenRouter filters for query, modality, supported parameters,
-  sort order, and minimum context length.
-- Local search across model id, name, and description.
-- Pricing display for text, image, audio, and video model listings.
-
-## Planned Tools
-
-- `chat_completion` for OpenRouter text and vision models.
-- `generate_image` for text-to-image and image editing models.
-- `generate_video` and `get_video_status` for async video generation.
-- Audio, reranking, validation, and model-detail helpers.
+- **Model discovery** — `list_models` with server-side filters (modality,
+  supported params, sort, min context), local search, and pricing.
+- **Image generation** — `generate_image`: text-to-image, image editing /
+  image-to-image (multiple local inputs), and **parallel variants** (seed-stepped).
+  - The output format (PNG/JPEG) is **chosen by the provider** — it is sniffed
+    from the response and the file extension is set to match.
+  - Requested `aspect_ratio` / `image_size` are **verified** against the actual
+    decoded pixels; mismatches are surfaced as warnings.
+  - Every job writes a `*.manifest.json` sidecar (full settings, per-input and
+    per-variant metadata, cost, provider, timing).
+  - **Asynchronous**: if a job runs longer than `wait_seconds` (default 10) the
+    tool returns a `task_id`; poll `get_result` for completion.
+- **Image description** — `describe_image`: image → detailed text via any
+  vision-capable model (image input, text output).
+- **Usage stats** — `get_usage_stats` (read-only) and `reset_usage_stats`
+  (destructive, requires `confirm: true`): per-process request/cost counters with
+  a by-model breakdown.
 
 ## Install
-
-From crates.io, after publishing:
-
-```bash
-cargo install openrouter-mcp
-```
 
 From a local checkout:
 
 ```bash
 cargo install --path . --locked --force
+```
+
+From crates.io (once published):
+
+```bash
+cargo install openrouter-mcp
 ```
 
 ## Configuration
@@ -51,7 +53,7 @@ On PowerShell:
 $env:OPENROUTER_API_KEY = "sk-or-v1-..."
 ```
 
-A local `.env` file is also loaded if present:
+A local `.env` file is also loaded if present (real env vars take precedence):
 
 ```text
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -59,18 +61,15 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 Do not commit `.env`.
 
-## MCP Usage
+Optional: `OPENROUTER_IMAGE_MAX_DIMENSION` (default `800`) caps the longest side
+of input images before they are sent (downscaled to reduce request size/cost).
 
-Start the MCP stdio server:
+## MCP usage
 
-```bash
-openrouter-mcp
-```
-
-The explicit subcommand also works:
+Start the stdio server (`mcp` subcommand is implied when none is given):
 
 ```bash
-openrouter-mcp mcp
+openrouter-mcp        # or: openrouter-mcp mcp
 ```
 
 Example MCP client config:
@@ -80,88 +79,97 @@ Example MCP client config:
   "mcpServers": {
     "openrouter": {
       "command": "openrouter-mcp",
-      "env": {
-        "OPENROUTER_API_KEY": "sk-or-v1-..."
-      }
+      "env": { "OPENROUTER_API_KEY": "sk-or-v1-..." }
     }
   }
 }
 ```
 
-If your client already provides `OPENROUTER_API_KEY` in the process
-environment, the `env` block is optional.
+If the client already provides `OPENROUTER_API_KEY` in the environment, the `env`
+block is optional.
 
-## CLI Usage
+### MCP tools
 
-List popular text models as JSON:
+| Tool | Kind | Description |
+| --- | --- | --- |
+| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search). |
+| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. **No defaults** — `model`, `prompt`, `output`, `aspect_ratio`, `image_size`, and `image_only` must all be set. |
+| `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
+| `describe_image` | read-only | Describe local image(s) with a vision-capable model; returns text. |
+| `get_usage_stats` | read-only | In-memory request/cost counters with a by-model breakdown. |
+| `reset_usage_stats` | destructive | Reset all counters (`confirm: true` required). |
 
-```bash
-openrouter-mcp models
-```
+`generate_image` returns a lean result — saved paths, decoded width/height,
+requested vs. actual aspect/size, seeds, and a pointer to the sidecar manifest;
+the full per-variant detail lives in the manifest on disk.
 
-Show a table of recent OpenAI models:
+## CLI usage
+
+The same binary is a CLI. Subcommands: `models`, `image`, `describe`, `mcp`.
+
+Browse models:
 
 ```bash
 openrouter-mcp models --query openai --sort newest --table
-```
-
-List image-capable models:
-
-```bash
 openrouter-mcp models --output-modalities image --sort newest --table
-```
-
-Return every matching model instead of the first 20:
-
-```bash
+openrouter-mcp models --query openai --search codex
 openrouter-mcp models --query claude --all
 ```
 
-Useful filters:
+Generate an image:
 
 ```bash
-openrouter-mcp models --supported-parameters tools --min-context 128000
-openrouter-mcp models --input-modalities image --output-modalities text
-openrouter-mcp models --search codex
+openrouter-mcp image \
+  --model google/gemini-3.1-flash-image-preview \
+  --prompt "a photorealistic owl with one cybernetic eye, starry sky" \
+  --aspect-ratio 1:1 --image-size 1K --seed 1200 \
+  --output ./out/owl.png
 ```
 
-## MCP Tool
+Edit / image-to-image (repeatable `--image`, optional `label=path`):
 
-### `list_models`
+```bash
+openrouter-mcp image \
+  --model google/gemini-3.1-flash-image-preview \
+  --prompt "add a small wizard hat" \
+  --image ./out/owl.png \
+  --output ./out/owl-hat.png
+```
 
-Lists OpenRouter models with capabilities and pricing.
+Four parallel variants (files named `*-var-<seed>.<ext>` plus a manifest):
 
-Arguments:
+```bash
+openrouter-mcp image -m bytedance-seed/seedream-4.5 --image-only \
+  --prompt "a cute pixar-style baby dragon" \
+  --aspect-ratio 1:1 --image-size 1K --seed 1490 --variants 4 \
+  --output ./out/dragon.png
+```
 
-- `query`: server-side free-text search by model name or slug.
-- `search`: local case-insensitive search across id, name, and description.
-- `output_modalities`: comma-separated output modalities, such as `text`,
-  `image`, `audio`, `embeddings`, `video`, `rerank`, `speech`,
-  `transcription`, or `all`.
-- `input_modalities`: comma-separated input modalities, such as `text`,
-  `image`, `audio`, or `file`.
-- `supported_parameters`: comma-separated required parameters, such as `tools`,
-  `structured_outputs`, or `reasoning`.
-- `sort`: `pricing-low-to-high`, `pricing-high-to-low`,
-  `context-high-to-low`, `throughput-high-to-low`, `latency-low-to-high`,
-  `most-popular`, `top-weekly`, or `newest`.
-- `min_context`: minimum context length in tokens.
-- `all`: return all matching models. Defaults to `false`, which returns the
-  first 20.
+Describe an image:
+
+```bash
+openrouter-mcp describe -m google/gemini-2.5-flash-lite --image ./out/owl.png
+```
+
+The image format the provider returns is not guaranteed; the CLI corrects the
+saved file's extension to match what actually came back.
 
 ## Development
-
-Run the local checks:
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo package --allow-dirty
+cargo llvm-cov --summary-only        # coverage (cargo install cargo-llvm-cov)
 ```
 
-Run a live OpenRouter smoke test:
+Live smoke tests (require `OPENROUTER_API_KEY`):
 
 ```bash
 cargo run -- models --query openai --sort newest --table
+cargo run -- describe -m google/gemini-2.5-flash-lite --image ./some.png
 ```
+
+## License
+
+Licensed under either of MIT or Apache-2.0, at your option.
