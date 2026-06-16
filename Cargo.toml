@@ -1,13 +1,13 @@
 [package]
 name = "openrouter-mcp"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "MCP stdio server for OpenRouter chat, image, and video generation"
+description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
 repository = "https://github.com/nbubelich/openrouter-mcp"
 readme = "README.md"
-keywords = ["mcp", "openrouter", "llm", "image-generation", "video"]
+keywords = ["mcp", "openrouter", "llm", "image-generation", "vision"]
 categories = ["api-bindings", "command-line-utilities"]
 include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**"]
 
@@ -25,3 +25,13 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+# Test-only HTTP mock server for exercising the OpenRouter client and MCP tool
+# without hitting the live API. Not shipped to users (dev-dependencies are
+# excluded from `cargo install` and the published crate).
+wiremock = "0.6"
