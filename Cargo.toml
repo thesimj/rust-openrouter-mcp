@@ -5,11 +5,20 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
-repository = "https://github.com/nbubelich/openrouter-mcp"
+authors = ["Nick Bubelich <n+github@bubelich.com>"]
+repository = "https://github.com/thesimj/rust-openrouter-mcp"
+homepage = "https://github.com/thesimj/rust-openrouter-mcp"
 readme = "README.md"
 keywords = ["mcp", "openrouter", "llm", "image-generation", "vision"]
 categories = ["api-bindings", "command-line-utilities"]
-include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+    "src/**",
+]
 
 [[bin]]
 name = "openrouter-mcp"
