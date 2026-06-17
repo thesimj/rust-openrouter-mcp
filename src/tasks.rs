@@ -14,10 +14,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-/// What a task produces. `Video` is reserved for the upcoming video phase, which
-/// reuses this registry.
+/// What a task produces. Video reuses this same async registry.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub enum TaskKind {
     Image,
     Video,

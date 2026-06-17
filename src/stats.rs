@@ -15,6 +15,8 @@ use tokio::sync::Mutex;
 struct ModelStats {
     requests: u64,
     images_generated: u64,
+    videos_generated: u64,
+    audio_files: u64,
     actual_cost_usd: f64,
     unknown_cost_count: u64,
 }
@@ -26,6 +28,10 @@ struct Inner {
     image_generations: u64,
     images_generated: u64,
     text_generations: u64,
+    video_generations: u64,
+    videos_generated: u64,
+    audio_generations: u64,
+    audio_files: u64,
     actual_cost_usd: f64,
     unknown_cost_count: u64,
     by_model: BTreeMap<String, ModelStats>,
@@ -40,6 +46,10 @@ impl Inner {
             image_generations: 0,
             images_generated: 0,
             text_generations: 0,
+            video_generations: 0,
+            videos_generated: 0,
+            audio_generations: 0,
+            audio_files: 0,
             actual_cost_usd: 0.0,
             unknown_cost_count: 0,
             by_model: BTreeMap::new(),
@@ -119,6 +129,57 @@ impl UsageStats {
         }
     }
 
+    /// Record one finished video generation. `success` is false when the job
+    /// produced no clip; `cost` is the reported USD `usage.cost`, if any.
+    pub async fn record_video(&self, model: &str, success: bool, cost: Option<f64>) {
+        let mut s = self.inner.lock().await;
+        s.requests_total += 1;
+        s.video_generations += 1;
+        if !success {
+            s.requests_failed += 1;
+            s.by_model.entry(model.to_string()).or_default().requests += 1;
+            return;
+        }
+        s.videos_generated += 1;
+        match cost {
+            Some(c) => s.actual_cost_usd += c,
+            None => s.unknown_cost_count += 1,
+        }
+        let m = s.by_model.entry(model.to_string()).or_default();
+        m.requests += 1;
+        m.videos_generated += 1;
+        match cost {
+            Some(c) => m.actual_cost_usd += c,
+            None => m.unknown_cost_count += 1,
+        }
+    }
+
+    /// Record one finished text-to-speech request. `cost` is typically `None`
+    /// (the speech endpoint returns no inline usage.cost), so it lands in
+    /// `unknown_cost_count`.
+    pub async fn record_audio(&self, model: &str, success: bool, cost: Option<f64>) {
+        let mut s = self.inner.lock().await;
+        s.requests_total += 1;
+        s.audio_generations += 1;
+        if !success {
+            s.requests_failed += 1;
+            s.by_model.entry(model.to_string()).or_default().requests += 1;
+            return;
+        }
+        s.audio_files += 1;
+        match cost {
+            Some(c) => s.actual_cost_usd += c,
+            None => s.unknown_cost_count += 1,
+        }
+        let m = s.by_model.entry(model.to_string()).or_default();
+        m.requests += 1;
+        m.audio_files += 1;
+        match cost {
+            Some(c) => m.actual_cost_usd += c,
+            None => m.unknown_cost_count += 1,
+        }
+    }
+
     /// A JSON snapshot of the current counters.
     pub async fn snapshot(&self) -> Value {
         let s = self.inner.lock().await;
@@ -132,6 +193,8 @@ impl UsageStats {
                     json!({
                         "requests": v.requests,
                         "images_generated": v.images_generated,
+                        "videos_generated": v.videos_generated,
+                        "audio_files": v.audio_files,
                         "actual_cost_usd": round4(v.actual_cost_usd),
                         "unknown_cost_count": v.unknown_cost_count,
                     }),
@@ -146,6 +209,10 @@ impl UsageStats {
             "image_generations": s.image_generations,
             "images_generated": s.images_generated,
             "text_generations": s.text_generations,
+            "video_generations": s.video_generations,
+            "videos_generated": s.videos_generated,
+            "audio_generations": s.audio_generations,
+            "audio_files": s.audio_files,
             "actual_cost_usd": round4(s.actual_cost_usd),
             "unknown_cost_count": s.unknown_cost_count,
             "by_model": by_model,

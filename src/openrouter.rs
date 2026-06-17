@@ -308,6 +308,248 @@ impl OpenRouterClient {
     }
 }
 
+impl OpenRouterClient {
+    /// `POST /api/v1/videos` - submit an asynchronous video-generation job. This
+    /// is **not** the chat endpoint: it returns `202` with a job id to poll. On a
+    /// non-2xx status the upstream error body is surfaced verbatim.
+    pub async fn submit_video(&self, req: &VideoSubmitBody) -> Result<VideoSubmitResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/videos", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(req)
+            .send()
+            .await
+            .context("request to OpenRouter /videos failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("OpenRouter /videos returned {status}: {body}");
+        }
+        let parsed: VideoSubmitResponse = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter /videos submit response")?;
+        Ok(parsed)
+    }
+
+    /// `GET /api/v1/videos/{id}` - poll a submitted video job for its status and,
+    /// once complete, the (unsigned) download URLs and usage.
+    pub async fn poll_video(&self, job_id: &str) -> Result<VideoPollResponse> {
+        let resp = self
+            .http
+            .get(format!("{}/videos/{job_id}", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /videos/{id} failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("OpenRouter /videos/{job_id} returned {status}: {body}");
+        }
+        let parsed: VideoPollResponse = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter /videos/{id} response")?;
+        Ok(parsed)
+    }
+
+    /// `GET /api/v1/videos/{id}/content?index=N` - download one generated clip.
+    /// Returns `(content_type, bytes)`; the content type (e.g. `video/mp4`) is
+    /// used to choose the file extension.
+    pub async fn download_video(&self, job_id: &str, index: usize) -> Result<(String, Vec<u8>)> {
+        let resp = self
+            .http
+            .get(format!("{}/videos/{job_id}/content", self.base_url))
+            .query(&[("index", index.to_string())])
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /videos/{id}/content failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("OpenRouter /videos/{job_id}/content returned {status}: {body}");
+        }
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| "video/mp4".to_string());
+        let bytes = resp
+            .bytes()
+            .await
+            .context("failed to read video content bytes")?
+            .to_vec();
+        Ok((content_type, bytes))
+    }
+
+    /// `POST /api/v1/audio/speech` - synchronous text-to-speech. Returns the raw
+    /// audio bytes (OpenAI-Speech-compatible), the content type, and the
+    /// `X-Generation-Id` header when present. On a non-2xx status the upstream
+    /// error body is surfaced verbatim.
+    pub async fn speech(&self, req: &SpeechBody) -> Result<SpeechResult> {
+        let resp = self
+            .http
+            .post(format!("{}/audio/speech", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(req)
+            .send()
+            .await
+            .context("request to OpenRouter /audio/speech failed")?;
+
+        let generation_id = resp
+            .headers()
+            .get("x-generation-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("OpenRouter /audio/speech returned {status}: {body}");
+        }
+        let mime = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| "audio/mpeg".to_string());
+        let bytes = resp
+            .bytes()
+            .await
+            .context("failed to read speech audio bytes")?
+            .to_vec();
+        Ok(SpeechResult {
+            mime,
+            bytes,
+            generation_id,
+        })
+    }
+}
+
+/// Request body for `POST /api/v1/videos`. Optional fields are omitted when
+/// unset (named `*Body` to avoid colliding with the domain `video_gen` struct).
+#[derive(Debug, Serialize)]
+pub struct VideoSubmitBody {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frame_images: Vec<FrameImage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_references: Vec<InputReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+/// A first/last frame for image-to-video (`frame_type` is `first_frame` or
+/// `last_frame`), sent as a data-URL `image_url`.
+#[derive(Debug, Serialize)]
+pub struct FrameImage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub image_url: ImageUrl,
+    pub frame_type: String,
+}
+
+impl FrameImage {
+    pub fn new(image_url: ImageUrl, frame_type: String) -> Self {
+        Self {
+            kind: "image_url",
+            image_url,
+            frame_type,
+        }
+    }
+}
+
+/// A reference image for reference-to-video, sent as a data-URL `image_url`.
+#[derive(Debug, Serialize)]
+pub struct InputReference {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub image_url: ImageUrl,
+}
+
+impl InputReference {
+    pub fn new(image_url: ImageUrl) -> Self {
+        Self {
+            kind: "image_url",
+            image_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoSubmitResponse {
+    pub id: String,
+    // Captured for completeness; we poll by id rather than following these.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub polling_url: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoPollResponse {
+    #[allow(dead_code)]
+    pub id: String,
+    #[serde(default)]
+    pub generation_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub unsigned_urls: Vec<String>,
+    #[serde(default)]
+    pub usage: Option<VideoUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoUsage {
+    #[serde(default)]
+    pub cost: Option<f64>,
+    // Parsed defensively; not surfaced today.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub is_byok: Option<bool>,
+}
+
+/// Request body for `POST /api/v1/audio/speech`. `response_format`/`speed` are
+/// omitted when unset.
+#[derive(Debug, Serialize)]
+pub struct SpeechBody {
+    pub model: String,
+    pub input: String,
+    pub voice: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+/// Raw audio bytes from `/audio/speech`, constructed from the response (not
+/// deserialized): the MIME type, bytes, and optional generation id.
+pub struct SpeechResult {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub generation_id: Option<String>,
+}
+
 /// A chat-completions request. `image_config`/`seed` are omitted when `None`.
 /// `stream` is always sent as `false` (MCP tools return one complete result).
 #[derive(Debug, Serialize)]
@@ -505,7 +747,7 @@ pub struct Pricing {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_partial_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -799,5 +1041,169 @@ mod tests {
         assert_eq!(pricing.web_search.as_deref(), Some("0.01"));
         assert_eq!(pricing.discount, Some(0.5));
         assert!(pricing.image.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_video_posts_body_and_parses_job_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .and(body_partial_json(
+                json!({ "model": "google/veo-3.1", "prompt": "a dog" }),
+            ))
+            // The async job API responds 202 with a job id and polling url.
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "id": "vid-1",
+                "polling_url": "https://openrouter.ai/api/v1/videos/vid-1",
+                "status": "pending"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let body = VideoSubmitBody {
+            model: "google/veo-3.1".to_string(),
+            prompt: "a dog".to_string(),
+            duration: Some(4),
+            resolution: None,
+            aspect_ratio: Some("16:9".to_string()),
+            size: None,
+            frame_images: vec![],
+            input_references: vec![],
+            generate_audio: Some(false),
+            seed: None,
+        };
+        let resp = client.submit_video(&body).await.unwrap();
+        assert_eq!(resp.id, "vid-1");
+    }
+
+    #[tokio::test]
+    async fn submit_video_surfaces_error_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":\"unsupported\"}"))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let body = VideoSubmitBody {
+            model: "m".to_string(),
+            prompt: "p".to_string(),
+            duration: None,
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            frame_images: vec![],
+            input_references: vec![],
+            generate_audio: None,
+            seed: None,
+        };
+        let err = client.submit_video(&body).await.unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[tokio::test]
+    async fn poll_video_parses_status_urls_and_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "vid-1",
+                "generation_id": "gen-7",
+                "status": "completed",
+                "unsigned_urls": ["https://cdn/0.mp4", "https://cdn/1.mp4"],
+                "usage": { "cost": 0.9, "is_byok": false }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let poll = client.poll_video("vid-1").await.unwrap();
+        assert_eq!(poll.status, "completed");
+        assert_eq!(poll.generation_id.as_deref(), Some("gen-7"));
+        assert_eq!(poll.unsigned_urls.len(), 2);
+        assert_eq!(poll.usage.unwrap().cost, Some(0.9));
+    }
+
+    #[tokio::test]
+    async fn download_video_returns_content_type_and_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-1/content"))
+            .and(query_param("index", "2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // A charset suffix must be stripped to the bare MIME type.
+                    .insert_header("content-type", "video/webm; charset=binary")
+                    .set_body_bytes(b"WEBM".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let (mime, bytes) = client.download_video("vid-1", 2).await.unwrap();
+        assert_eq!(mime, "video/webm");
+        assert_eq!(bytes, b"WEBM");
+    }
+
+    #[tokio::test]
+    async fn speech_returns_bytes_mime_and_generation_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(body_partial_json(json!({
+                "model": "openai/gpt-4o-mini-tts",
+                "input": "hi",
+                "voice": "alloy"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .insert_header("x-generation-id", "gen-aud-3")
+                    .set_body_bytes(b"MP3".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let body = SpeechBody {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: "hi".to_string(),
+            voice: "alloy".to_string(),
+            response_format: Some("mp3".to_string()),
+            speed: None,
+        };
+        let result = match client.speech(&body).await {
+            Ok(r) => r,
+            Err(e) => panic!("speech should succeed: {e}"),
+        };
+        assert_eq!(result.mime, "audio/mpeg");
+        assert_eq!(result.bytes, b"MP3");
+        assert_eq!(result.generation_id.as_deref(), Some("gen-aud-3"));
+    }
+
+    #[tokio::test]
+    async fn speech_surfaces_error_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("{\"error\":\"bad voice\"}"))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let body = SpeechBody {
+            model: "m".to_string(),
+            input: "x".to_string(),
+            voice: "z".to_string(),
+            response_format: None,
+            speed: None,
+        };
+        let err = match client.speech(&body).await {
+            Err(e) => e,
+            Ok(_) => panic!("provider error should propagate"),
+        };
+        assert!(err.to_string().contains("bad voice"));
     }
 }

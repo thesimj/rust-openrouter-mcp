@@ -4,7 +4,10 @@ use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{
+        AnnotateAble, CallToolResult, Content, RawAudioContent, RawContent, RawResource,
+        ServerCapabilities, ServerInfo,
+    },
     service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -16,10 +19,12 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
+use crate::audio_gen::{self, SpeechGenRequest};
 use crate::image_gen::{self, GenerateRequest};
 use crate::openrouter::{ModelsQuery, OpenRouterClient, apply_filters};
 use crate::stats::UsageStats;
 use crate::tasks::{TaskKind, TaskRegistry, TaskSnapshot};
+use crate::video_gen::{self, VideoGenRequest, VideoInput};
 
 /// MCP server wrapping an [`OpenRouterClient`].
 #[derive(Clone)]
@@ -44,9 +49,14 @@ impl OpenRouterServer {
 /// Default seconds to wait inline before returning a task id for a slow job.
 const DEFAULT_WAIT_SECONDS: u64 = 10;
 
-/// Build the lean per-job result object (paths, dims, requested vs actual,
-/// manifest pointer, plus warnings/errors when present).
-fn job_result_json(
+/// Default inline wait for video: video takes 30s-several minutes, so the
+/// fast-return window almost always yields `pending` and the caller polls
+/// get_result. Kept within the 1-60 clamp.
+const DEFAULT_VIDEO_WAIT_SECONDS: u64 = 20;
+
+/// Build the lean per-job result object for an image job (paths, dims, requested
+/// vs actual, manifest pointer, plus warnings/errors when present).
+fn image_job_result_json(
     summary: &image_gen::JobSummary,
     aspect_ratio: &Option<String>,
     image_size: &Option<String>,
@@ -82,6 +92,39 @@ fn job_result_json(
     result
 }
 
+/// Build the lean per-job result object for a video job: kind "video", the saved
+/// clip paths and metadata, the manifest pointer, plus warnings/errors.
+fn video_job_result_json(summary: &video_gen::VideoJobSummary) -> serde_json::Value {
+    let videos: Vec<_> = summary
+        .videos
+        .iter()
+        .map(|v| {
+            json!({
+                "path": v.path.to_string_lossy(),
+                "duration": v.duration,
+                "resolution": v.resolution,
+                "aspect_ratio": v.aspect_ratio,
+                "has_audio": v.has_audio,
+                "mime": v.mime,
+            })
+        })
+        .collect();
+    let mut result = json!({
+        "ok": true,
+        "model": summary.model,
+        "kind": "video",
+        "videos": videos,
+        "manifest": summary.manifest_path.to_string_lossy(),
+    });
+    if !summary.warnings.is_empty() {
+        result["warnings"] = json!(summary.warnings);
+    }
+    if !summary.errors.is_empty() {
+        result["errors"] = json!(summary.errors);
+    }
+    result
+}
+
 /// Longest-side cap (px) for the inline preview embedded in a tool result. The
 /// full-resolution image always stays on disk; this only bounds the base64 copy
 /// sent to the client so generated images render without bloating context.
@@ -92,6 +135,14 @@ const PREVIEW_MAX_SIDE: u32 = 1568;
 /// produce up to 16 images; base64-embedding every one would bloat the client's
 /// context, so any beyond this cap are reported by path in the JSON block only.
 const MAX_INLINE_PREVIEWS: usize = 4;
+
+/// Most inline media blocks (audio / video ResourceLinks) attached to a result.
+const MAX_INLINE_MEDIA: usize = 4;
+
+/// Largest audio file embedded inline as a base64 AudioContent block. Larger
+/// files bloat the client's context badly, so they are reported by path only
+/// (the file is always saved to disk regardless).
+const MAX_INLINE_AUDIO_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Collect the on-disk paths of the generated images in a job envelope.
 fn envelope_image_paths(env: &serde_json::Value) -> Vec<String> {
@@ -105,6 +156,43 @@ fn envelope_image_paths(env: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Collect the on-disk paths of the generated clips in a video job envelope.
+fn envelope_video_paths(env: &serde_json::Value) -> Vec<String> {
+    env.get("videos")
+        .and_then(|v| v.as_array())
+        .map(|videos| {
+            videos
+                .iter()
+                .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build a `ResourceLink` content block for each generated clip path. rmcp 1.7
+/// has no native video content block, so a sandboxed client gets a `file://`
+/// ResourceLink (mime video/mp4, size from the file) rather than an embedded
+/// blob; the path is also in the JSON text block. Capped at [`MAX_INLINE_MEDIA`].
+///
+/// Blocking: does a filesystem stat per path - run via `spawn_blocking`.
+fn video_resource_link_blocks(paths: &[String]) -> Vec<Content> {
+    paths
+        .iter()
+        .take(MAX_INLINE_MEDIA)
+        .map(|path| {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let mut r = RawResource::new(format!("file://{path}"), name);
+            r.mime_type = Some("video/mp4".to_string());
+            r.size = std::fs::metadata(path).ok().map(|m| m.len() as u32);
+            Content::resource_link(r)
+        })
+        .collect()
 }
 
 /// True when `bytes` is a PNG whose longest side already fits `max_side`, so it
@@ -186,21 +274,34 @@ async fn job_call_result(
     let mut blocks = vec![Content::text(body)];
 
     if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
-        let paths = envelope_image_paths(env);
-        let total = paths.len();
-        // Reading + decoding + resizing + re-encoding images is blocking CPU and
-        // disk I/O; run it off the async worker so concurrent tool calls (e.g.
-        // get_result polls) aren't stalled behind it.
-        let previews = tokio::task::spawn_blocking(move || encode_preview_blocks(&paths))
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let shown = previews.len();
-        blocks.extend(previews);
-        if total > MAX_INLINE_PREVIEWS {
-            blocks.push(Content::text(format!(
-                "note: showing {shown} of {total} generated images inline (capped at \
-                 {MAX_INLINE_PREVIEWS}); every image is saved to disk at the paths above."
-            )));
+        match env.get("kind").and_then(|k| k.as_str()) {
+            Some("video") => {
+                let paths = envelope_video_paths(env);
+                // A filesystem stat per clip is blocking I/O; keep it off the worker.
+                let links = tokio::task::spawn_blocking(move || video_resource_link_blocks(&paths))
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                blocks.extend(links);
+            }
+            // "image" (and the historical default) get inline image previews.
+            _ => {
+                let paths = envelope_image_paths(env);
+                let total = paths.len();
+                // Reading + decoding + resizing + re-encoding images is blocking CPU
+                // and disk I/O; run it off the async worker so concurrent tool calls
+                // (e.g. get_result polls) aren't stalled behind it.
+                let previews = tokio::task::spawn_blocking(move || encode_preview_blocks(&paths))
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let shown = previews.len();
+                blocks.extend(previews);
+                if total > MAX_INLINE_PREVIEWS {
+                    blocks.push(Content::text(format!(
+                        "note: showing {shown} of {total} generated images inline (capped at \
+                         {MAX_INLINE_PREVIEWS}); every image is saved to disk at the paths above."
+                    )));
+                }
+            }
         }
     }
     Ok(CallToolResult::success(blocks))
@@ -331,6 +432,79 @@ pub struct DescribeImageArgs {
     /// Longest-side cap (px) for input images before sending (default 800).
     #[serde(default)]
     pub max_image_dimension: Option<u32>,
+}
+
+/// Arguments for the `generate_video` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GenerateVideoArgs {
+    /// Video model id, e.g. "google/veo-3.1". Use list_models with
+    /// output_modalities="video" to discover them.
+    pub model: String,
+    /// Prompt text describing the video to generate.
+    pub prompt: String,
+    /// REQUIRED (no default): clip duration in seconds.
+    #[serde(default)]
+    pub duration: Option<u32>,
+    /// Resolution, e.g. "480p", "720p", "1080p", "1K", "2K", "4K"
+    /// (interchangeable with `size`).
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// REQUIRED (no default unless `size` is given): aspect ratio,
+    /// e.g. "16:9", "9:16", "1:1".
+    #[serde(default)]
+    pub aspect_ratio: Option<String>,
+    /// "WIDTHxHEIGHT" (interchangeable with resolution + aspect_ratio).
+    #[serde(default)]
+    pub size: Option<String>,
+    /// REQUIRED (no default): true to generate an audio track (for
+    /// audio-capable models), false for silent video.
+    #[serde(default)]
+    pub generate_audio: Option<bool>,
+    /// Seed for reproducible-ish generation (provider support varies).
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Local image path used as the first frame (image-to-video). Adding a frame
+    /// makes this image-to-video; reference_images are then ignored.
+    #[serde(default)]
+    pub first_frame: Option<String>,
+    /// Local image path used as the last frame (image-to-video).
+    #[serde(default)]
+    pub last_frame: Option<String>,
+    /// Local image paths used as references (reference-to-video). Ignored, with a
+    /// warning, when first_frame/last_frame are given (frame_images wins).
+    #[serde(default)]
+    pub reference_images: Vec<String>,
+    /// Longest-side cap (px) for input frame/reference images (default 800).
+    #[serde(default)]
+    pub max_image_dimension: Option<u32>,
+    /// Seconds to wait inline before returning a task_id (1-60, default 20).
+    /// Video is slow, so the normal path returns "pending"; poll get_result.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 60))]
+    pub wait_seconds: Option<u64>,
+    /// Output file path (extension corrected to the returned format, e.g. .mp4).
+    pub output: String,
+}
+
+/// Arguments for the `generate_audio` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GenerateAudioArgs {
+    /// TTS model id, e.g. "openai/gpt-4o-mini-tts" or "hexgrad/kokoro-82m".
+    pub model: String,
+    /// REQUIRED (no default): the text to synthesize.
+    #[serde(default)]
+    pub input: Option<String>,
+    /// REQUIRED (no default): voice id (varies by model, e.g. "alloy").
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Output audio format: "mp3" (default) or "pcm".
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Playback speed (select models only).
+    #[serde(default)]
+    pub speed: Option<f64>,
+    /// Output file path (extension corrected to the returned format, e.g. .mp3).
+    pub output: String,
 }
 
 /// Arguments for the `get_result` tool.
@@ -519,7 +693,7 @@ impl OpenRouterServer {
                     tasks
                         .complete(
                             &id_bg,
-                            job_result_json(&summary, &aspect_ratio, &image_size),
+                            image_job_result_json(&summary, &aspect_ratio, &image_size),
                         )
                         .await;
                 }
@@ -593,6 +767,276 @@ impl OpenRouterServer {
                 ),
                 None,
             )),
+        }
+    }
+
+    #[tool(
+        description = "Generate a video with an OpenRouter video model (e.g. google/veo-3.1) and \
+        save it to `output`. For text-to-video, pass a prompt. For image-to-video, also pass \
+        first_frame (and optionally last_frame) as local image paths; for reference-to-video pass \
+        reference_images (ignored, with a warning, if a frame is given - frames win). This tool \
+        has NO defaults: model, prompt, output, duration, generate_audio, and an aspect_ratio \
+        OR size must all be specified, or the call fails naming what is missing. Video generation \
+        is slow (30s to several minutes): it runs asynchronously and almost always returns status \
+        \"pending\" with a task_id after wait_seconds (default 20) - poll get_result until it is \
+        \"completed\". The completed result carries the saved file path in JSON plus, for \
+        sandboxed clients, a file:// ResourceLink (mime video/mp4) per clip.",
+        annotations(
+            title = "Generate Video",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn generate_video(
+        &self,
+        Parameters(args): Parameters<GenerateVideoArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inline = client_wants_inline_previews(&context);
+        self.run_generate_video(args, inline).await
+    }
+
+    /// Core of `generate_video`, parameterized on inline media like
+    /// [`Self::run_generate`], so tests can drive it without a `RequestContext`.
+    async fn run_generate_video(
+        &self,
+        args: GenerateVideoArgs,
+        inline_previews: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        // No defaults: the agent must choose these explicitly.
+        let mut missing: Vec<&str> = Vec::new();
+        if args.duration.is_none() {
+            missing.push("duration (seconds)");
+        }
+        if args.aspect_ratio.is_none() && args.size.is_none() {
+            missing.push("aspect_ratio (e.g. \"16:9\", \"9:16\") or size (\"WIDTHxHEIGHT\")");
+        }
+        if args.generate_audio.is_none() {
+            missing.push("generate_audio (true for an audio track, false for silent video)");
+        }
+        if !missing.is_empty() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "generate_video has no defaults - specify every parameter explicitly. \
+                     Missing: {}. (model, prompt and output are also required.) Use list_models \
+                     with output_modalities=\"video\" to choose a model.",
+                    missing.join("; ")
+                ),
+                None,
+            ));
+        }
+
+        let mut frames = Vec::new();
+        if let Some(p) = &args.first_frame {
+            frames.push(VideoInput {
+                path: p.into(),
+                frame_type: "first_frame".to_string(),
+            });
+        }
+        if let Some(p) = &args.last_frame {
+            frames.push(VideoInput {
+                path: p.into(),
+                frame_type: "last_frame".to_string(),
+            });
+        }
+        let req = VideoGenRequest {
+            model: args.model.clone(),
+            prompt: args.prompt,
+            duration: args.duration,
+            resolution: args.resolution,
+            aspect_ratio: args.aspect_ratio,
+            size: args.size,
+            generate_audio: args.generate_audio,
+            seed: args.seed,
+            frames,
+            references: args.reference_images.iter().map(PathBuf::from).collect(),
+            max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+            poll_interval_secs: video_gen::resolve_poll_interval(None),
+            poll_timeout_secs: video_gen::resolve_poll_timeout(None),
+        };
+
+        let wait = args
+            .wait_seconds
+            .unwrap_or(DEFAULT_VIDEO_WAIT_SECONDS)
+            .clamp(1, 60);
+        let base = PathBuf::from(&args.output);
+
+        let task_id = uuid::Uuid::now_v7().to_string();
+        self.tasks.insert_pending(&task_id, TaskKind::Video).await;
+
+        let client = self.client.clone();
+        let tasks = self.tasks.clone();
+        let stats = self.stats.clone();
+        let model = args.model.clone();
+        let id_bg = task_id.clone();
+        let handle = tokio::spawn(async move {
+            match video_gen::run_job(&client, &req, &base, "inline").await {
+                Ok(summary) if !summary.videos.is_empty() => {
+                    let cost: Option<f64> = {
+                        let costs: Vec<f64> =
+                            summary.videos.iter().filter_map(|v| v.cost).collect();
+                        if costs.is_empty() {
+                            None
+                        } else {
+                            Some(costs.iter().sum())
+                        }
+                    };
+                    stats.record_video(&model, true, cost).await;
+                    tasks
+                        .complete(&id_bg, video_job_result_json(&summary))
+                        .await;
+                }
+                Ok(summary) => {
+                    stats.record_video(&model, false, None).await;
+                    tasks
+                        .fail(
+                            &id_bg,
+                            format!("video generation failed: {}", summary.errors.join("; ")),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    stats.record_video(&model, false, None).await;
+                    tasks.fail(&id_bg, format!("{e:#}")).await;
+                }
+            }
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(wait), handle).await;
+        let snap = self
+            .tasks
+            .snapshot(&task_id)
+            .await
+            .expect("task was just inserted");
+        let env = snapshot_to_envelope(&task_id, &snap);
+        job_call_result(&env, inline_previews).await
+    }
+
+    #[tool(
+        description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
+        openai/gpt-4o-mini-tts or hexgrad/kokoro-82m) and save the audio to `output`. This is a \
+        synchronous, fast call (not a background task). This tool has NO defaults: model, input \
+        (the text), voice, and output must all be specified, or the call fails naming what is \
+        missing. Returns the saved file path in JSON; for sandboxed clients it also returns a \
+        native inline audio content block when the file is small enough. response_format defaults \
+        to mp3 so the extension is deterministic.",
+        annotations(
+            title = "Generate Speech",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn generate_audio(
+        &self,
+        Parameters(args): Parameters<GenerateAudioArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inline = client_wants_inline_previews(&context);
+        self.run_generate_audio(args, inline).await
+    }
+
+    /// Core of `generate_audio` (synchronous, mirrors `describe_image`),
+    /// parameterized on inline media so tests can drive it directly.
+    async fn run_generate_audio(
+        &self,
+        args: GenerateAudioArgs,
+        inline_previews: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        // No defaults: input and voice are the things agents forget.
+        let mut missing: Vec<&str> = Vec::new();
+        if args
+            .input
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            missing.push("input (the text to synthesize)");
+        }
+        if args
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            missing.push("voice (voice id, varies by model e.g. \"alloy\")");
+        }
+        if !missing.is_empty() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "generate_audio has no defaults - specify every parameter explicitly. \
+                     Missing: {}. (model and output are also required.) Use list_models with \
+                     output_modalities=\"speech\" to choose a model.",
+                    missing.join("; ")
+                ),
+                None,
+            ));
+        }
+
+        let model = args.model.clone();
+        let req = SpeechGenRequest {
+            model: args.model,
+            input: args.input.unwrap_or_default(),
+            voice: args.voice.unwrap_or_default(),
+            response_format: args.response_format,
+            speed: args.speed,
+        };
+        let output = PathBuf::from(&args.output);
+
+        match audio_gen::run_job(&self.client, &req, &output, "inline").await {
+            Ok(result) => {
+                self.stats.record_audio(&model, true, None).await;
+                let mut env = json!({
+                    "ok": true,
+                    "kind": "audio",
+                    "model": result.model,
+                    "audio": {
+                        "path": result.audio.path.to_string_lossy(),
+                        "mime": result.audio.mime,
+                        "voice": result.audio.voice,
+                        "response_format": result.audio.response_format,
+                    },
+                    "manifest": result.manifest_path.to_string_lossy(),
+                });
+                if !result.warnings.is_empty() {
+                    env["warnings"] = json!(result.warnings);
+                }
+                let body = serde_json::to_string_pretty(&env)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let mut blocks = vec![Content::text(body)];
+
+                // Inline native AudioContent for sandboxed clients, under the cap.
+                if inline_previews {
+                    let path = result.audio.path.clone();
+                    let mime = result.audio.mime.clone();
+                    let small = std::fs::metadata(&path)
+                        .map(|m| m.len() <= MAX_INLINE_AUDIO_BYTES)
+                        .unwrap_or(false);
+                    if small {
+                        let read = tokio::task::spawn_blocking(move || std::fs::read(&path))
+                            .await
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        if let Ok(bytes) = read {
+                            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                            blocks.push(
+                                RawContent::Audio(RawAudioContent {
+                                    data,
+                                    mime_type: mime,
+                                })
+                                .no_annotation(),
+                            );
+                        }
+                    }
+                }
+                Ok(CallToolResult::success(blocks))
+            }
+            Err(e) => {
+                self.stats.record_audio(&model, false, None).await;
+                Err(ErrorData::internal_error(format!("{e:#}"), None))
+            }
         }
     }
 
@@ -725,9 +1169,12 @@ impl ServerHandler for OpenRouterServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "MCP server for OpenRouter. Use `list_models` to discover models, \
                 their capabilities, and pricing, then `generate_image` to create \
-                images with an image-capable model. If `generate_image` returns \
-                status \"pending\" with a task_id, poll `get_result` until it is \
-                \"completed\". `get_usage_stats` reports this process's spend and counts.",
+                images, `generate_video` to create videos (slow, async: it returns \
+                status \"pending\" with a task_id - poll `get_result` until \
+                \"completed\"), and `generate_audio` for text-to-speech (synchronous). \
+                If `generate_image` or `generate_video` returns status \"pending\" with \
+                a task_id, poll `get_result` until it is \"completed\". \
+                `get_usage_stats` reports this process's spend and counts.",
         )
     }
 }
@@ -1020,6 +1467,133 @@ mod tests {
         assert_eq!(v["creator_user_id"], "user_42");
         assert_eq!(v["usage"], 1.5);
         assert!(v["limit"].is_null());
+    }
+
+    #[tokio::test]
+    async fn generate_audio_synthesizes_and_returns_path_json() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-tool/voice.mp3");
+        let args = GenerateAudioArgs {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: Some("hello".to_string()),
+            voice: Some("alloy".to_string()),
+            response_format: None,
+            speed: None,
+            output: out.to_string_lossy().into_owned(),
+        };
+        // inline_previews=false -> JSON only, no embedded audio block.
+        let res = server.run_generate_audio(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["kind"], "audio");
+        assert_eq!(v["audio"]["voice"], "alloy");
+        assert_eq!(v["audio"]["mime"], "audio/mpeg");
+        assert!(v["audio"]["path"].as_str().unwrap().ends_with(".mp3"));
+
+        // The stats counter recorded the audio generation.
+        let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
+        assert_eq!(stats["audio_files"], 1);
+    }
+
+    #[tokio::test]
+    async fn generate_audio_requires_input_and_voice() {
+        // Validation runs before any HTTP call.
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args = GenerateAudioArgs {
+            model: "m".to_string(),
+            input: None,
+            voice: Some("  ".to_string()), // blank-after-trim counts as missing
+            response_format: None,
+            speed: None,
+            output: "out.mp3".to_string(),
+        };
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert!(err.message.contains("input"));
+        assert!(err.message.contains("voice"));
+        assert!(err.message.contains("no defaults"));
+    }
+
+    #[tokio::test]
+    async fn generate_video_requires_explicit_parameters() {
+        // Validation runs before any HTTP call, so the base URL is never used.
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args = GenerateVideoArgs {
+            model: "m".to_string(),
+            prompt: "p".to_string(),
+            duration: None,
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            generate_audio: None,
+            seed: None,
+            first_frame: None,
+            last_frame: None,
+            reference_images: vec![],
+            max_image_dimension: None,
+            wait_seconds: None,
+            output: "out.mp4".to_string(),
+        };
+        let err = server.run_generate_video(args, false).await.unwrap_err();
+        assert!(err.message.contains("duration"));
+        assert!(err.message.contains("aspect_ratio"));
+        assert!(err.message.contains("generate_audio"));
+        assert!(err.message.contains("no defaults"));
+    }
+
+    #[tokio::test]
+    async fn generate_video_returns_pending_with_a_task_id() {
+        // The submit succeeds but the poll keeps reporting "processing", so the
+        // short wait window elapses and the tool returns a pending task to poll.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "vid-pending" })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "vid-pending",
+                "status": "processing",
+                "unsigned_urls": []
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-video-pending/clip.mp4");
+        let args = GenerateVideoArgs {
+            model: "google/veo-3.1".to_string(),
+            prompt: "a kite".to_string(),
+            duration: Some(4),
+            resolution: None,
+            aspect_ratio: Some("16:9".to_string()),
+            size: None,
+            generate_audio: Some(false),
+            seed: None,
+            first_frame: None,
+            last_frame: None,
+            reference_images: vec![],
+            max_image_dimension: None,
+            wait_seconds: Some(1), // clamp floor: return quickly as pending
+            output: out.to_string_lossy().into_owned(),
+        };
+        let res = server.run_generate_video(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["kind"], "video");
+        assert!(v["task_id"].is_string());
     }
 
     #[tokio::test]
