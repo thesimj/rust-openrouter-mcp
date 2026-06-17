@@ -106,7 +106,8 @@ impl OpenRouterServer {
         description = "Return in-memory usage statistics for this server process: version (the \
         server build version), started_at, \
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
-        text_generations (describe_image calls), actual_cost_usd (summed from usage.cost), \
+        text_generations (describe_image and chat_completion calls), actual_cost_usd \
+        (summed from usage.cost), \
         unknown_cost_count, and a by_model breakdown. Counters reset when the server restarts.",
         annotations(
             title = "Get Usage Stats",

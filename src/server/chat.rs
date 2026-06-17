@@ -9,7 +9,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::openrouter::{ChatRequest, Content as ChatContent, Message};
+use crate::chat_gen;
 use crate::server::schema::{de_opt_f64, de_opt_uint, require_all, scalarize_nullable};
 
 use super::OpenRouterServer;
@@ -76,52 +76,25 @@ impl OpenRouterServer {
         }
         require_all("chat_completion", "text", &missing)?;
 
-        let model = args.model.clone();
-
-        let mut messages: Vec<Message> = Vec::new();
-        if let Some(system) = args
-            .system
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+        let prompt = args.prompt.unwrap_or_default();
+        // Record success only after text is actually extracted (an empty-choices
+        // or empty-content response is an error, not a successful generation).
+        match chat_gen::complete(
+            &self.client,
+            &args.model,
+            args.system.as_deref(),
+            &prompt,
+            args.temperature,
+            args.max_tokens,
+        )
+        .await
         {
-            messages.push(Message {
-                role: "system".into(),
-                content: ChatContent::Text(system.to_string()),
-            });
-        }
-        messages.push(Message {
-            role: "user".into(),
-            content: ChatContent::Text(args.prompt.unwrap_or_default()),
-        });
-
-        let req = ChatRequest {
-            model: model.clone(),
-            messages,
-            modalities: None,
-            image_config: None,
-            seed: None,
-            temperature: args.temperature,
-            max_tokens: args.max_tokens,
-            stream: false,
-        };
-
-        match self.client.chat_completion(&req).await {
-            Ok(resp) => {
-                let cost = resp.completion.usage.and_then(|u| u.cost);
-                self.stats.record_text(&model, true, cost).await;
-                let choice = resp.completion.choices.into_iter().next().ok_or_else(|| {
-                    ErrorData::internal_error("OpenRouter returned no choices", None)
-                })?;
-                let text = choice
-                    .message
-                    .content
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| ErrorData::internal_error("model returned no text", None))?;
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+            Ok(result) => {
+                self.stats.record_text(&args.model, true, result.cost).await;
+                Ok(CallToolResult::success(vec![Content::text(result.text)]))
             }
             Err(e) => {
-                self.stats.record_text(&model, false, None).await;
+                self.stats.record_text(&args.model, false, None).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }

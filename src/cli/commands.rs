@@ -8,7 +8,7 @@ use super::{
 use crate::image_gen::GenerateRequest;
 use crate::openrouter::{ModelsQuery, OpenRouterClient};
 use crate::pricing::{models_to_json, video_price};
-use crate::{audio_gen, image_gen, openrouter, video_gen};
+use crate::{audio_gen, chat_gen, image_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
 /// output paths (JSON and table).
@@ -92,47 +92,17 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let (prompt, _source) = resolve_prompt(args.prompt, args.prompt_file)?;
 
-    let mut messages = Vec::new();
-    if let Some(system) = args
-        .system
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        messages.push(openrouter::Message {
-            role: "system".to_string(),
-            content: openrouter::Content::Text(system.to_string()),
-        });
-    }
-    messages.push(openrouter::Message {
-        role: "user".to_string(),
-        content: openrouter::Content::Text(prompt),
-    });
-
-    let req = openrouter::ChatRequest {
-        model: args.model,
-        messages,
-        modalities: None,
-        image_config: None,
-        seed: None,
-        temperature: args.temperature,
-        max_tokens: args.max_tokens,
-        stream: false,
-    };
-    let resp = client.chat_completion(&req).await?;
-    let choice = resp
-        .completion
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("OpenRouter returned no choices"))?;
-    let text = choice
-        .message
-        .content
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("model returned no text"))?;
-    println!("{text}");
-    if let Some(cost) = resp.completion.usage.and_then(|u| u.cost) {
+    let result = chat_gen::complete(
+        &client,
+        &args.model,
+        args.system.as_deref(),
+        &prompt,
+        args.temperature,
+        args.max_tokens,
+    )
+    .await?;
+    println!("{}", result.text);
+    if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }
     Ok(())

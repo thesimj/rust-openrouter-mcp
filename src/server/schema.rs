@@ -144,8 +144,7 @@ pub(crate) fn require_all(tool: &str, modality: &str, missing: &[&str]) -> Resul
     Err(ErrorData::invalid_params(
         format!(
             "{tool} has no defaults - specify every parameter explicitly. Missing: {}. \
-             (model, prompt and output are also required.) Use list_models with \
-             output_modalities=\"{modality}\" to choose a model.",
+             Use list_models with output_modalities=\"{modality}\" to choose a model.",
             missing.join("; ")
         ),
         None,

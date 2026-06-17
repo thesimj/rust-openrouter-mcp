@@ -6,6 +6,7 @@
 //! Requires the `OPENROUTER_API_KEY` environment variable (or a local `.env`).
 
 mod audio_gen;
+mod chat_gen;
 mod cli;
 mod image_gen;
 mod image_io;
