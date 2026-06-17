@@ -23,18 +23,18 @@ use rmcp::ErrorData;
 /// are left untouched.
 pub(crate) fn scalarize_nullable(schema: &mut schemars::Schema) {
     use schemars::transform::transform_subschemas;
-    if let Some(obj) = schema.as_object_mut() {
-        if let Some(serde_json::Value::Array(types)) = obj.get("type") {
-            let non_null: Vec<serde_json::Value> = types
-                .iter()
-                .filter(|t| t.as_str() != Some("null"))
-                .cloned()
-                .collect();
-            if non_null.len() == 1 {
-                obj.insert("type".to_string(), non_null.into_iter().next().unwrap());
-                if obj.get("default") == Some(&serde_json::Value::Null) {
-                    obj.remove("default");
-                }
+    if let Some(obj) = schema.as_object_mut()
+        && let Some(serde_json::Value::Array(types)) = obj.get("type")
+    {
+        let non_null: Vec<serde_json::Value> = types
+            .iter()
+            .filter(|t| t.as_str() != Some("null"))
+            .cloned()
+            .collect();
+        if non_null.len() == 1 {
+            obj.insert("type".to_string(), non_null.into_iter().next().unwrap());
+            if obj.get("default") == Some(&serde_json::Value::Null) {
+                obj.remove("default");
             }
         }
     }

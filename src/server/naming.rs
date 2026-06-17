@@ -107,15 +107,15 @@ pub(crate) fn auto_base_name(
 /// set, else `$HOME/Downloads/openrouter-mcp`, else a temp dir. User-visible by
 /// default so artifacts are findable when the process CWD is undefined.
 pub(crate) fn output_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("OPENROUTER_MCP_OUTPUT_DIR") {
-        if !d.trim().is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("OPENROUTER_MCP_OUTPUT_DIR")
+        && !d.trim().is_empty()
+    {
+        return PathBuf::from(d);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join("Downloads").join("openrouter-mcp");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home).join("Downloads").join("openrouter-mcp");
     }
     std::env::temp_dir().join("openrouter-mcp")
 }

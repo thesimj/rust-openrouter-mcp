@@ -116,10 +116,10 @@ pub(crate) fn humanize_pricing(pricing: &Value) -> Option<Value> {
 /// Attach a `pricing_human` sibling next to a `pricing` object in `obj`, in
 /// place, when one can be built.
 pub(crate) fn attach_pricing_human(obj: &mut Value) {
-    if let Some(human) = obj.get("pricing").and_then(humanize_pricing) {
-        if let Some(map) = obj.as_object_mut() {
-            map.insert("pricing_human".to_string(), human);
-        }
+    if let Some(human) = obj.get("pricing").and_then(humanize_pricing)
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert("pricing_human".to_string(), human);
     }
 }
 

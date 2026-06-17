@@ -200,20 +200,20 @@ pub fn check_dimensions(
     let actual_image_size = classify_image_size(width.max(height));
     let mut warnings = Vec::new();
 
-    if let Some(req) = requested_aspect {
-        if aspect_matches(req, width, height) == Some(false) {
-            warnings.push(format!(
-                "requested aspect_ratio {req} but image is {actual_aspect_ratio} ({width}x{height})"
-            ));
-        }
+    if let Some(req) = requested_aspect
+        && aspect_matches(req, width, height) == Some(false)
+    {
+        warnings.push(format!(
+            "requested aspect_ratio {req} but image is {actual_aspect_ratio} ({width}x{height})"
+        ));
     }
-    if let Some(req) = requested_size {
-        if !req.eq_ignore_ascii_case(actual_image_size) {
-            warnings.push(format!(
-                "requested image_size {req} but image is ~{actual_image_size} ({}px)",
-                width.max(height)
-            ));
-        }
+    if let Some(req) = requested_size
+        && !req.eq_ignore_ascii_case(actual_image_size)
+    {
+        warnings.push(format!(
+            "requested image_size {req} but image is ~{actual_image_size} ({}px)",
+            width.max(height)
+        ));
     }
 
     DimensionCheck {
