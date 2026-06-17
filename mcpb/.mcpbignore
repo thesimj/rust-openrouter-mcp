@@ -1,0 +1,2 @@
+# Dev-only: the icon generator is kept in the repo, not shipped in the bundle.
+make-icon.mjs

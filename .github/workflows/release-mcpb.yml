@@ -1,0 +1,44 @@
+name: Release MCPB (Claude Desktop)
+
+# Builds the macOS Claude Desktop extension (.mcpb) and attaches it to the
+# GitHub Release when a version tag is pushed (e.g. v0.1.0).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mcpb:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with macOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build universal binary and pack .mcpb
+        run: scripts/build-mcpb.sh
+
+      - name: Upload .mcpb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openrouter-mcp-mcpb
+          path: dist/openrouter-mcp.mcpb
+
+      - name: Attach .mcpb to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/openrouter-mcp.mcpb

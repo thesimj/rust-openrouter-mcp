@@ -1,0 +1,79 @@
+{
+  "manifest_version": "0.2",
+  "name": "openrouter-mcp",
+  "display_name": "OpenRouter — Models & Images",
+  "version": "0.1.0",
+  "description": "Discover OpenRouter models and generate, edit, and describe images from Claude.",
+  "long_description": "A single Rust binary that exposes OpenRouter to Claude over MCP. Discover models with their capabilities and pricing, generate and edit images (with parallel seed-stepped variants and a sidecar manifest), describe local images with a vision model, and track per-process usage. Bring your own OpenRouter API key.",
+  "author": {
+    "name": "Nick Bubelich",
+    "url": "https://github.com/thesimj"
+  },
+  "homepage": "https://github.com/thesimj/rust-openrouter-mcp",
+  "documentation": "https://github.com/thesimj/rust-openrouter-mcp#readme",
+  "support": "https://github.com/thesimj/rust-openrouter-mcp/issues",
+  "icon": "icon.png",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "openrouter",
+    "image-generation",
+    "vision",
+    "models",
+    "llm"
+  ],
+  "privacy_policies": [
+    "https://github.com/thesimj/rust-openrouter-mcp/blob/main/PRIVACY.md"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/openrouter-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/bin/openrouter-mcp",
+      "args": ["mcp"],
+      "env": {
+        "OPENROUTER_API_KEY": "${user_config.api_key}",
+        "OPENROUTER_MCP_IMAGE_PREVIEWS": "always"
+      }
+    }
+  },
+  "tools_generated": false,
+  "tools": [
+    {
+      "name": "list_models",
+      "description": "List available OpenRouter models with capabilities and pricing; filter and sort server-side."
+    },
+    {
+      "name": "generate_image",
+      "description": "Generate or edit an image with an OpenRouter image model and save it to disk (supports parallel variants)."
+    },
+    {
+      "name": "get_result",
+      "description": "Fetch the status and result of a generation job by task_id."
+    },
+    {
+      "name": "describe_image",
+      "description": "Describe or answer questions about local image(s) with a vision-capable model."
+    },
+    {
+      "name": "get_usage_stats",
+      "description": "Return in-memory usage statistics for this server process."
+    },
+    {
+      "name": "reset_usage_stats",
+      "description": "Reset all in-memory usage statistics to zero (requires confirm=true)."
+    }
+  ],
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "OpenRouter API Key",
+      "description": "Your OpenRouter API key. Create one at https://openrouter.ai/keys",
+      "required": true,
+      "sensitive": true
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin"]
+  }
+}
