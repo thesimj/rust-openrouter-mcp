@@ -1,6 +1,7 @@
-//! `GET /api/v1/models` endpoint.
+//! `GET /api/v1/models` and `GET /api/v1/models/{id}/endpoints`.
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use crate::openrouter::{Model, ModelsQuery, ModelsResponse, OpenRouterClient};
 
@@ -26,6 +27,34 @@ impl OpenRouterClient {
             .await
             .context("failed to decode OpenRouter /models response")?;
         Ok(parsed.data)
+    }
+
+    /// `GET /api/v1/models/{model_id}/endpoints` - the full record for one model:
+    /// the model object (id, description, architecture, context) plus the
+    /// per-provider endpoints (pricing, uptime, status, quantization, supported
+    /// parameters). Returned as raw JSON so the caller surfaces everything
+    /// OpenRouter reports without a hand-maintained schema. `model_id` is the
+    /// `author/slug` id (e.g. "anthropic/claude-opus-4.7").
+    pub async fn describe_model(&self, model_id: &str) -> Result<Value> {
+        let resp = self
+            .http
+            .get(format!("{}/models/{}/endpoints", self.base_url, model_id))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /models/{id}/endpoints failed")?
+            .error_for_status()
+            .context("OpenRouter /models/{id}/endpoints returned an error status")?;
+
+        let mut body: Value = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter model-endpoints response")?;
+        // Unwrap the `data` envelope (model + endpoints) when present.
+        Ok(body
+            .get_mut("data")
+            .map(Value::take)
+            .unwrap_or(body))
     }
 }
 
@@ -78,6 +107,41 @@ mod tests {
             .list_models(&ModelsQuery::default())
             .await
             .unwrap_err();
+        assert!(err.to_string().contains("error status"));
+    }
+
+    #[tokio::test]
+    async fn describe_model_unwraps_data_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/anthropic/claude-opus-4.7/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "anthropic/claude-opus-4.7",
+                    "endpoints": [{"provider_name": "Anthropic", "status": 0}]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let detail = client.describe_model("anthropic/claude-opus-4.7").await.unwrap();
+        // The `data` envelope is unwrapped; everything underneath is preserved.
+        assert_eq!(detail["id"], "anthropic/claude-opus-4.7");
+        assert_eq!(detail["endpoints"][0]["provider_name"], "Anthropic");
+    }
+
+    #[tokio::test]
+    async fn describe_model_errors_on_unknown_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/foo/bar/endpoints"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let err = client.describe_model("foo/bar").await.unwrap_err();
         assert!(err.to_string().contains("error status"));
     }
 }

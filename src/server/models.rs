@@ -52,6 +52,15 @@ pub(crate) struct ListModelsArgs {
     pub all: bool,
 }
 
+/// Arguments for the `describe_model` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = scalarize_nullable)]
+pub(crate) struct DescribeModelArgs {
+    /// Exact model id ("author/slug"), e.g. "anthropic/claude-opus-4.7". Use
+    /// list_models to discover ids.
+    pub model: String,
+}
+
 #[tool_router(router = models_router, vis = "pub(crate)")]
 impl OpenRouterServer {
     #[tool(
@@ -105,6 +114,45 @@ impl OpenRouterServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(
+        description = "Get the full detail for a single OpenRouter model by its exact id \
+        (author/slug, e.g. \"anthropic/claude-opus-4.7\" - discover ids with list_models). \
+        Returns everything OpenRouter reports for that model as JSON: the model object \
+        (description, architecture/modalities, tokenizer, context_length, knowledge_cutoff, \
+        benchmarks) plus the per-provider endpoints with their pricing, uptime, status, \
+        quantization, max tokens, and supported parameters - richer and more current than the \
+        list_models entry (which is a compact subset). Fails if the id is unknown.",
+        annotations(
+            title = "Describe OpenRouter Model",
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn describe_model(
+        &self,
+        Parameters(args): Parameters<DescribeModelArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let model = args.model.trim();
+        if model.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "model is required (an exact id, e.g. \"anthropic/claude-opus-4.7\")".to_string(),
+                None,
+            ));
+        }
+
+        let detail = self
+            .client
+            .describe_model(model)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&detail)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +184,45 @@ mod tests {
         // The tool returns the model list as pretty JSON text content.
         let body = serde_json::to_string(&result).unwrap();
         assert!(body.contains("openai/gpt"));
+    }
+
+    #[tokio::test]
+    async fn describe_model_tool_returns_full_detail_json() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/anthropic/claude-opus-4.7/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "anthropic/claude-opus-4.7",
+                    "endpoints": [{"provider_name": "Anthropic", "context_length": 1000000}]
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "anthropic/claude-opus-4.7".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let body = serde_json::to_string(&result).unwrap();
+        assert!(body.contains("anthropic/claude-opus-4.7"));
+        assert!(body.contains("Anthropic"));
+    }
+
+    #[tokio::test]
+    async fn describe_model_tool_requires_model_id() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let err = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "   ".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("model is required"));
     }
 
     #[tokio::test]
