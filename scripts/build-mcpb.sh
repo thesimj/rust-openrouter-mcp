@@ -30,8 +30,8 @@ lipo -create -output "$MCPB_DIR/bin/$BIN_NAME" \
 chmod +x "$MCPB_DIR/bin/$BIN_NAME"
 lipo -info "$MCPB_DIR/bin/$BIN_NAME"
 
-echo "==> Refreshing icon"
-node "$MCPB_DIR/make-icon.mjs"
+echo "==> Refreshing icon from assets/logo.png"
+sips -s format png -z 512 512 "$ROOT/assets/logo.png" --out "$MCPB_DIR/icon.png" >/dev/null
 
 echo "==> Validating manifest"
 npx -y @anthropic-ai/mcpb validate "$MCPB_DIR/manifest.json"

@@ -1,0 +1,83 @@
+{
+  "endpoint": "/api/v1/chat/completions",
+  "model": "google/gemini-3.1-flash-image-preview",
+  "prompt": "A modern, minimal app-icon logo for a developer tool \"OpenRouter MCP\". Central motif: a glowing routing hub — one node fanning connections out to several smaller nodes (one binary routing to many AI models). Subtly fold in a Rust-language cue (a small steel gear/cog) and the OpenRouter palette (deep slate background, warm orange/amber accent). Flat vector style, clean geometric shapes, bold and legible at small sizes, soft inner glow, centered on a rounded-square dark background. No text. High contrast, crisp edges, professional, suitable as a macOS app icon.",
+  "prompt_source": "inline",
+  "modalities": [
+    "image",
+    "text"
+  ],
+  "aspect_ratio": "1:1",
+  "image_size": "2K",
+  "base_seed": null,
+  "variants_requested": 4,
+  "max_image_dimension": 800,
+  "created_at": "2026-06-17T22:48:08.334843+00:00",
+  "input_images": [],
+  "variants": [
+    {
+      "index": 1,
+      "seed": null,
+      "path": "./assets/logo-var-001.png",
+      "mime_type": "image/png",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736468-e1aHyMYyUMvHcZ8NzhF4",
+      "provider": "Google",
+      "duration_ms": 19498,
+      "cost": 0.100862
+    },
+    {
+      "index": 2,
+      "seed": null,
+      "path": "./assets/logo-var-002.jpg",
+      "mime_type": "image/jpeg",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736468-lyck6vmO0vFacSiRlKln",
+      "provider": "Google AI Studio",
+      "duration_ms": 15524,
+      "cost": 0.1020295
+    },
+    {
+      "index": 3,
+      "seed": null,
+      "path": "./assets/logo-var-003.jpg",
+      "mime_type": "image/jpeg",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736468-EHQS42RsFOtiMXpWSDQG",
+      "provider": "Google AI Studio",
+      "duration_ms": 15128,
+      "cost": 0.1021615
+    },
+    {
+      "index": 4,
+      "seed": null,
+      "path": "./assets/logo-var-004.png",
+      "mime_type": "image/png",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736468-poR6LBpCoQGhh5oGICPu",
+      "provider": "Google",
+      "duration_ms": 18147,
+      "cost": 0.100862
+    }
+  ]
+}

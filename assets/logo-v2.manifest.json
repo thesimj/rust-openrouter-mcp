@@ -1,0 +1,95 @@
+{
+  "endpoint": "/api/v1/chat/completions",
+  "model": "google/gemini-3.1-flash-image-preview",
+  "prompt": "Using the exact visual style, color palette, and lighting of the provided reference image, design a square app-icon LOGO for a developer tool \"OpenRouter MCP\". Central motif: the same isometric glowing dark terminal/binary cube (with a subtle \">_\" command-prompt glyph on its front face) acting as a routing hub, with a few clean glowing routes fanning out to small multimodal output nodes — a tiny image tile, a video frame, an audio waveform, and a chat bubble. Match the reference's dark slate background, warm orange + teal accents, soft neon glow, subtle circuit lines, and clean flat-3D style. Compose as a centered, rounded-square dark app icon, bold and legible at small sizes. No text labels, no third-party brand logos.",
+  "prompt_source": "inline",
+  "modalities": [
+    "image",
+    "text"
+  ],
+  "aspect_ratio": "1:1",
+  "image_size": "2K",
+  "base_seed": null,
+  "variants_requested": 4,
+  "max_image_dimension": 800,
+  "created_at": "2026-06-17T22:52:05.853841+00:00",
+  "input_images": [
+    {
+      "index": 1,
+      "label": "style_reference",
+      "source": "./assets/hero-var-002.png",
+      "original_width": 2752,
+      "original_height": 1536,
+      "normalized_mime_type": "image/png",
+      "normalized_width": 800,
+      "normalized_height": 447,
+      "normalization_max_side": 800
+    }
+  ],
+  "variants": [
+    {
+      "index": 1,
+      "seed": null,
+      "path": "./assets/logo-v2-var-001.jpg",
+      "mime_type": "image/jpeg",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736699-DLG51hMe3f5cofeTUdFi",
+      "provider": "Google AI Studio",
+      "duration_ms": 15426,
+      "cost": 0.101991
+    },
+    {
+      "index": 2,
+      "seed": null,
+      "path": "./assets/logo-v2-var-002.png",
+      "mime_type": "image/png",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736699-BJ5h3gIUAEAXdQVYklZN",
+      "provider": "Google",
+      "duration_ms": 26981,
+      "cost": 0.1014525
+    },
+    {
+      "index": 3,
+      "seed": null,
+      "path": "./assets/logo-v2-var-003.jpg",
+      "mime_type": "image/jpeg",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736699-QQPB46zuN9cQQg1IMwhU",
+      "provider": "Google AI Studio",
+      "duration_ms": 14850,
+      "cost": 0.101814
+    },
+    {
+      "index": 4,
+      "seed": null,
+      "path": "./assets/logo-v2-var-004.png",
+      "mime_type": "image/png",
+      "width": 2048,
+      "height": 2048,
+      "requested_aspect_ratio": "1:1",
+      "requested_image_size": "2K",
+      "actual_aspect_ratio": "1:1",
+      "actual_image_size": "2K",
+      "generation_id": "gen-1781736699-JQ84jSHD6hvz4D2Dgz3O",
+      "provider": "Google",
+      "duration_ms": 25869,
+      "cost": 0.1014525
+    }
+  ]
+}

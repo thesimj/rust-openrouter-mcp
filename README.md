@@ -4,6 +4,10 @@
 [![Release MCPB](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml/badge.svg)](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp/blob/main/Cargo.toml)
 
+<p align="center">
+  <img src="assets/hero.png" alt="rust-openrouter-mcp - one Rust binary routing an AI assistant to OpenRouter's models" width="100%">
+</p>
+
 MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
 single Rust binary. Discover models, generate and edit images (with parallel
 variants and a sidecar manifest), describe images with a vision model, and track
