@@ -47,3 +47,11 @@ uuid = { version = "1", features = ["v7"] }
 # without hitting the live API. Not shipped to users (dev-dependencies are
 # excluded from `cargo install` and the published crate).
 wiremock = "0.6"
+
+[profile.release]
+opt-level = "z"      # optimize for size
+debug = false        # no DWARF debug info (this is the cargo default; explicit here)
+strip = "symbols"    # also drop the symbol table -> smaller binary, no debug/symbol info
+lto = "thin"         # cross-crate inlining + dead-code elimination across all crates
+codegen-units = 1    # whole-program optimization (slower compile, smaller output)
+panic = "abort"      # drop unwinding tables/landing pads (release aborts on panic)
