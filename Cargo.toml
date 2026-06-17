@@ -9,7 +9,7 @@ authors = ["Nick Bubelich <n+github@bubelich.com>"]
 repository = "https://github.com/thesimj/rust-openrouter-mcp"
 homepage = "https://github.com/thesimj/rust-openrouter-mcp"
 readme = "README.md"
-keywords = ["mcp", "openrouter", "llm", "image-generation", "vision"]
+keywords = ["mcp", "openrouter", "cli", "image-generation", "vision"]
 categories = ["api-bindings", "command-line-utilities", "multimedia::images"]
 include = [
     "Cargo.toml",
