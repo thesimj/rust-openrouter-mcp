@@ -37,8 +37,8 @@ struct Inner {
     by_model: BTreeMap<String, ModelStats>,
 }
 
-impl Inner {
-    fn new() -> Self {
+impl Default for Inner {
+    fn default() -> Self {
         Self {
             started_at: Utc::now(),
             requests_total: 0,
@@ -54,6 +54,24 @@ impl Inner {
             unknown_cost_count: 0,
             by_model: BTreeMap::new(),
         }
+    }
+}
+
+impl Inner {
+    /// Add a reported (or unreported) cost to both the global and a per-model
+    /// counter: known costs accumulate in `actual_cost_usd`, unknown ones bump
+    /// `unknown_cost_count`. Returns the per-model entry for further updates.
+    fn account_cost(&mut self, model: &str, cost: Option<f64>) -> &mut ModelStats {
+        match cost {
+            Some(c) => self.actual_cost_usd += c,
+            None => self.unknown_cost_count += 1,
+        }
+        let m = self.by_model.entry(model.to_string()).or_default();
+        match cost {
+            Some(c) => m.actual_cost_usd += c,
+            None => m.unknown_cost_count += 1,
+        }
+        m
     }
 }
 
@@ -76,7 +94,7 @@ impl Default for UsageStats {
 impl UsageStats {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner::new())),
+            inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
 
@@ -117,16 +135,7 @@ impl UsageStats {
             return;
         }
         s.text_generations += 1;
-        match cost {
-            Some(c) => s.actual_cost_usd += c,
-            None => s.unknown_cost_count += 1,
-        }
-        let m = s.by_model.entry(model.to_string()).or_default();
-        m.requests += 1;
-        match cost {
-            Some(c) => m.actual_cost_usd += c,
-            None => m.unknown_cost_count += 1,
-        }
+        s.account_cost(model, cost).requests += 1;
     }
 
     /// Record one finished video generation. `success` is false when the job
@@ -141,17 +150,9 @@ impl UsageStats {
             return;
         }
         s.videos_generated += 1;
-        match cost {
-            Some(c) => s.actual_cost_usd += c,
-            None => s.unknown_cost_count += 1,
-        }
-        let m = s.by_model.entry(model.to_string()).or_default();
+        let m = s.account_cost(model, cost);
         m.requests += 1;
         m.videos_generated += 1;
-        match cost {
-            Some(c) => m.actual_cost_usd += c,
-            None => m.unknown_cost_count += 1,
-        }
     }
 
     /// Record one finished text-to-speech request. `cost` is typically `None`
@@ -167,17 +168,9 @@ impl UsageStats {
             return;
         }
         s.audio_files += 1;
-        match cost {
-            Some(c) => s.actual_cost_usd += c,
-            None => s.unknown_cost_count += 1,
-        }
-        let m = s.by_model.entry(model.to_string()).or_default();
+        let m = s.account_cost(model, cost);
         m.requests += 1;
         m.audio_files += 1;
-        match cost {
-            Some(c) => m.actual_cost_usd += c,
-            None => m.unknown_cost_count += 1,
-        }
     }
 
     /// A JSON snapshot of the current counters.
@@ -221,7 +214,7 @@ impl UsageStats {
 
     /// Reset all counters (and the start time).
     pub async fn reset(&self) {
-        *self.inner.lock().await = Inner::new();
+        *self.inner.lock().await = Inner::default();
     }
 }
 

@@ -1,10 +1,5 @@
-//! Video-generation orchestration over the async OpenRouter video job API.
-//!
-//! Unlike image generation (synchronous chat-completions), video uses an async
-//! job API: submit `POST /api/v1/videos`, poll `GET /api/v1/videos/{id}` until
-//! the job completes or fails, then download each clip from the content
-//! endpoint. Frame images (first/last) and reference images are reused from the
-//! image input pipeline (normalized to PNG data URLs).
+//! Video job orchestration: submit, poll, download each clip, write the sidecar
+//! manifest, and return a lean summary. Shared by the CLI and the MCP tool.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -15,94 +10,7 @@ use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
 use crate::openrouter::{FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoSubmitBody};
 
-/// Default seconds between poll attempts (env `OPENROUTER_VIDEO_POLL_INTERVAL`).
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
-/// Default ceiling on the background poll loop (env `OPENROUTER_VIDEO_POLL_TIMEOUT`).
-const DEFAULT_POLL_TIMEOUT_SECS: u64 = 600;
-
-/// A local image used as a video frame (first/last). `frame_type` is
-/// `first_frame` or `last_frame`.
-#[derive(Debug, Clone)]
-pub struct VideoInput {
-    pub path: PathBuf,
-    pub frame_type: String,
-}
-
-/// Inputs for a single video generation (domain struct; the wire body is
-/// [`openrouter::VideoSubmitBody`]).
-#[derive(Debug, Clone)]
-pub struct VideoGenRequest {
-    pub model: String,
-    pub prompt: String,
-    pub duration: Option<u32>,
-    pub resolution: Option<String>,
-    pub aspect_ratio: Option<String>,
-    pub size: Option<String>,
-    pub generate_audio: Option<bool>,
-    pub seed: Option<u64>,
-    /// First/last frames for image-to-video. When present, `references` is ignored.
-    pub frames: Vec<VideoInput>,
-    /// Reference images for reference-to-video.
-    pub references: Vec<PathBuf>,
-    pub max_image_dimension: u32,
-    pub poll_interval_secs: u64,
-    pub poll_timeout_secs: u64,
-}
-
-/// Resolve the poll interval: explicit value, else `OPENROUTER_VIDEO_POLL_INTERVAL`,
-/// else [`DEFAULT_POLL_INTERVAL_SECS`].
-pub fn resolve_poll_interval(explicit: Option<u64>) -> u64 {
-    explicit
-        .or_else(|| {
-            std::env::var("OPENROUTER_VIDEO_POLL_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
-        .max(1)
-}
-
-/// Resolve the poll timeout: explicit value, else `OPENROUTER_VIDEO_POLL_TIMEOUT`,
-/// else [`DEFAULT_POLL_TIMEOUT_SECS`].
-pub fn resolve_poll_timeout(explicit: Option<u64>) -> u64 {
-    explicit
-        .or_else(|| {
-            std::env::var("OPENROUTER_VIDEO_POLL_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(DEFAULT_POLL_TIMEOUT_SECS)
-        .max(1)
-}
-
-/// One saved clip in a job's lean summary.
-pub struct VideoSummary {
-    pub path: PathBuf,
-    pub duration: Option<u32>,
-    pub resolution: Option<String>,
-    pub aspect_ratio: Option<String>,
-    pub has_audio: bool,
-    pub mime: String,
-    pub cost: Option<f64>,
-    /// OpenRouter generation id, recorded in the manifest.
-    #[allow(dead_code)]
-    pub generation_id: Option<String>,
-}
-
-/// Result of a full video job: the saved clips, the manifest path, plus warnings
-/// and errors.
-pub struct VideoJobSummary {
-    pub model: String,
-    pub manifest_path: PathBuf,
-    pub videos: Vec<VideoSummary>,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
-}
-
-/// Sidecar manifest path next to the outputs: `<stem>.manifest.json`.
-pub fn manifest_path(base: &Path) -> PathBuf {
-    image_gen::manifest_path(base)
-}
+use super::{VideoGenRequest, VideoJobSummary, VideoSummary, manifest_path};
 
 /// File extension for a video/audio MIME type. Falls back to `mp4`.
 fn extension_for(mime: &str) -> &'static str {
@@ -154,15 +62,16 @@ pub async fn run_job(
         );
     }
 
+    // Build unlabeled InputImages (frames/references carry no per-image label).
+    let unlabeled = |paths: Vec<PathBuf>| -> Vec<InputImage> {
+        paths
+            .into_iter()
+            .map(|path| InputImage { path, label: None })
+            .collect()
+    };
+
     // Normalize frames once, up front (a read/decode failure fails before spend).
-    let frame_inputs: Vec<InputImage> = req
-        .frames
-        .iter()
-        .map(|f| InputImage {
-            path: f.path.clone(),
-            label: None,
-        })
-        .collect();
+    let frame_inputs = unlabeled(req.frames.iter().map(|f| f.path.clone()).collect());
     let frame_prepared = image_gen::prepare_inputs(&frame_inputs, req.max_image_dimension)?;
     let mut frame_images = Vec::new();
     let mut frame_meta = Vec::new();
@@ -189,14 +98,7 @@ pub async fn run_job(
     let mut input_references = Vec::new();
     let mut reference_meta = Vec::new();
     if !use_frames {
-        let ref_inputs: Vec<InputImage> = req
-            .references
-            .iter()
-            .map(|p| InputImage {
-                path: p.clone(),
-                label: None,
-            })
-            .collect();
+        let ref_inputs = unlabeled(req.references.clone());
         let ref_prepared = image_gen::prepare_inputs(&ref_inputs, req.max_image_dimension)?;
         for (p, prep) in req.references.iter().zip(&ref_prepared) {
             input_references.push(InputReference::new(ImageUrl {
@@ -387,14 +289,6 @@ mod tests {
         assert_eq!(single, PathBuf::from("out/clip.mp4"));
         let multi = clip_output_path(Path::new("out/clip.mp4"), 1, 3, "webm");
         assert_eq!(multi, PathBuf::from("out/clip-clip-002.webm"));
-    }
-
-    #[test]
-    fn resolve_poll_interval_and_timeout_default_and_floor_at_one() {
-        assert_eq!(resolve_poll_interval(Some(9)), 9);
-        assert_eq!(resolve_poll_interval(Some(0)), 1, "floors at 1");
-        assert_eq!(resolve_poll_timeout(Some(120)), 120);
-        assert_eq!(resolve_poll_timeout(Some(0)), 1, "floors at 1");
     }
 
     #[tokio::test]
