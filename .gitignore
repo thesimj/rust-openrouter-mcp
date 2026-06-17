@@ -21,6 +21,11 @@ target/
 # Local scratch folder (not committed)
 __local/
 
+# MCPB build outputs (the bundled binary and packed extension are built in CI;
+# the manifest, icon, and generator script under mcpb/ ARE committed)
+/dist/
+/mcpb/bin/
+
 # Environment files (secrets, e.g. OPENROUTER_API_KEY)
 .env
 .env.*

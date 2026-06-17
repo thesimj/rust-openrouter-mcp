@@ -25,7 +25,27 @@ per-process usage — all behind one `openrouter-mcp` executable.
   (destructive, requires `confirm: true`): per-process request/cost counters with
   a by-model breakdown.
 
-## Install
+## Add to Claude Desktop (one-click)
+
+This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS** — no
+terminal or Rust toolchain required.
+
+1. Download `openrouter-mcp.mcpb` from the
+   [latest release](https://github.com/thesimj/rust-openrouter-mcp/releases/latest).
+2. Double-click it (or drag it into **Claude Desktop → Settings → Extensions**).
+3. Click **Install**, paste your
+   [OpenRouter API key](https://openrouter.ai/keys), and enable it.
+
+Your API key is stored in the macOS keychain by Claude Desktop and injected into
+the server as `OPENROUTER_API_KEY`. See [Privacy Policy](#privacy-policy).
+
+To build the bundle yourself (produces a universal arm64+x86_64 binary):
+
+```bash
+scripts/build-mcpb.sh        # -> dist/openrouter-mcp.mcpb
+```
+
+## Install (CLI / other MCP clients)
 
 From a local checkout:
 
@@ -169,6 +189,15 @@ Live smoke tests (require `OPENROUTER_API_KEY`):
 cargo run -- models --query openai --sort newest --table
 cargo run -- describe -m google/gemini-2.5-flash-lite --image ./some.png
 ```
+
+## Privacy Policy
+
+`openrouter-mcp` runs entirely on your machine and collects no telemetry. The
+only third party it contacts is [OpenRouter](https://openrouter.ai), and only to
+fulfill the requests you make (model discovery, image generation/description).
+Your API key is sent solely to OpenRouter to authenticate those calls. Generated
+images are written only to paths you specify; usage stats live in memory and are
+lost on exit. Full details: [PRIVACY.md](PRIVACY.md).
 
 ## License
 
