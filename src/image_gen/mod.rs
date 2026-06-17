@@ -253,6 +253,8 @@ fn user_chat(
         modalities,
         image_config,
         seed,
+        temperature: None,
+        max_tokens: None,
         stream: false,
     }
 }

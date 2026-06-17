@@ -18,6 +18,7 @@ use crate::tasks::TaskRegistry;
 
 mod account;
 mod audio;
+mod chat;
 mod image;
 mod models;
 mod naming;
@@ -47,6 +48,7 @@ impl OpenRouterServer {
                 + Self::image_router()
                 + Self::video_router()
                 + Self::audio_router()
+                + Self::chat_router()
                 + Self::account_router(),
         }
     }

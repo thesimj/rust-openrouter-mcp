@@ -18,6 +18,12 @@ pub struct ChatRequest {
     pub image_config: Option<ImageConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// Sampling temperature; omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Max tokens to generate; omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     pub stream: bool,
 }
 

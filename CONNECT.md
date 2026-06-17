@@ -282,8 +282,8 @@ in the server's `env`. See [Configuration](README.md#configuration).
 
 Most clients list discovered tools after connecting. You should see:
 `list_models`, `describe_model`, `generate_image`, `generate_video`,
-`generate_audio`, `get_result`, `describe_image`, `get_account`,
-`get_usage_stats`, `reset_usage_stats`. Ask the agent to *"list OpenRouter image
+`generate_audio`, `chat_completion`, `get_result`, `describe_image`,
+`get_account`, `get_usage_stats`, `reset_usage_stats`. Ask the agent to *"list OpenRouter image
 models"* to confirm `list_models` runs.
 
 You can also sanity-check the binary by hand:

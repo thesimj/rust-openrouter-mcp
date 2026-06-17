@@ -143,12 +143,16 @@ block is optional.
 
 | Tool | Kind | Description |
 | --- | --- | --- |
-| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search). |
-| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. **No defaults** - `model`, `prompt`, `output`, `aspect_ratio`, `image_size`, and `image_only` must all be set. |
+| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing). |
+| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, and (for video models) real `pricing_skus`. |
+| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`, `image_only`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
+| `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
+| `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
+| `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply (text in, text out); route a sub-task to a different model. |
+| `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
-| `describe_image` | read-only | Describe local image(s) with a vision-capable model; returns text. |
 | `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |
-| `get_usage_stats` | read-only | In-memory request/cost counters with a by-model breakdown. |
+| `get_usage_stats` | read-only | In-memory request/cost counters (and server `version`) with a by-model breakdown. |
 | `reset_usage_stats` | destructive | Reset all counters (`confirm: true` required). |
 
 `generate_image` returns a lean result - saved paths, decoded width/height,
