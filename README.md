@@ -45,6 +45,13 @@ To build the bundle yourself (produces a universal arm64+x86_64 binary):
 scripts/build-mcpb.sh        # -> dist/openrouter-mcp.mcpb
 ```
 
+## Connect another client (CLI, IDE, agent)
+
+`openrouter-mcp` is a universal local stdio MCP server. **[CONNECT.md](CONNECT.md)**
+has copy-paste setup for Claude Code, Codex CLI, Gemini CLI, Antigravity, Cursor,
+Windsurf, VS Code (Copilot), Zed, Cline, Roo Code, Continue, Goose, opencode,
+Crush, Amp, OpenHands, and more.
+
 ## Install (CLI / other MCP clients)
 
 From a local checkout:
