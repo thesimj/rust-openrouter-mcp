@@ -1,5 +1,9 @@
 # rust-openrouter-mcp
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp#license)
+[![Release MCPB](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml/badge.svg)](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp/blob/main/Cargo.toml)
+
 MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
 single Rust binary. Discover models, generate and edit images (with parallel
 variants and a sidecar manifest), describe images with a vision model, and track
@@ -71,6 +75,14 @@ Crush, Amp, OpenHands, and more.
 
 ## Install (CLI / other MCP clients)
 
+One-click install into a supported IDE (both wire up `openrouter-mcp mcp` over
+stdio - replace the placeholder `sk-or-v1-YOUR_KEY` with your real key after):
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=openrouter&config=eyJjb21tYW5kIjogIm9wZW5yb3V0ZXItbWNwIiwgImFyZ3MiOiBbIm1jcCJdLCAiZW52IjogeyJPUEVOUk9VVEVSX0FQSV9LRVkiOiAic2stb3ItdjEtWU9VUl9LRVkifX0=)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=openrouter&config=%7B%22command%22%3A%20%22openrouter-mcp%22%2C%20%22args%22%3A%20%5B%22mcp%22%5D%2C%20%22env%22%3A%20%7B%22OPENROUTER_API_KEY%22%3A%20%22sk-or-v1-YOUR_KEY%22%7D%7D)
+
+Both require `openrouter-mcp` to be on your `PATH` (install it below first).
+
 From a local checkout:
 
 ```bash
@@ -105,12 +117,23 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 Do not commit `.env`.
 
-Optional: `OPENROUTER_IMAGE_MAX_DIMENSION` (default `800`) caps the longest side
-of input images before they are sent (raster inputs are downscaled to reduce
-request size/cost; SVG inputs are rasterized with their longest side scaled to
-this cap).
+All environment variables read by the server/CLI:
 
-Optional: `OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image` /
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
+| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image` / `get_result` embed inline base64 image previews: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
+| `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
+| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. | `800` |
+| `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
+| `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
+| `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |
+| `OPENROUTER_X_TITLE` | Overrides the `X-Title` app-attribution header. | `rust-openrouter-mcp` |
+| `HOME` | OS variable; only used to derive the default output directory when `OPENROUTER_MCP_OUTPUT_DIR` is unset. | (OS-provided) |
+
+A few of these warrant extra detail.
+
+`OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image` /
 `get_result` embed the generated image **inline** (base64) in the tool result, in
 addition to saving it to disk:
 
@@ -126,6 +149,9 @@ Inline previews are downscaled to a 1568px longest side; the full-resolution
 image is always the file saved on disk.
 
 ## MCP usage
+
+The server speaks MCP over stdio (the `mcp` subcommand); it is local-only, with
+no remote/HTTP transport.
 
 Start the stdio server (`mcp` subcommand is implied when none is given):
 
