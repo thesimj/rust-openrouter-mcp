@@ -195,6 +195,7 @@ impl UsageStats {
             })
             .collect();
         json!({
+            "version": env!("CARGO_PKG_VERSION"),
             "started_at": s.started_at.to_rfc3339(),
             "uptime_seconds": uptime,
             "requests_total": s.requests_total,
@@ -230,6 +231,7 @@ mod tests {
         stats.record_job("model-b", 1, 1, 0.04, 0).await;
 
         let s = stats.snapshot().await;
+        assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(s["requests_total"], 5);
         assert_eq!(s["requests_failed"], 1);
         assert_eq!(s["images_generated"], 4);
