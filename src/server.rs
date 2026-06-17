@@ -1,9 +1,11 @@
 //! The rmcp stdio MCP server and its tools.
 
+use base64::Engine;
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -78,6 +80,79 @@ fn job_result_json(
         result["errors"] = json!(summary.errors);
     }
     result
+}
+
+/// Longest-side cap (px) for the inline preview embedded in a tool result. The
+/// full-resolution image always stays on disk; this only bounds the base64 copy
+/// sent to the client so generated images render without bloating context.
+/// ~1568px is Claude's image sweet spot (larger is downsampled client-side).
+const PREVIEW_MAX_SIDE: u32 = 1568;
+
+/// Turn a completed job envelope into inline image content blocks so the client
+/// (e.g. Claude Desktop) renders the generated images, not just their paths.
+/// Reads each `images[].path` from disk, downscales to [`PREVIEW_MAX_SIDE`], and
+/// base64-encodes it as a PNG `image` content block. Unreadable files are skipped
+/// (the JSON text block still reports their paths), so this never fails the call.
+fn preview_image_blocks(env: &serde_json::Value) -> Vec<Content> {
+    let Some(images) = env.get("images").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    images
+        .iter()
+        .filter_map(|img| img.get("path").and_then(|p| p.as_str()))
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let png = crate::image_io::normalize_to_png(&bytes, PREVIEW_MAX_SIDE).ok()?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+            Some(Content::image(b64, "image/png".to_string()))
+        })
+        .collect()
+}
+
+/// Decide whether to embed inline image previews for the connected client.
+///
+/// Why this is client-dependent: a local CLI (Claude Code) shares the
+/// filesystem, so a returned path *is* the image — inline base64 only bloats
+/// context. Claude Desktop, by contrast, runs the MCP server in a sandbox whose
+/// filesystem the app can't read, so a path is useless and the bytes must be
+/// returned inline or the image is stranded.
+///
+/// `OPENROUTER_MCP_IMAGE_PREVIEWS` overrides detection: `always` / `never`
+/// (anything else, or unset, means `auto`). The `.mcpb` connector sets `always`.
+/// In `auto` we return previews for every client *except* the local-filesystem
+/// CLI (`claude-code`), so the failure-prone case (Desktop) is covered by default.
+fn client_wants_inline_previews(ctx: &RequestContext<RoleServer>) -> bool {
+    match std::env::var("OPENROUTER_MCP_IMAGE_PREVIEWS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("always") => return true,
+        Some("never") => return false,
+        _ => {}
+    }
+    let client = ctx
+        .peer
+        .peer_info()
+        .map(|info| info.client_info.name.to_ascii_lowercase())
+        .unwrap_or_default();
+    !client.contains("claude-code")
+}
+
+/// Build the full tool result for a job envelope: the JSON metadata as a text
+/// block, followed (when `inline_previews` and the job completed) by an inline
+/// image preview of each generated image.
+fn job_call_result(
+    env: &serde_json::Value,
+    inline_previews: bool,
+) -> Result<CallToolResult, ErrorData> {
+    let body = serde_json::to_string_pretty(env)
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    let mut blocks = vec![Content::text(body)];
+    if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
+        blocks.extend(preview_image_blocks(env));
+    }
+    Ok(CallToolResult::success(blocks))
 }
 
 /// Wrap a task snapshot into the response envelope returned by `generate_image`
@@ -302,6 +377,19 @@ impl OpenRouterServer {
     async fn generate_image(
         &self,
         Parameters(args): Parameters<GenerateImageArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inline_previews = client_wants_inline_previews(&context);
+        self.run_generate(args, inline_previews).await
+    }
+
+    /// Core of `generate_image`, parameterized on whether to embed inline image
+    /// previews (decided per-client by the tool entrypoint). Separated so tests
+    /// can drive it without constructing a transport `RequestContext`.
+    async fn run_generate(
+        &self,
+        args: GenerateImageArgs,
+        inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
         // No defaults: the agent must choose these explicitly.
         let mut missing: Vec<&str> = Vec::new();
@@ -412,9 +500,7 @@ impl OpenRouterServer {
             .await
             .expect("task was just inserted");
         let env = snapshot_to_envelope(&task_id, &snap);
-        let body = serde_json::to_string_pretty(&env)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        job_call_result(&env, inline_previews)
     }
 
     #[tool(
@@ -432,18 +518,27 @@ impl OpenRouterServer {
     async fn get_result(
         &self,
         Parameters(args): Parameters<GetResultArgs>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.tasks.snapshot(&args.task_id).await {
+        let inline_previews = client_wants_inline_previews(&context);
+        self.run_get_result(args.task_id, inline_previews).await
+    }
+
+    /// Core of `get_result`, parameterized on inline previews like
+    /// [`Self::run_generate`], so tests can call it without a `RequestContext`.
+    async fn run_get_result(
+        &self,
+        task_id: String,
+        inline_previews: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.tasks.snapshot(&task_id).await {
             Some(snap) => {
-                let env = snapshot_to_envelope(&args.task_id, &snap);
-                let body = serde_json::to_string_pretty(&env)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                let env = snapshot_to_envelope(&task_id, &snap);
+                job_call_result(&env, inline_previews)
             }
             None => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown task_id \"{}\" (tasks are in-memory per server process and lost on restart)",
-                    args.task_id
+                    "unknown task_id \"{task_id}\" (tasks are in-memory per server process and lost on restart)"
                 ),
                 None,
             )),
@@ -576,9 +671,6 @@ mod tests {
 
     use super::*;
 
-    // 1x1 PNG (header is valid; full decode is not exercised on this path).
-    const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
-
     /// Build a server whose client talks to the given mock OpenRouter base URL.
     fn server_for(uri: String) -> OpenRouterServer {
         OpenRouterServer::new(OpenRouterClient::with_base_url(uri, "test-key"))
@@ -591,10 +683,22 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// Base64 of a genuinely decodable 2x2 PNG, used wherever a test needs an
+    /// image the preview path can decode + re-encode (it stands in for the valid
+    /// images real providers return).
+    fn valid_png_b64() -> String {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 120, 200, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+    }
+
     #[tokio::test]
     async fn generate_image_runs_async_and_get_result_fetches_it() {
         let mock = MockServer::start().await;
-        let data_url = format!("data:image/png;base64,{PNG_1X1_B64}");
+        let data_url = format!("data:image/png;base64,{}", valid_png_b64());
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -620,23 +724,109 @@ mod tests {
             output: out.to_string_lossy().into_owned(),
         };
         // Fast mock completes within the wait window -> inline completed result.
-        let res = server.generate_image(Parameters(args)).await.unwrap();
+        // inline_previews=true mirrors a Claude Desktop client.
+        let res = server.run_generate(args, true).await.unwrap();
         let v = tool_result_json(&res);
         assert_eq!(v["status"], "completed");
         assert_eq!(v["kind"], "image");
         assert!(v["images"][0]["path"].is_string());
         let task_id = v["task_id"].as_str().unwrap().to_string();
 
-        // The same task is retrievable by id.
-        let res2 = server
-            .get_result(Parameters(GetResultArgs {
-                task_id: task_id.clone(),
-            }))
-            .await
-            .unwrap();
+        // The completed result also carries an inline image preview block so
+        // the client renders the generated image, not just its path.
+        let full = serde_json::to_value(&res).unwrap();
+        let img_block = full["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "image")
+            .expect("an image content block is present");
+        assert_eq!(img_block["mimeType"], "image/png");
+        assert!(!img_block["data"].as_str().unwrap().is_empty());
+
+        // The same task is retrievable by id, also with an inline preview.
+        let res2 = server.run_get_result(task_id.clone(), true).await.unwrap();
         let v2 = tool_result_json(&res2);
         assert_eq!(v2["status"], "completed");
         assert_eq!(v2["task_id"], task_id);
+        let full2 = serde_json::to_value(&res2).unwrap();
+        assert!(
+            full2["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "image"),
+            "get_result also returns the inline preview"
+        );
+
+        // A CLI-style client (inline_previews=false) gets paths only, no image block.
+        let res_cli = server.run_get_result(task_id.clone(), false).await.unwrap();
+        let full_cli = serde_json::to_value(&res_cli).unwrap();
+        assert!(
+            !full_cli["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "image"),
+            "no inline preview when the client doesn't want it"
+        );
+    }
+
+    #[test]
+    fn preview_image_blocks_reads_existing_and_skips_missing() {
+        // A valid PNG on disk yields one image block.
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(valid_png_b64())
+            .unwrap();
+        let dir = std::env::temp_dir();
+        let good = dir.join("openrouter-mcp-preview-good.png");
+        std::fs::write(&good, &png).unwrap();
+        let missing = dir.join("openrouter-mcp-preview-missing.png");
+        let _ = std::fs::remove_file(&missing);
+
+        let env = json!({
+            "images": [
+                { "path": good.to_string_lossy() },
+                { "path": missing.to_string_lossy() },
+            ]
+        });
+        let blocks = preview_image_blocks(&env);
+        assert_eq!(blocks.len(), 1, "only the readable image becomes a block");
+        let v = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["mimeType"], "image/png");
+        assert!(!v["data"].as_str().unwrap().is_empty());
+
+        // No images array -> no blocks.
+        assert!(preview_image_blocks(&json!({ "status": "completed" })).is_empty());
+    }
+
+    #[test]
+    fn job_call_result_gates_previews_on_the_flag() {
+        let good = std::env::temp_dir().join("openrouter-mcp-gate-good.png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(valid_png_b64())
+            .unwrap();
+        std::fs::write(&good, &png).unwrap();
+        let env = json!({
+            "status": "completed",
+            "images": [ { "path": good.to_string_lossy() } ],
+        });
+
+        let has_image = |res: &CallToolResult| {
+            serde_json::to_value(res).unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "image")
+        };
+        // Desktop-style: previews on. CLI-style: text only.
+        assert!(has_image(&job_call_result(&env, true).unwrap()));
+        assert!(!has_image(&job_call_result(&env, false).unwrap()));
+
+        // A pending job never carries a preview, even with previews enabled.
+        let pending = json!({ "status": "pending", "images": [] });
+        assert!(!has_image(&job_call_result(&pending, true).unwrap()));
     }
 
     #[tokio::test]
@@ -659,9 +849,7 @@ mod tests {
     async fn get_result_unknown_task_errors() {
         let server = server_for("http://127.0.0.1:9".to_string());
         let err = server
-            .get_result(Parameters(GetResultArgs {
-                task_id: "nope".to_string(),
-            }))
+            .run_get_result("nope".to_string(), true)
             .await
             .unwrap_err();
         assert!(err.message.contains("unknown task_id"));
@@ -706,7 +894,7 @@ mod tests {
             wait_seconds: None,
             output: "out.png".to_string(),
         };
-        let err = server.generate_image(Parameters(args)).await.unwrap_err();
+        let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));
         assert!(err.message.contains("image_size"));
         assert!(err.message.contains("image_only"));

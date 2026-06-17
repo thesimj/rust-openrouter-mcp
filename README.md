@@ -84,6 +84,21 @@ Do not commit `.env`.
 Optional: `OPENROUTER_IMAGE_MAX_DIMENSION` (default `800`) caps the longest side
 of input images before they are sent (downscaled to reduce request size/cost).
 
+Optional: `OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image` /
+`get_result` embed the generated image **inline** (base64) in the tool result, in
+addition to saving it to disk:
+
+- `auto` (default) — inline previews for every client **except** the local
+  `claude-code` CLI, which shares the filesystem and can open the saved file
+  directly.
+- `always` — always embed previews. The Claude Desktop connector sets this,
+  because Desktop runs the server in a sandboxed filesystem it can't read, so the
+  saved path is unreachable and the image must come back inline.
+- `never` — paths only, never inline bytes.
+
+Inline previews are downscaled to a 1568px longest side; the full-resolution
+image is always the file saved on disk.
+
 ## MCP usage
 
 Start the stdio server (`mcp` subcommand is implied when none is given):

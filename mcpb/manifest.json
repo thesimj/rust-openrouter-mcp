@@ -31,7 +31,8 @@
       "command": "${__dirname}/bin/openrouter-mcp",
       "args": ["mcp"],
       "env": {
-        "OPENROUTER_API_KEY": "${user_config.api_key}"
+        "OPENROUTER_API_KEY": "${user_config.api_key}",
+        "OPENROUTER_MCP_IMAGE_PREVIEWS": "always"
       }
     }
   },
