@@ -161,12 +161,20 @@ the full per-variant detail lives in the manifest on disk.
 
 ## CLI usage
 
-The same binary is a CLI. Subcommands: `models`, `image`, `describe`, `key`, `mcp`.
+The same binary is a CLI. Subcommands: `models`, `image`, `video`, `audio`,
+`describe`, `chat`, `key`, `mcp`.
 
 Show info about the API key in use:
 
 ```bash
 openrouter-mcp key
+```
+
+Send a prompt to a chat/text model:
+
+```bash
+openrouter-mcp chat --model openai/gpt-5.4 --prompt "Summarize MCP in one sentence."
+openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -s "Be terse." -p "Why Rust?" --temperature 0.3
 ```
 
 Browse models:

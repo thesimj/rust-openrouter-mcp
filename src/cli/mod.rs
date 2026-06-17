@@ -39,6 +39,8 @@ enum Command {
     Audio(AudioArgs),
     /// Describe local image(s) with a vision-capable model.
     Describe(DescribeArgs),
+    /// Send a prompt to any chat/text model and print its reply.
+    Chat(ChatArgs),
     /// Show basic info about the API key in use (label, owner, credits, limits).
     Key,
 }
@@ -188,6 +190,29 @@ pub(crate) struct AudioArgs {
     output: PathBuf,
 }
 
+/// CLI flags for `chat`, mirroring the `chat_completion` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct ChatArgs {
+    /// Chat/text model id, e.g. openai/gpt-5.4 or anthropic/claude-sonnet-4.6.
+    #[arg(short, long)]
+    model: String,
+    /// Prompt text. Use --prompt-file to read from a file/stdin instead.
+    #[arg(short, long)]
+    prompt: Option<String>,
+    /// Read the prompt from a file (use '-' for stdin).
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Optional system instruction prepended as a system message.
+    #[arg(short, long)]
+    system: Option<String>,
+    /// Sampling temperature.
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// Maximum number of tokens to generate.
+    #[arg(long)]
+    max_tokens: Option<u64>,
+}
+
 /// CLI flags for `models`, mirroring the `list_models` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct ModelsArgs {
@@ -230,6 +255,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Video(args)) => commands::run_video(args).await,
         Some(Command::Audio(args)) => commands::run_audio(args).await,
         Some(Command::Describe(args)) => commands::run_describe(args).await,
+        Some(Command::Chat(args)) => commands::run_chat(args).await,
         Some(Command::Key) => commands::run_key().await,
         Some(Command::Mcp) | None => crate::server::run().await,
     }

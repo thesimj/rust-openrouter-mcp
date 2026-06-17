@@ -2,7 +2,7 @@
 
 use super::table::{primary_modality, render_sectioned_table};
 use super::{
-    AudioArgs, DescribeArgs, ImageArgs, ModelsArgs, VideoArgs, parse_image_arg,
+    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, VideoArgs, parse_image_arg,
     resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
@@ -81,6 +81,58 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
     let result = image_gen::describe_image(&client, &req).await?;
     println!("{}", result.text);
     if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
+/// Send a prompt to a chat/text model and print the reply to stdout (cost to
+/// stderr). Mirrors the `chat_completion` MCP tool.
+pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let (prompt, _source) = resolve_prompt(args.prompt, args.prompt_file)?;
+
+    let mut messages = Vec::new();
+    if let Some(system) = args
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        messages.push(openrouter::Message {
+            role: "system".to_string(),
+            content: openrouter::Content::Text(system.to_string()),
+        });
+    }
+    messages.push(openrouter::Message {
+        role: "user".to_string(),
+        content: openrouter::Content::Text(prompt),
+    });
+
+    let req = openrouter::ChatRequest {
+        model: args.model,
+        messages,
+        modalities: None,
+        image_config: None,
+        seed: None,
+        temperature: args.temperature,
+        max_tokens: args.max_tokens,
+        stream: false,
+    };
+    let resp = client.chat_completion(&req).await?;
+    let choice = resp
+        .completion
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("OpenRouter returned no choices"))?;
+    let text = choice
+        .message
+        .content
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("model returned no text"))?;
+    println!("{text}");
+    if let Some(cost) = resp.completion.usage.and_then(|u| u.cost) {
         eprintln!("cost: ${cost}");
     }
     Ok(())
