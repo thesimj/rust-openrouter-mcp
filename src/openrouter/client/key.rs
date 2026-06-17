@@ -31,10 +31,32 @@ impl OpenRouterClient {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::OpenRouterClient;
+
+    /// Every request carries the OpenRouter app-attribution headers
+    /// (`HTTP-Referer` / `X-Title`) so usage shows under the app in rankings.
+    /// The mock only matches when both headers are present with the defaults.
+    #[tokio::test]
+    async fn requests_send_app_attribution_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .and(header(
+                "HTTP-Referer",
+                "https://github.com/thesimj/rust-openrouter-mcp",
+            ))
+            .and(header("X-Title", "rust-openrouter-mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        // Succeeds only if the request matched the header expectations above.
+        client.get_key_info().await.unwrap();
+    }
 
     #[tokio::test]
     async fn get_key_info_parses_live_shaped_response() {

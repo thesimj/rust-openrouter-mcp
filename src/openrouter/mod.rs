@@ -12,6 +12,35 @@ use anyhow::{Context, Result};
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
 
+/// Default app-attribution values sent on every request. OpenRouter uses these
+/// to build the app's page and rankings (purely informational; no effect on
+/// pricing or responses). Both are overridable via the `OPENROUTER_HTTP_REFERER`
+/// and `OPENROUTER_X_TITLE` env vars.
+const APP_REFERER: &str = "https://github.com/thesimj/rust-openrouter-mcp";
+const APP_TITLE: &str = "rust-openrouter-mcp";
+
+/// Build the shared `reqwest::Client`, attaching the OpenRouter app-attribution
+/// headers (`HTTP-Referer` / `X-Title`) as defaults so every endpoint inherits
+/// them. Falls back to a bare client if header construction fails.
+fn build_http_client() -> reqwest::Client {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let referer = std::env::var("OPENROUTER_HTTP_REFERER").unwrap_or_else(|_| APP_REFERER.into());
+    let title = std::env::var("OPENROUTER_X_TITLE").unwrap_or_else(|_| APP_TITLE.into());
+    let mut headers = HeaderMap::new();
+    // Header names are case-insensitive on the wire; `from_static` requires
+    // lowercase. OpenRouter documents them as `HTTP-Referer` / `X-Title`.
+    if let Ok(v) = HeaderValue::from_str(&referer) {
+        headers.insert(HeaderName::from_static("http-referer"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&title) {
+        headers.insert(HeaderName::from_static("x-title"), v);
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Thin wrapper around `reqwest::Client` carrying the OpenRouter API key.
 #[derive(Clone)]
 pub struct OpenRouterClient {
@@ -44,7 +73,7 @@ impl OpenRouterClient {
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .context("OPENROUTER_API_KEY environment variable is not set")?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             api_key,
             base_url: BASE_URL.to_string(),
         })
@@ -55,7 +84,7 @@ impl OpenRouterClient {
     #[cfg(test)]
     pub(crate) fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             api_key: api_key.into(),
             base_url: base_url.into(),
         }
