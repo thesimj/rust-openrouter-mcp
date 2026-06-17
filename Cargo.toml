@@ -10,7 +10,7 @@ repository = "https://github.com/thesimj/rust-openrouter-mcp"
 homepage = "https://github.com/thesimj/rust-openrouter-mcp"
 readme = "README.md"
 keywords = ["mcp", "openrouter", "llm", "image-generation", "vision"]
-categories = ["api-bindings", "command-line-utilities"]
+categories = ["api-bindings", "command-line-utilities", "multimedia::images"]
 include = [
     "Cargo.toml",
     "Cargo.lock",
