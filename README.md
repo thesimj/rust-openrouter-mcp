@@ -8,7 +8,9 @@ per-process usage - all behind one `openrouter-mcp` executable.
 ## Features
 
 - **Model discovery** - `list_models` with server-side filters (modality,
-  supported params, sort, min context), local search, and pricing.
+  supported params, sort, min context), local search, and pricing; `describe_model`
+  returns full detail for one model id (architecture, context, benchmarks, and
+  per-provider endpoints with pricing - including real `pricing_skus` for video).
 - **Image generation** - `generate_image`: text-to-image, image editing /
   image-to-image (multiple local inputs), and **parallel variants** (seed-stepped).
   - Input images may be PNG, JPEG, WebP, GIF, or **SVG**. SVG inputs are
@@ -23,8 +25,16 @@ per-process usage - all behind one `openrouter-mcp` executable.
     per-variant metadata, cost, provider, timing).
   - **Asynchronous**: if a job runs longer than `wait_seconds` (default 10) the
     tool returns a `task_id`; poll `get_result` for completion.
+- **Video generation** - `generate_video`: text-to-video and image-to-video
+  (first/last frame and reference images) with an OpenRouter video model.
+  **Asynchronous**: returns a `task_id`; poll `get_result` for the hosted clip.
+- **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
+  TTS model (voice/format/speed); saves the audio to disk with a manifest.
 - **Image description** - `describe_image`: image -> detailed text via any
   vision-capable model (image input, text output).
+- **Chat completion** - `chat_completion`: send a prompt to any OpenRouter
+  chat/text model and get its text reply (text in, text out) - route a sub-task
+  to a different model (optional `system`, `temperature`, `max_tokens`).
 - **Account info** - `get_account`: basic info about the API key in use (label,
   owning user id, credit usage with daily/weekly/monthly breakdown, spending
   limit / remaining balance, and tier / key-type flags).
@@ -224,6 +234,24 @@ openrouter-mcp describe -m google/gemini-2.5-flash-lite --image ./out/owl.png
 The image format the provider returns is not guaranteed; the CLI corrects the
 saved file's extension to match what actually came back.
 
+Generate a video (blocks through submit + poll; text-to-video or
+image-to-video via `--first-frame` / `--last-frame`):
+
+```bash
+openrouter-mcp video \
+  --model bytedance/seedance-2.0 \
+  --prompt "a paper boat drifting down a rain-soaked street, cinematic" \
+  --duration 8 --resolution 1080p --output ./out/boat.mp4
+```
+
+Generate speech (text-to-speech):
+
+```bash
+openrouter-mcp audio \
+  --model openai/gpt-4o-mini-tts --voice alloy \
+  --input "Hello from OpenRouter." --output ./out/hello.mp3
+```
+
 ## Development
 
 ```bash
@@ -244,10 +272,12 @@ cargo run -- describe -m google/gemini-2.5-flash-lite --image ./some.png
 
 `openrouter-mcp` runs entirely on your machine and collects no telemetry. The
 only third party it contacts is [OpenRouter](https://openrouter.ai), and only to
-fulfill the requests you make (model discovery, image generation/description).
-Your API key is sent solely to OpenRouter to authenticate those calls. Generated
-images are written only to paths you specify; usage stats live in memory and are
-lost on exit. Full details: [PRIVACY.md](PRIVACY.md).
+fulfill the requests you make (model discovery, image/video/speech generation,
+image description, and chat completion). Your API key is sent solely to
+OpenRouter to authenticate those calls. Generated files are written only to
+paths you specify (or an auto-named path under `OPENROUTER_MCP_OUTPUT_DIR`);
+usage stats live in memory and are lost on exit. Full details:
+[PRIVACY.md](PRIVACY.md).
 
 ## License
 
