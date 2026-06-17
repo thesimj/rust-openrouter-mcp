@@ -2,7 +2,7 @@
 name = "openrouter-mcp"
 version = "0.2.5"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
 authors = ["Nick Bubelich <n+github@bubelich.com>"]
