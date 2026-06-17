@@ -1,7 +1,5 @@
 //! The `generate_audio` text-to-speech tool and its argument struct.
 
-use std::path::PathBuf;
-
 use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
@@ -15,6 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audio_gen::{self, SpeechGenRequest};
+use crate::server::naming;
 use crate::server::result::{MAX_INLINE_AUDIO_BYTES, client_wants_inline_previews};
 use crate::server::schema::{de_opt_f64, require_all, scalarize_nullable};
 
@@ -39,7 +38,10 @@ pub(crate) struct GenerateAudioArgs {
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub speed: Option<f64>,
     /// Output file path (extension corrected to the returned format, e.g. .mp3).
-    pub output: String,
+    /// Optional: when omitted, an auto-named file is written under
+    /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 #[tool_router(router = audio_router, vis = "pub(crate)")]
@@ -48,8 +50,9 @@ impl OpenRouterServer {
         description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
         openai/gpt-4o-mini-tts or hexgrad/kokoro-82m) and save the audio to `output`. This is a \
         synchronous, fast call (not a background task). This tool has NO defaults: model, input \
-        (the text), voice, and output must all be specified, or the call fails naming what is \
-        missing. Returns the saved file path in JSON; for sandboxed clients it also returns a \
+        (the text), and voice must all be specified, or the call fails naming what is \
+        missing. `output` is optional - omit it for an auto-named file under \
+        OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). Returns the saved file path in JSON; for sandboxed clients it also returns a \
         native inline audio content block when the file is small enough. response_format defaults \
         to mp3 so the extension is deterministic.",
         annotations(
@@ -105,7 +108,14 @@ impl OpenRouterServer {
             response_format: args.response_format,
             speed: args.speed,
         };
-        let output = PathBuf::from(&args.output);
+        let fmt = req.response_format.as_deref().unwrap_or("mp3");
+        let output = naming::resolve_output_base(
+            args.output,
+            naming::MediaKind::Audio,
+            &model,
+            &[req.voice.as_str(), fmt],
+            None,
+        );
 
         match audio_gen::run_job(&self.client, &req, &output, "inline").await {
             Ok(result) => {
@@ -190,7 +200,7 @@ mod tests {
             voice: Some("alloy".to_string()),
             response_format: None,
             speed: None,
-            output: out.to_string_lossy().into_owned(),
+            output: Some(out.to_string_lossy().into_owned()),
         };
         // inline_previews=false -> JSON only, no embedded audio block.
         let res = server.run_generate_audio(args, false).await.unwrap();
@@ -216,7 +226,7 @@ mod tests {
             voice: Some("  ".to_string()), // blank-after-trim counts as missing
             response_format: None,
             speed: None,
-            output: "out.mp3".to_string(),
+            output: Some("out.mp3".to_string()),
         };
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert!(err.message.contains("input"));

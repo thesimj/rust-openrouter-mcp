@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::image_gen;
+use crate::server::naming;
 use crate::server::result::{
     DEFAULT_VIDEO_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
@@ -70,7 +71,10 @@ pub(crate) struct GenerateVideoArgs {
     #[schemars(range(min = 1, max = 60))]
     pub wait_seconds: Option<u64>,
     /// Output file path (extension corrected to the returned format, e.g. .mp4).
-    pub output: String,
+    /// Optional: when omitted, an auto-named file is written under
+    /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// Build the lean per-job result object for a video job: kind "video", the saved
@@ -108,8 +112,10 @@ impl OpenRouterServer {
         save it to `output`. For text-to-video, pass a prompt. For image-to-video, also pass \
         first_frame (and optionally last_frame) as local image paths; for reference-to-video pass \
         reference_images (ignored, with a warning, if a frame is given - frames win). This tool \
-        has NO defaults: model, prompt, output, duration, generate_audio, and an aspect_ratio \
-        OR size must all be specified, or the call fails naming what is missing. Video generation \
+        has NO defaults: model, prompt, duration, generate_audio, and an aspect_ratio \
+        OR size must all be specified, or the call fails naming what is missing. `output` is \
+        optional - omit it for an auto-named file under OPENROUTER_MCP_OUTPUT_DIR \
+        (default $HOME/Downloads/openrouter-mcp). Video generation \
         is slow (30s to several minutes): it runs asynchronously and almost always returns status \
         \"pending\" with a task_id after wait_seconds (default 20) - poll get_result until it is \
         \"completed\". The completed result carries the saved file path in JSON plus, for \
@@ -183,7 +189,26 @@ impl OpenRouterServer {
             .wait_seconds
             .unwrap_or(DEFAULT_VIDEO_WAIT_SECONDS)
             .clamp(1, 60);
-        let base = PathBuf::from(&args.output);
+        let mut config: Vec<String> = Vec::new();
+        if let Some(a) = &req.aspect_ratio {
+            config.push(a.clone());
+        } else if let Some(s) = &req.size {
+            config.push(s.clone());
+        }
+        if let Some(r) = &req.resolution {
+            config.push(r.clone());
+        }
+        if let Some(d) = req.duration {
+            config.push(format!("{d}s"));
+        }
+        let config_refs: Vec<&str> = config.iter().map(String::as_str).collect();
+        let base = naming::resolve_output_base(
+            args.output,
+            naming::MediaKind::Video,
+            &req.model,
+            &config_refs,
+            req.seed,
+        );
         let model = args.model;
 
         self.spawn_job_and_wait(
@@ -243,7 +268,7 @@ mod tests {
             reference_images: vec![],
             max_image_dimension: None,
             wait_seconds: None,
-            output: "out.mp4".to_string(),
+            output: Some("out.mp4".to_string()),
         };
         let err = server.run_generate_video(args, false).await.unwrap_err();
         assert!(err.message.contains("duration"));
@@ -288,7 +313,7 @@ mod tests {
             reference_images: vec![],
             max_image_dimension: None,
             wait_seconds: Some(1), // clamp floor: return quickly as pending
-            output: out.to_string_lossy().into_owned(),
+            output: Some(out.to_string_lossy().into_owned()),
         };
         let res = server.run_generate_video(args, false).await.unwrap();
         let v = tool_result_json(&res);

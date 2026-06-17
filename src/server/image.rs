@@ -1,8 +1,6 @@
 //! Image tools (`generate_image`, `describe_image`), their argument structs, the
 //! shared `ImageInput` type, and the image-job result builder.
 
-use std::path::PathBuf;
-
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -15,6 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::image_gen::{self, GenerateRequest};
+use crate::server::naming;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
@@ -91,8 +90,11 @@ pub(crate) struct GenerateImageArgs {
     #[schemars(range(min = 1, max = 60))]
     pub wait_seconds: Option<u64>,
     /// Output file path (single image, or the base name for variants). The
-    /// extension is corrected to the actual returned format.
-    pub output: String,
+    /// extension is corrected to the actual returned format. Optional: when
+    /// omitted, an auto-named file is written under OPENROUTER_MCP_OUTPUT_DIR
+    /// (default $HOME/Downloads/openrouter-mcp).
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// Arguments for the `describe_image` tool.
@@ -149,7 +151,9 @@ fn image_job_result_json(
 impl OpenRouterServer {
     #[tool(
         description = "Generate or edit an image with an OpenRouter image model (e.g. \
-        google/gemini-3.1-flash-image-preview) and save it to `output`. For text-to-image, \
+        google/gemini-3.1-flash-image-preview) and save it. `output` is optional - omit it to \
+        get an auto-named file (kind_datetime_model_config_seed_hash) under \
+        OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). For text-to-image, \
         pass a prompt. For editing / image-to-image, also pass local `images` (order \
         preserved; optional per-image label) - the prompt becomes the edit instruction. \
         Set variants>1 to generate several in parallel (seed-stepped). Returns a compact \
@@ -157,9 +161,9 @@ impl OpenRouterServer {
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
         warnings. The output format (PNG or JPEG) is chosen by the provider and the \
         extension is set to match. Set image_only=true for models that only output images \
-        (e.g. Grok/FLUX). This tool has NO defaults: model, prompt, output, aspect_ratio, \
+        (e.g. Grok/FLUX). This tool has NO defaults: model, prompt, aspect_ratio, \
         image_size and image_only must all be specified, or the call fails with an error \
-        naming what is missing. Runs asynchronously: if the job is still going after \
+        naming what is missing (output is optional, see above). Runs asynchronously: if the job is still going after \
         wait_seconds (default 10), it returns status \"pending\" with a task_id to poll via \
         get_result; otherwise it returns the completed result inline. To analyze or caption \
         an existing image instead of creating one, use describe_image.",
@@ -221,7 +225,20 @@ impl OpenRouterServer {
             .wait_seconds
             .unwrap_or(DEFAULT_WAIT_SECONDS)
             .clamp(1, 60);
-        let base = PathBuf::from(&args.output);
+        let mut config: Vec<&str> = Vec::new();
+        if let Some(a) = &aspect_ratio {
+            config.push(a);
+        }
+        if let Some(s) = &image_size {
+            config.push(s);
+        }
+        let base = naming::resolve_output_base(
+            args.output,
+            naming::MediaKind::Image,
+            &args.model,
+            &config,
+            args.seed,
+        );
         let model = args.model;
         let variants_u64 = variants as u64;
 
@@ -337,7 +354,7 @@ mod tests {
             max_image_dimension: None,
             variants: None,
             wait_seconds: Some(30),
-            output: out.to_string_lossy().into_owned(),
+            output: Some(out.to_string_lossy().into_owned()),
         };
         // Fast mock completes within the wait window -> inline completed result.
         // inline_previews=true mirrors a Claude Desktop client.
@@ -403,7 +420,7 @@ mod tests {
             max_image_dimension: None,
             variants: None,
             wait_seconds: None,
-            output: "out.png".to_string(),
+            output: Some("out.png".to_string()),
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));

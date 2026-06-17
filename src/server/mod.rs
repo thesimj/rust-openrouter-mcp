@@ -20,6 +20,7 @@ mod account;
 mod audio;
 mod image;
 mod models;
+mod naming;
 mod result;
 mod schema;
 mod video;
