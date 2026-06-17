@@ -56,6 +56,37 @@ impl OpenRouterClient {
             .map(Value::take)
             .unwrap_or(body))
     }
+
+    /// `GET /api/v1/videos/models`, returning the entry whose `id` matches
+    /// `model_id` (or `None` if absent). Video models carry their real pricing
+    /// here under `pricing_skus` (e.g. `per-video-second`, `video_tokens`) plus
+    /// supported resolutions/durations/sizes - none of which appears in the
+    /// token-based `/models` pricing object (which is `0` for video).
+    pub async fn video_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
+        let resp = self
+            .http
+            .get(format!("{}/videos/models", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /videos/models failed")?
+            .error_for_status()
+            .context("OpenRouter /videos/models returned an error status")?;
+
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter /videos/models response")?;
+        let found = body
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
+                    .cloned()
+            });
+        Ok(found)
+    }
 }
 
 #[cfg(test)]
