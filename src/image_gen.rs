@@ -91,40 +91,71 @@ fn assemble_prompt(prompt: &str, images: &[InputImage]) -> String {
     format!("{block}\nUser prompt:\n{prompt}")
 }
 
-/// Build the message content: a plain string for text-to-image, or a text-first
-/// array of parts (the text prompt, then each normalized input image as a PNG
-/// data URL) for editing / multi-image requests.
+/// A normalized input image, computed once and reused across all variant
+/// requests and the manifest (avoids re-reading/re-encoding per variant).
+pub(crate) struct PreparedInput {
+    /// `data:image/png;base64,...` URL sent to the model.
+    pub data_url: String,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub normalized_width: u32,
+    pub normalized_height: u32,
+}
+
+/// Read, decode, downscale, and PNG-encode each input image **once**, capturing
+/// the data URL and the original/normalized dimensions.
+pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<PreparedInput>> {
+    images
+        .iter()
+        .map(|img| {
+            let bytes = std::fs::read(&img.path)
+                .with_context(|| format!("could not read input image {}", img.path.display()))?;
+            let (original_width, original_height) = image_io::decode_dimensions(&bytes)?;
+            let png = image_io::normalize_to_png(&bytes, max_dim)?;
+            let (normalized_width, normalized_height) = image_io::decode_dimensions(&png)?;
+            Ok(PreparedInput {
+                data_url: image_io::png_data_url(&png),
+                original_width,
+                original_height,
+                normalized_width,
+                normalized_height,
+            })
+        })
+        .collect()
+}
+
+/// Build the message content from already-prepared inputs: a plain string for
+/// text-to-image, or a text-first array of parts (text prompt, then each input
+/// image data URL) for editing / multi-image requests.
 pub(crate) fn build_content(
     prompt: &str,
     images: &[InputImage],
-    max_dimension: u32,
-) -> Result<Content> {
-    if images.is_empty() {
-        return Ok(Content::Text(prompt.to_string()));
+    prepared: &[PreparedInput],
+) -> Content {
+    if prepared.is_empty() {
+        return Content::Text(prompt.to_string());
     }
     let mut parts = vec![ContentPart::Text {
         text: assemble_prompt(prompt, images),
     }];
-    for img in images {
-        let bytes = std::fs::read(&img.path)
-            .with_context(|| format!("could not read input image {}", img.path.display()))?;
-        let png = image_io::normalize_to_png(&bytes, max_dimension)?;
+    for input in prepared {
         parts.push(ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: image_io::png_data_url(&png),
+                url: input.data_url.clone(),
             },
         });
     }
-    Ok(Content::Parts(parts))
+    Content::Parts(parts)
 }
 
-/// Generate one image. Errors carry the upstream provider message when the API
-/// rejects the request.
-pub async fn generate_image(
+/// Issue one chat-completions request for the given pre-built `content` and
+/// extract the generated image. Shared by single and variant generation so the
+/// content (including normalized input images) is built once and reused.
+async fn generate_core(
     client: &OpenRouterClient,
     req: &GenerateRequest,
+    content: Content,
 ) -> Result<GeneratedImage> {
-    let modalities = modalities_for(req.image_only);
     let image_config = match (&req.aspect_ratio, &req.image_size) {
         (None, None) => None,
         (a, s) => Some(ImageConfig {
@@ -132,15 +163,13 @@ pub async fn generate_image(
             image_size: s.clone(),
         }),
     };
-
-    let content = build_content(&req.prompt, &req.images, req.max_image_dimension)?;
     let chat = ChatRequest {
         model: req.model.clone(),
         messages: vec![Message {
             role: "user".to_string(),
             content,
         }],
-        modalities: Some(modalities),
+        modalities: Some(modalities_for(req.image_only)),
         image_config,
         seed: req.seed,
         stream: false,
@@ -207,7 +236,8 @@ pub async fn describe_image(
     if req.images.is_empty() {
         anyhow::bail!("describe_image requires at least one input image");
     }
-    let content = build_content(&req.prompt, &req.images, req.max_image_dimension)?;
+    let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
+    let content = build_content(&req.prompt, &req.images, &prepared);
     let chat = ChatRequest {
         model: req.model.clone(),
         messages: vec![Message {
@@ -262,17 +292,22 @@ pub async fn generate_variants(
     client: &OpenRouterClient,
     req: &GenerateRequest,
     variants: usize,
+    content: Content,
 ) -> Vec<VariantOutcome> {
     let base_seed = req.seed;
+    // saturating_add: a base seed near u64::MAX must not overflow-panic.
+    let seed_for = |i: usize| base_seed.map(|s| s.saturating_add(i as u64));
     let handles: Vec<_> = (0..variants)
         .map(|i| {
             let client = client.clone();
             let mut r = req.clone();
-            r.seed = base_seed.map(|s| s + i as u64);
+            let seed = seed_for(i);
+            r.seed = seed;
+            let content = content.clone();
             tokio::spawn(async move {
                 let start = Instant::now();
-                let result = generate_image(&client, &r).await;
-                (r.seed, start.elapsed().as_millis(), result)
+                let result = generate_core(&client, &r, content).await;
+                (seed, start.elapsed().as_millis(), result)
             })
         })
         .collect();
@@ -288,7 +323,7 @@ pub async fn generate_variants(
             },
             Err(e) => VariantOutcome {
                 index: i,
-                seed: base_seed.map(|s| s + i as u64),
+                seed: seed_for(i),
                 duration_ms: 0,
                 result: Err(anyhow::anyhow!("variant task failed: {e}")),
             },
@@ -302,6 +337,21 @@ pub async fn generate_variants(
 /// extension. Multiple variants get a `-var-<seed>` suffix (seed zero-padded to
 /// at least 4 digits, so it is self-identifying and reproducible); when no seed
 /// is set the variant `index` is used instead, zero-padded so 10+ sort.
+/// The file stem of `base`, or `"image"` if it has none.
+fn base_stem(base: &Path) -> String {
+    base.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_string())
+}
+
+/// Join `name` onto `base`'s parent directory (or use it bare when there is none).
+fn in_parent_of(base: &Path, name: String) -> PathBuf {
+    match base.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 pub fn variant_output_path(
     base: &Path,
     seed: Option<u64>,
@@ -312,10 +362,6 @@ pub fn variant_output_path(
     if total <= 1 {
         return base.with_extension(ext);
     }
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_string());
     let marker = match seed {
         Some(s) => format!("{s:04}"),
         None => {
@@ -323,34 +369,12 @@ pub fn variant_output_path(
             format!("{:0width$}", index_zero_based + 1, width = width)
         }
     };
-    let name = format!("{stem}-var-{marker}.{ext}");
-    match base.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
+    in_parent_of(base, format!("{}-var-{marker}.{ext}", base_stem(base)))
 }
 
 /// Sidecar manifest path next to the outputs: `<stem>.manifest.json`.
 pub fn manifest_path(base: &Path) -> PathBuf {
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_string());
-    let name = format!("{stem}.manifest.json");
-    match base.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-/// `(original_w, original_h, normalized_w, normalized_h)` for an input image.
-fn describe_input(path: &Path, max_dim: u32) -> Result<(u32, u32, u32, u32)> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("could not read input image {}", path.display()))?;
-    let (ow, oh) = image_io::decode_dimensions(&bytes)?;
-    let png = image_io::normalize_to_png(&bytes, max_dim)?;
-    let (nw, nh) = image_io::decode_dimensions(&png)?;
-    Ok((ow, oh, nw, nh))
+    in_parent_of(base, format!("{}.manifest.json", base_stem(base)))
 }
 
 /// One saved image in a job's lean summary.
@@ -385,25 +409,30 @@ pub async fn run_job(
     base_output: &Path,
     prompt_source: &str,
 ) -> Result<JobSummary> {
-    let outcomes = generate_variants(client, req, variants).await;
+    // Normalize input images once, up front — reused for every variant request
+    // and for the manifest (a read/decode failure fails the whole job before any
+    // generation, so no spend occurs).
+    let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
+    let input_images: Vec<InputImageMeta> = req
+        .images
+        .iter()
+        .zip(&prepared)
+        .enumerate()
+        .map(|(i, (img, p))| InputImageMeta {
+            index: i + 1,
+            label: img.label.clone(),
+            source: img.path.to_string_lossy().into_owned(),
+            original_width: p.original_width,
+            original_height: p.original_height,
+            normalized_mime_type: "image/png",
+            normalized_width: p.normalized_width,
+            normalized_height: p.normalized_height,
+            normalization_max_side: req.max_image_dimension,
+        })
+        .collect();
+    let content = build_content(&req.prompt, &req.images, &prepared);
 
-    // Input-image metadata (best-effort; read errors also surface per variant).
-    let mut input_images = Vec::new();
-    for (i, img) in req.images.iter().enumerate() {
-        if let Ok((ow, oh, nw, nh)) = describe_input(&img.path, req.max_image_dimension) {
-            input_images.push(InputImageMeta {
-                index: i + 1,
-                label: img.label.clone(),
-                source: img.path.to_string_lossy().into_owned(),
-                original_width: ow,
-                original_height: oh,
-                normalized_mime_type: "image/png",
-                normalized_width: nw,
-                normalized_height: nh,
-                normalization_max_side: req.max_image_dimension,
-            });
-        }
-    }
+    let outcomes = generate_variants(client, req, variants, content).await;
 
     let mut images = Vec::new();
     let mut warnings = Vec::new();
@@ -427,36 +456,45 @@ pub async fn run_job(
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent).ok();
                 }
-                std::fs::write(&path, &img.bytes)
-                    .with_context(|| format!("could not write {}", path.display()))?;
-                let check = image_io::check_dimensions(
-                    img.width,
-                    img.height,
-                    req.aspect_ratio.as_deref(),
-                    req.image_size.as_deref(),
-                );
-                for w in &check.warnings {
-                    warnings.push(format!("variant {}: {w}", outcome.index + 1));
+                // Isolate a write failure to this variant rather than aborting
+                // the whole batch (the image was generated and paid for).
+                match std::fs::write(&path, &img.bytes) {
+                    Ok(()) => {
+                        let check = image_io::check_dimensions(
+                            img.width,
+                            img.height,
+                            req.aspect_ratio.as_deref(),
+                            req.image_size.as_deref(),
+                        );
+                        for w in &check.warnings {
+                            warnings.push(format!("variant {}: {w}", outcome.index + 1));
+                        }
+                        meta.path = Some(path.to_string_lossy().into_owned());
+                        meta.mime_type = Some(img.mime.clone());
+                        meta.width = Some(img.width);
+                        meta.height = Some(img.height);
+                        meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
+                        meta.actual_image_size = Some(check.actual_image_size.to_string());
+                        meta.generation_id = img.generation_id.clone();
+                        meta.provider = img.provider.clone();
+                        meta.cost = img.cost;
+                        meta.text = img.text.clone();
+                        images.push(ImageSummary {
+                            path,
+                            seed: outcome.seed,
+                            width: img.width,
+                            height: img.height,
+                            actual_aspect_ratio: check.actual_aspect_ratio,
+                            actual_image_size: check.actual_image_size,
+                            cost: img.cost,
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("could not write {}: {e}", path.display());
+                        errors.push(format!("variant {}: {msg}", outcome.index + 1));
+                        meta.error = Some(msg);
+                    }
                 }
-                meta.path = Some(path.to_string_lossy().into_owned());
-                meta.mime_type = Some(img.mime.clone());
-                meta.width = Some(img.width);
-                meta.height = Some(img.height);
-                meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
-                meta.actual_image_size = Some(check.actual_image_size.to_string());
-                meta.generation_id = img.generation_id.clone();
-                meta.provider = img.provider.clone();
-                meta.cost = img.cost;
-                meta.text = img.text.clone();
-                images.push(ImageSummary {
-                    path,
-                    seed: outcome.seed,
-                    width: img.width,
-                    height: img.height,
-                    actual_aspect_ratio: check.actual_aspect_ratio,
-                    actual_image_size: check.actual_image_size,
-                    cost: img.cost,
-                });
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -483,7 +521,10 @@ pub async fn run_job(
         variants: variant_metas,
     };
     let mpath = manifest_path(base_output);
-    manifest::write(&mpath, &manifest)?;
+    // A manifest-write failure must not discard already-saved images / spend.
+    if let Err(e) = manifest::write(&mpath, &manifest) {
+        errors.push(format!("manifest write failed: {e}"));
+    }
 
     Ok(JobSummary {
         model: req.model.clone(),
@@ -505,6 +546,17 @@ mod tests {
     // 1x1 transparent PNG.
     const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+    /// Single-image generation (prepare inputs, build content, run core) — the
+    /// path production drives via run_job/generate_variants, exercised directly.
+    async fn generate_image(
+        client: &OpenRouterClient,
+        req: &GenerateRequest,
+    ) -> Result<GeneratedImage> {
+        let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
+        let content = build_content(&req.prompt, &req.images, &prepared);
+        generate_core(client, req, content).await
+    }
+
     /// Write a small valid PNG to a temp file and return its path.
     fn temp_png(name: &str) -> PathBuf {
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2));
@@ -517,18 +569,19 @@ mod tests {
 
     #[test]
     fn build_content_is_plain_text_without_images() {
-        let content = build_content("just text", &[], 800).unwrap();
+        let content = build_content("just text", &[], &[]);
         let v = serde_json::to_value(&content).unwrap();
         assert_eq!(v, serde_json::json!("just text"));
     }
 
     #[test]
     fn build_content_puts_text_first_then_images() {
-        let img = InputImage {
+        let images = vec![InputImage {
             path: temp_png("openrouter-mcp-test-content.png"),
             label: None,
-        };
-        let content = build_content("edit this", std::slice::from_ref(&img), 800).unwrap();
+        }];
+        let prepared = prepare_inputs(&images, 800).unwrap();
+        let content = build_content("edit this", &images, &prepared);
         let v = serde_json::to_value(&content).unwrap();
         assert!(v.is_array());
         assert_eq!(v[0]["type"], "text");
@@ -554,7 +607,8 @@ mod tests {
                 label: Some("product".to_string()),
             },
         ];
-        let content = build_content("compose them", &images, 800).unwrap();
+        let prepared = prepare_inputs(&images, 800).unwrap();
+        let content = build_content("compose them", &images, &prepared);
         let v = serde_json::to_value(&content).unwrap();
         let text = v[0]["text"].as_str().unwrap();
         assert!(text.contains("Reference images:"));

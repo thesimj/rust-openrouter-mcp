@@ -114,21 +114,27 @@ fn resolve_prompt(
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
 ) -> anyhow::Result<(String, String)> {
-    if let Some(pf) = prompt_file {
+    let (text, source) = if let Some(pf) = prompt_file {
         if pf == Path::new("-") {
             use std::io::Read;
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s)?;
-            return Ok((s.trim().to_string(), "stdin".to_string()));
+            (s.trim().to_string(), "stdin".to_string())
+        } else {
+            let s = std::fs::read_to_string(&pf)
+                .with_context(|| format!("could not read prompt file {}", pf.display()))?;
+            (s.trim().to_string(), "file".to_string())
         }
-        let s = std::fs::read_to_string(&pf)
-            .with_context(|| format!("could not read prompt file {}", pf.display()))?;
-        return Ok((s.trim().to_string(), "file".to_string()));
+    } else {
+        match prompt {
+            Some(p) => (p, "inline".to_string()),
+            None => anyhow::bail!("provide --prompt or --prompt-file"),
+        }
+    };
+    if text.trim().is_empty() {
+        anyhow::bail!("prompt is empty (an empty --prompt-file / stdin is not allowed)");
     }
-    match prompt {
-        Some(p) => Ok((p, "inline".to_string())),
-        None => anyhow::bail!("provide --prompt or --prompt-file"),
-    }
+    Ok((text, source))
 }
 
 /// Resolve the base output path from `--output`, or `--output-dir`+`--output-name`.
@@ -148,17 +154,25 @@ fn resolve_base_output(
 
 /// Parse a CLI `--image` value, which is either `path` or `label=path`.
 fn parse_image_arg(value: &str) -> image_gen::InputImage {
-    match value.split_once('=') {
-        // Only treat as labeled when the left side looks like a label, not a
-        // Windows drive letter (e.g. `C:\...` has no `=`, but guard anyway).
-        Some((label, path)) if !label.is_empty() && !path.is_empty() => image_gen::InputImage {
-            path: PathBuf::from(path),
-            label: Some(label.to_string()),
-        },
-        _ => image_gen::InputImage {
-            path: PathBuf::from(value),
-            label: None,
-        },
+    // Only treat `left=right` as a labeled reference when `left` looks like a
+    // bare label (alphanumeric/`_`/`-`), so a real path containing '=' (e.g.
+    // `./a=b/img.png`) is kept whole instead of being mis-split.
+    if let Some((label, path)) = value.split_once('=') {
+        let is_label = !label.is_empty()
+            && !path.is_empty()
+            && label
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+        if is_label {
+            return image_gen::InputImage {
+                path: PathBuf::from(path),
+                label: Some(label.to_string()),
+            };
+        }
+    }
+    image_gen::InputImage {
+        path: PathBuf::from(value),
+        label: None,
     }
 }
 

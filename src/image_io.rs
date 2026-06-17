@@ -97,7 +97,8 @@ pub fn aspect_matches(requested: &str, width: u32, height: u32) -> Option<bool> 
     let (rw, rh) = requested.split_once(':')?;
     let rw: f64 = rw.trim().parse().ok()?;
     let rh: f64 = rh.trim().parse().ok()?;
-    if rh == 0.0 || height == 0 {
+    // A degenerate ratio (zero/negative side) is unverifiable, not a mismatch.
+    if rw <= 0.0 || rh <= 0.0 || height == 0 {
         return None;
     }
     let requested = rw / rh;

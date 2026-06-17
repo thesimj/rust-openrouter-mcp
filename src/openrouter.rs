@@ -246,14 +246,14 @@ pub struct Message {
 
 /// Message content: either a plain string or an ordered list of parts
 /// (text-first, then images) for editing/multi-image requests.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Content {
     Text(String),
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
