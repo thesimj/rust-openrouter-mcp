@@ -50,7 +50,7 @@
     },
     {
       "name": "generate_image",
-      "description": "Generate or edit an image with an OpenRouter image model and save it to disk (supports parallel variants)."
+      "description": "Generate or edit an image with an OpenRouter image model and save it to disk (parallel variants; input images by path, url, or base64/data-URL)."
     },
     {
       "name": "generate_video",
@@ -66,7 +66,7 @@
     },
     {
       "name": "describe_image",
-      "description": "Describe or answer questions about local image(s) with a vision-capable model."
+      "description": "Describe or answer questions about image(s) (by path, url, or base64/data-URL) with a vision-capable model."
     },
     {
       "name": "get_account",
