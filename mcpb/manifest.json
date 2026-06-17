@@ -55,6 +55,10 @@
       "description": "Describe or answer questions about local image(s) with a vision-capable model."
     },
     {
+      "name": "get_account",
+      "description": "Return info about the OpenRouter API key in use: label, credit usage, limits, and tier."
+    },
+    {
       "name": "get_usage_stats",
       "description": "Return in-memory usage statistics for this server process."
     },
