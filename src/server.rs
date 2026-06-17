@@ -88,21 +88,56 @@ fn job_result_json(
 /// ~1568px is Claude's image sweet spot (larger is downsampled client-side).
 const PREVIEW_MAX_SIDE: u32 = 1568;
 
-/// Turn a completed job envelope into inline image content blocks so the client
-/// (e.g. Claude Desktop) renders the generated images, not just their paths.
-/// Reads each `images[].path` from disk, downscales to [`PREVIEW_MAX_SIDE`], and
-/// base64-encodes it as a PNG `image` content block. Unreadable files are skipped
-/// (the JSON text block still reports their paths), so this never fails the call.
-fn preview_image_blocks(env: &serde_json::Value) -> Vec<Content> {
-    let Some(images) = env.get("images").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    images
+/// Most inline previews embedded in a single tool result. Many-variant jobs can
+/// produce up to 16 images; base64-embedding every one would bloat the client's
+/// context, so any beyond this cap are reported by path in the JSON block only.
+const MAX_INLINE_PREVIEWS: usize = 4;
+
+/// Collect the on-disk paths of the generated images in a job envelope.
+fn envelope_image_paths(env: &serde_json::Value) -> Vec<String> {
+    env.get("images")
+        .and_then(|v| v.as_array())
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|img| img.get("path").and_then(|p| p.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when `bytes` is a PNG whose longest side already fits `max_side`, so it
+/// can be sent inline verbatim without a decode/resize/re-encode round-trip.
+/// [`crate::image_io::decode_dimensions`] only reads the header, so this is cheap.
+fn is_png_within_bound(bytes: &[u8], max_side: u32) -> bool {
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.starts_with(&PNG_MAGIC)
+        && crate::image_io::decode_dimensions(bytes)
+            .map(|(w, h)| w <= max_side && h <= max_side)
+            .unwrap_or(false)
+}
+
+/// Turn the generated images' paths into inline image content blocks so the
+/// client (e.g. Claude Desktop) renders them, not just their paths. Reads each
+/// path from disk, downscales to [`PREVIEW_MAX_SIDE`] (or passes an already-small
+/// PNG through untouched), and base64-encodes it as a PNG `image` block. Caps the
+/// count at [`MAX_INLINE_PREVIEWS`]; unreadable/undecodable files are skipped (the
+/// JSON text block still reports their paths), so this never fails the call.
+///
+/// Blocking: does disk I/O and image decode/encode — run it via `spawn_blocking`,
+/// never directly on the async runtime.
+fn encode_preview_blocks(paths: &[String]) -> Vec<Content> {
+    paths
         .iter()
-        .filter_map(|img| img.get("path").and_then(|p| p.as_str()))
+        .take(MAX_INLINE_PREVIEWS)
         .filter_map(|path| {
             let bytes = std::fs::read(path).ok()?;
-            let png = crate::image_io::normalize_to_png(&bytes, PREVIEW_MAX_SIDE).ok()?;
+            let png = if is_png_within_bound(&bytes, PREVIEW_MAX_SIDE) {
+                bytes
+            } else {
+                crate::image_io::normalize_to_png(&bytes, PREVIEW_MAX_SIDE).ok()?
+            };
             let b64 = base64::engine::general_purpose::STANDARD.encode(png);
             Some(Content::image(b64, "image/png".to_string()))
         })
@@ -124,8 +159,8 @@ fn preview_image_blocks(env: &serde_json::Value) -> Vec<Content> {
 fn client_wants_inline_previews(ctx: &RequestContext<RoleServer>) -> bool {
     match std::env::var("OPENROUTER_MCP_IMAGE_PREVIEWS")
         .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
         .as_deref()
-        .map(str::trim)
     {
         Some("always") => return true,
         Some("never") => return false,
@@ -142,15 +177,31 @@ fn client_wants_inline_previews(ctx: &RequestContext<RoleServer>) -> bool {
 /// Build the full tool result for a job envelope: the JSON metadata as a text
 /// block, followed (when `inline_previews` and the job completed) by an inline
 /// image preview of each generated image.
-fn job_call_result(
+async fn job_call_result(
     env: &serde_json::Value,
     inline_previews: bool,
 ) -> Result<CallToolResult, ErrorData> {
     let body = serde_json::to_string_pretty(env)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     let mut blocks = vec![Content::text(body)];
+
     if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
-        blocks.extend(preview_image_blocks(env));
+        let paths = envelope_image_paths(env);
+        let total = paths.len();
+        // Reading + decoding + resizing + re-encoding images is blocking CPU and
+        // disk I/O; run it off the async worker so concurrent tool calls (e.g.
+        // get_result polls) aren't stalled behind it.
+        let previews = tokio::task::spawn_blocking(move || encode_preview_blocks(&paths))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let shown = previews.len();
+        blocks.extend(previews);
+        if total > MAX_INLINE_PREVIEWS {
+            blocks.push(Content::text(format!(
+                "note: showing {shown} of {total} generated images inline (capped at \
+                 {MAX_INLINE_PREVIEWS}); every image is saved to disk at the paths above."
+            )));
+        }
     }
     Ok(CallToolResult::success(blocks))
 }
@@ -500,7 +551,7 @@ impl OpenRouterServer {
             .await
             .expect("task was just inserted");
         let env = snapshot_to_envelope(&task_id, &snap);
-        job_call_result(&env, inline_previews)
+        job_call_result(&env, inline_previews).await
     }
 
     #[tool(
@@ -534,7 +585,7 @@ impl OpenRouterServer {
         match self.tasks.snapshot(&task_id).await {
             Some(snap) => {
                 let env = snapshot_to_envelope(&task_id, &snap);
-                job_call_result(&env, inline_previews)
+                job_call_result(&env, inline_previews).await
             }
             None => Err(ErrorData::invalid_params(
                 format!(
@@ -773,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_image_blocks_reads_existing_and_skips_missing() {
+    fn encode_preview_blocks_reads_existing_and_skips_missing() {
         // A valid PNG on disk yields one image block.
         let png = base64::engine::general_purpose::STANDARD
             .decode(valid_png_b64())
@@ -790,19 +841,37 @@ mod tests {
                 { "path": missing.to_string_lossy() },
             ]
         });
-        let blocks = preview_image_blocks(&env);
+        let blocks = encode_preview_blocks(&envelope_image_paths(&env));
         assert_eq!(blocks.len(), 1, "only the readable image becomes a block");
         let v = serde_json::to_value(&blocks[0]).unwrap();
         assert_eq!(v["type"], "image");
         assert_eq!(v["mimeType"], "image/png");
         assert!(!v["data"].as_str().unwrap().is_empty());
 
-        // No images array -> no blocks.
-        assert!(preview_image_blocks(&json!({ "status": "completed" })).is_empty());
+        // No images array -> no paths -> no blocks.
+        assert!(envelope_image_paths(&json!({ "status": "completed" })).is_empty());
     }
 
     #[test]
-    fn job_call_result_gates_previews_on_the_flag() {
+    fn encode_preview_blocks_caps_at_the_limit() {
+        // Write more readable PNGs than the cap; only MAX_INLINE_PREVIEWS render.
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(valid_png_b64())
+            .unwrap();
+        let dir = std::env::temp_dir();
+        let paths: Vec<String> = (0..MAX_INLINE_PREVIEWS + 3)
+            .map(|i| {
+                let p = dir.join(format!("openrouter-mcp-cap-{i}.png"));
+                std::fs::write(&p, &png).unwrap();
+                p.to_string_lossy().into_owned()
+            })
+            .collect();
+        let blocks = encode_preview_blocks(&paths);
+        assert_eq!(blocks.len(), MAX_INLINE_PREVIEWS, "preview count is capped");
+    }
+
+    #[tokio::test]
+    async fn job_call_result_gates_previews_on_the_flag() {
         let good = std::env::temp_dir().join("openrouter-mcp-gate-good.png");
         let png = base64::engine::general_purpose::STANDARD
             .decode(valid_png_b64())
@@ -821,12 +890,12 @@ mod tests {
                 .any(|c| c["type"] == "image")
         };
         // Desktop-style: previews on. CLI-style: text only.
-        assert!(has_image(&job_call_result(&env, true).unwrap()));
-        assert!(!has_image(&job_call_result(&env, false).unwrap()));
+        assert!(has_image(&job_call_result(&env, true).await.unwrap()));
+        assert!(!has_image(&job_call_result(&env, false).await.unwrap()));
 
         // A pending job never carries a preview, even with previews enabled.
         let pending = json!({ "status": "pending", "images": [] });
-        assert!(!has_image(&job_call_result(&pending, true).unwrap()));
+        assert!(!has_image(&job_call_result(&pending, true).await.unwrap()));
     }
 
     #[tokio::test]
