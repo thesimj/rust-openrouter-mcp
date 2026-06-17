@@ -88,6 +88,92 @@ impl OpenRouterClient {
     }
 }
 
+impl OpenRouterClient {
+    /// `GET /api/v1/key` — basic information about the API key in use: its label,
+    /// the owning `creator_user_id`, credit usage (total and per period), spending
+    /// limit / remaining balance, tier/management flags, and the (deprecated)
+    /// rate limit. This is key/account-level info, not the owner's name or email.
+    pub async fn get_key_info(&self) -> Result<KeyInfo> {
+        let resp = self
+            .http
+            .get(format!("{}/key", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /key failed")?
+            .error_for_status()
+            .context("OpenRouter /key returned an error status")?;
+
+        let parsed: KeyInfoResponse = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter /key response")?;
+        Ok(parsed.data)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeyInfoResponse {
+    pub data: KeyInfo,
+}
+
+/// Basic information about the API key in use (`GET /api/v1/key`). Every field is
+/// optional/defaulted: the upstream schema evolves, and `limit`/`limit_remaining`
+/// are `null` for unlimited keys. Fields OpenRouter returns but we don't surface
+/// (e.g. `limit_reset`, `expires_at`, BYOK period breakdowns) are ignored.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct KeyInfo {
+    /// Human-readable label, usually a masked key (e.g. "sk-or-v1-813...ca1").
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Opaque id of the user who owns the key (closest available "owner" identity).
+    #[serde(default)]
+    pub creator_user_id: Option<String>,
+    /// Whether this is a free-tier key.
+    #[serde(default)]
+    pub is_free_tier: Option<bool>,
+    /// Whether this key can provision (create/manage) other keys.
+    #[serde(default)]
+    pub is_provisioning_key: Option<bool>,
+    /// Whether this is an account management key.
+    #[serde(default)]
+    pub is_management_key: Option<bool>,
+    /// Spending cap in USD; `None` (null upstream) means unlimited.
+    #[serde(default)]
+    pub limit: Option<f64>,
+    /// Remaining balance in USD; `None` means unlimited.
+    #[serde(default)]
+    pub limit_remaining: Option<f64>,
+    /// Total credits consumed (USD).
+    #[serde(default)]
+    pub usage: Option<f64>,
+    /// Credits consumed today (USD).
+    #[serde(default)]
+    pub usage_daily: Option<f64>,
+    /// Credits consumed this week (USD).
+    #[serde(default)]
+    pub usage_weekly: Option<f64>,
+    /// Credits consumed this month (USD).
+    #[serde(default)]
+    pub usage_monthly: Option<f64>,
+    /// Spend on bring-your-own-key providers (USD), not billed as credits.
+    #[serde(default)]
+    pub byok_usage: Option<f64>,
+    /// Legacy rate-limit descriptor (deprecated upstream; kept for completeness).
+    #[serde(default)]
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// Legacy per-key rate limit. `requests` is signed because OpenRouter returns
+/// `-1` to mean "no limit"; the field is deprecated and safe to ignore.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RateLimit {
+    #[serde(default)]
+    pub requests: Option<i64>,
+    #[serde(default)]
+    pub interval: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VideoModelsResponse {
     pub data: Vec<VideoModel>,
@@ -492,6 +578,66 @@ mod tests {
                 .map(String::as_str),
             Some("0.1")
         );
+    }
+
+    #[tokio::test]
+    async fn get_key_info_parses_live_shaped_response() {
+        let server = MockServer::start().await;
+        // Body mirrors the real GET /api/v1/key payload (extra fields ignored,
+        // rate_limit.requests is -1 = unlimited, limit is null = unlimited).
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "label": "sk-or-v1-813...ca1",
+                    "creator_user_id": "user_39wcop8",
+                    "is_free_tier": false,
+                    "is_provisioning_key": false,
+                    "is_management_key": false,
+                    "limit": null,
+                    "limit_reset": null,
+                    "limit_remaining": null,
+                    "expires_at": null,
+                    "usage": 63.17,
+                    "usage_daily": 3.25,
+                    "usage_weekly": 10.28,
+                    "usage_monthly": 10.46,
+                    "byok_usage": 0,
+                    "byok_usage_daily": 0,
+                    "rate_limit": { "requests": -1, "interval": "10s", "note": "deprecated" }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let info = client.get_key_info().await.unwrap();
+        assert_eq!(info.label.as_deref(), Some("sk-or-v1-813...ca1"));
+        assert_eq!(info.creator_user_id.as_deref(), Some("user_39wcop8"));
+        assert_eq!(info.is_free_tier, Some(false));
+        assert_eq!(info.is_management_key, Some(false));
+        assert!(info.limit.is_none(), "null limit -> unlimited");
+        assert!(info.limit_remaining.is_none());
+        assert_eq!(info.usage, Some(63.17));
+        assert_eq!(info.usage_monthly, Some(10.46));
+        assert_eq!(info.byok_usage, Some(0.0));
+        let rl = info.rate_limit.unwrap();
+        assert_eq!(rl.requests, Some(-1));
+        assert_eq!(rl.interval.as_deref(), Some("10s"));
+    }
+
+    #[tokio::test]
+    async fn get_key_info_errors_on_non_success_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "bad-key");
+        let err = client.get_key_info().await.unwrap_err();
+        assert!(err.to_string().contains("error status"));
     }
 
     /// Build `n` placeholder models with ids `model-0`, `model-1`, … so list

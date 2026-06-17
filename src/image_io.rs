@@ -45,6 +45,68 @@ pub fn normalize_to_png(bytes: &[u8], max_side: u32) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
+/// Heuristically detect an SVG document from its leading bytes (the `image`
+/// crate can't decode SVG, so these inputs are routed to [`svg_to_png`] instead).
+/// Skips a UTF-8 BOM and leading whitespace, then looks for an `<svg` root —
+/// directly, or after an `<?xml …?>` declaration within the first chunk.
+pub fn is_svg(bytes: &[u8]) -> bool {
+    let head = bytes.get(..1024).unwrap_or(bytes);
+    let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head);
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<svg")
+        || (trimmed.starts_with("<?xml") && text.contains("<svg"))
+        || (trimmed.starts_with("<!--") && text.contains("<svg"))
+}
+
+/// A rasterized SVG: PNG bytes plus the source's intrinsic (viewBox) size and
+/// whether it contains `<text>` (which is not rendered — no fonts are loaded).
+pub struct RasterizedSvg {
+    pub png: Vec<u8>,
+    pub intrinsic_width: u32,
+    pub intrinsic_height: u32,
+    pub has_text: bool,
+}
+
+/// Rasterize an SVG to PNG, scaling so its longest side is exactly `max_side`
+/// (fit-to-cap: vector upscaling is lossless, so small icons render crisp at the
+/// cap rather than at their tiny intrinsic size). The pixmap is bounded by
+/// `max_side` on both axes by construction, so a hostile `width`/`viewBox` can't
+/// trigger a huge allocation. No fonts are loaded (text is skipped) and no
+/// external resources are resolved (`resources_dir` is `None`).
+pub fn svg_to_png(bytes: &[u8], max_side: u32) -> Result<RasterizedSvg> {
+    use resvg::{tiny_skia, usvg};
+
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(bytes, &opt).context("could not parse SVG")?;
+    let size = tree.size();
+    let (w, h) = (size.width(), size.height());
+    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        bail!("SVG has a degenerate size ({w}x{h})");
+    }
+
+    let scale = f64::from(max_side) / f64::from(w.max(h));
+    let out_w = ((f64::from(w) * scale).round() as u32).max(1);
+    let out_h = ((f64::from(h) * scale).round() as u32).max(1);
+    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h)
+        .with_context(|| format!("could not allocate a {out_w}x{out_h} pixmap for the SVG"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let transform = tiny_skia::Transform::from_scale(scale as f32, scale as f32);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let png = pixmap
+        .encode_png()
+        .context("could not encode the rasterized SVG as PNG")?;
+
+    Ok(RasterizedSvg {
+        png,
+        intrinsic_width: w.round() as u32,
+        intrinsic_height: h.round() as u32,
+        has_text: bytes
+            .windows(5)
+            .any(|win| win.eq_ignore_ascii_case(b"<text")),
+    })
+}
+
 /// Build a `data:image/png;base64,...` URL from PNG bytes (for sending inputs).
 pub fn png_data_url(png: &[u8]) -> String {
     format!(
@@ -181,6 +243,44 @@ mod tests {
     fn parse_data_url_rejects_non_data_and_non_base64() {
         assert!(parse_data_url("https://example.com/x.png").is_err());
         assert!(parse_data_url("data:image/png,notbase64").is_err());
+    }
+
+    const SVG_200X100: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100" fill="#1e50a0"/></svg>"##;
+
+    #[test]
+    fn is_svg_detects_svg_and_rejects_raster() {
+        assert!(is_svg(SVG_200X100.as_bytes()));
+        assert!(is_svg(b"  \n  <svg xmlns='...'></svg>"));
+        assert!(is_svg(
+            br#"<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>"#
+        ));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1_B64)
+            .unwrap();
+        assert!(!is_svg(&png));
+        assert!(!is_svg(b"just some text"));
+    }
+
+    #[test]
+    fn svg_to_png_fits_longest_side_to_cap_and_reports_intrinsic_size() {
+        // 200x100 source, cap 800 -> longest side scaled up to 800 -> 800x400.
+        let r = svg_to_png(SVG_200X100.as_bytes(), 800).unwrap();
+        assert_eq!(&r.png[1..4], b"PNG");
+        assert_eq!(decode_dimensions(&r.png).unwrap(), (800, 400));
+        assert_eq!((r.intrinsic_width, r.intrinsic_height), (200, 100));
+        assert!(!r.has_text);
+    }
+
+    #[test]
+    fn svg_to_png_flags_text() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="20"><text x="0" y="10">hi</text></svg>"#;
+        let r = svg_to_png(svg.as_bytes(), 800).unwrap();
+        assert!(r.has_text);
+    }
+
+    #[test]
+    fn svg_to_png_rejects_invalid_svg() {
+        assert!(svg_to_png(b"<svg>not closed", 800).is_err());
     }
 
     #[test]

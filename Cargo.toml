@@ -2,7 +2,7 @@
 name = "openrouter-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
 authors = ["Nick Bubelich <n+github@bubelich.com>"]
@@ -36,6 +36,9 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Rasterizes SVG inputs to PNG before sending (re-exports usvg + tiny-skia).
+# Pure Rust, no system libraries. usvg pins the effective MSRV to 1.87.
+resvg = { version = "0.47", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v7"] }
 

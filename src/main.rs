@@ -42,6 +42,8 @@ enum Command {
     Image(ImageArgs),
     /// Describe local image(s) with a vision-capable model.
     Describe(DescribeArgs),
+    /// Show basic info about the API key in use (label, owner, credits, limits).
+    Key,
 }
 
 /// CLI flags for `describe`, mirroring the `describe_image` MCP tool.
@@ -221,8 +223,41 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Models(args)) => run_models(args).await,
         Some(Command::Image(args)) => run_image(args).await,
         Some(Command::Describe(args)) => run_describe(args).await,
+        Some(Command::Key) => run_key().await,
         Some(Command::Mcp) | None => server::run().await,
     }
+}
+
+/// Fetch and print basic info about the API key in use (`GET /api/v1/key`).
+async fn run_key() -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let info = client.get_key_info().await?;
+
+    // `limit`/`limit_remaining` are null for unlimited keys.
+    let usd = |o: Option<f64>| o.map_or_else(|| "unlimited".to_string(), |v| format!("${v}"));
+    let flag = |o: Option<bool>| if o.unwrap_or(false) { "yes" } else { "no" };
+
+    println!("label:            {}", info.label.as_deref().unwrap_or("—"));
+    println!(
+        "owner (user id):  {}",
+        info.creator_user_id.as_deref().unwrap_or("—")
+    );
+    println!("free tier:        {}", flag(info.is_free_tier));
+    println!("provisioning key: {}", flag(info.is_provisioning_key));
+    println!("management key:   {}", flag(info.is_management_key));
+    println!("limit:            {}", usd(info.limit));
+    println!("limit remaining:  {}", usd(info.limit_remaining));
+    println!("usage (total):    ${}", info.usage.unwrap_or(0.0));
+    println!(
+        "usage day/wk/mo:  ${} / ${} / ${}",
+        info.usage_daily.unwrap_or(0.0),
+        info.usage_weekly.unwrap_or(0.0),
+        info.usage_monthly.unwrap_or(0.0)
+    );
+    if let Some(byok) = info.byok_usage.filter(|v| *v > 0.0) {
+        println!("byok usage:       ${byok}");
+    }
+    Ok(())
 }
 
 /// Describe local image(s) with a vision model and print the text to stdout.

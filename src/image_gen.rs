@@ -100,26 +100,58 @@ pub(crate) struct PreparedInput {
     pub original_height: u32,
     pub normalized_width: u32,
     pub normalized_height: u32,
+    /// Source MIME when the input arrived as something other than the four raster
+    /// formats (currently only `image/svg+xml`); `None` for raster inputs.
+    pub source_mime: Option<&'static str>,
+    /// Non-fatal notes about this input (e.g. an SVG containing unrendered text).
+    pub warnings: Vec<String>,
 }
 
-/// Read, decode, downscale, and PNG-encode each input image **once**, capturing
-/// the data URL and the original/normalized dimensions.
+/// Read each input image **once** and produce the PNG data URL plus original /
+/// normalized dimensions. Raster inputs (png/jpeg/webp/gif) are decoded and
+/// downscaled to `max_dim`; SVG inputs are rasterized to PNG at the cap (see
+/// [`image_io::svg_to_png`]), with the SVG's intrinsic viewBox size recorded as
+/// the "original" dimensions.
 pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<PreparedInput>> {
     images
         .iter()
         .map(|img| {
             let bytes = std::fs::read(&img.path)
                 .with_context(|| format!("could not read input image {}", img.path.display()))?;
-            let (original_width, original_height) = image_io::decode_dimensions(&bytes)?;
-            let png = image_io::normalize_to_png(&bytes, max_dim)?;
-            let (normalized_width, normalized_height) = image_io::decode_dimensions(&png)?;
-            Ok(PreparedInput {
-                data_url: image_io::png_data_url(&png),
-                original_width,
-                original_height,
-                normalized_width,
-                normalized_height,
-            })
+            if image_io::is_svg(&bytes) {
+                let svg = image_io::svg_to_png(&bytes, max_dim)
+                    .with_context(|| format!("could not rasterize SVG {}", img.path.display()))?;
+                let (normalized_width, normalized_height) = image_io::decode_dimensions(&svg.png)?;
+                let mut warnings = Vec::new();
+                if svg.has_text {
+                    warnings.push(
+                        "SVG contains <text> which is not rendered (no fonts are loaded)"
+                            .to_string(),
+                    );
+                }
+                Ok(PreparedInput {
+                    data_url: image_io::png_data_url(&svg.png),
+                    original_width: svg.intrinsic_width,
+                    original_height: svg.intrinsic_height,
+                    normalized_width,
+                    normalized_height,
+                    source_mime: Some("image/svg+xml"),
+                    warnings,
+                })
+            } else {
+                let (original_width, original_height) = image_io::decode_dimensions(&bytes)?;
+                let png = image_io::normalize_to_png(&bytes, max_dim)?;
+                let (normalized_width, normalized_height) = image_io::decode_dimensions(&png)?;
+                Ok(PreparedInput {
+                    data_url: image_io::png_data_url(&png),
+                    original_width,
+                    original_height,
+                    normalized_width,
+                    normalized_height,
+                    source_mime: None,
+                    warnings: Vec::new(),
+                })
+            }
         })
         .collect()
 }
@@ -422,6 +454,7 @@ pub async fn run_job(
             index: i + 1,
             label: img.label.clone(),
             source: img.path.to_string_lossy().into_owned(),
+            source_mime_type: p.source_mime,
             original_width: p.original_width,
             original_height: p.original_height,
             normalized_mime_type: "image/png",
@@ -438,6 +471,14 @@ pub async fn run_job(
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut variant_metas = Vec::new();
+
+    // Surface per-input notes (e.g. an SVG with unrendered text) alongside the
+    // per-variant dimension warnings.
+    for (i, p) in prepared.iter().enumerate() {
+        for w in &p.warnings {
+            warnings.push(format!("input image {}: {w}", i + 1));
+        }
+    }
 
     for outcome in outcomes {
         let mut meta = VariantMeta {
@@ -565,6 +606,25 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, buf.into_inner()).unwrap();
         path
+    }
+
+    #[test]
+    fn prepare_inputs_rasterizes_svg_to_png_data_url() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200" viewBox="0 0 400 200"><rect width="400" height="200"/></svg>"#;
+        let path = std::env::temp_dir().join("openrouter-mcp-test-input.svg");
+        std::fs::write(&path, svg).unwrap();
+
+        let images = vec![InputImage { path, label: None }];
+        let prepared = prepare_inputs(&images, 800).unwrap();
+        let p = &prepared[0];
+
+        // SVG was rasterized to PNG and fit to the 800px cap (400x200 -> 800x400),
+        // intrinsic viewBox size recorded as the original, source flagged as SVG.
+        assert!(p.data_url.starts_with("data:image/png;base64,"));
+        assert_eq!((p.original_width, p.original_height), (400, 200));
+        assert_eq!((p.normalized_width, p.normalized_height), (800, 400));
+        assert_eq!(p.source_mime, Some("image/svg+xml"));
+        assert!(p.warnings.is_empty());
     }
 
     #[test]

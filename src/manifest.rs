@@ -34,6 +34,10 @@ pub struct InputImageMeta {
     pub index: usize,
     pub label: Option<String>,
     pub source: String,
+    /// Original MIME when the input was not one of the four raster formats
+    /// (currently only `image/svg+xml`); omitted for raster inputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mime_type: Option<&'static str>,
     pub original_width: u32,
     pub original_height: u32,
     pub normalized_mime_type: &'static str,

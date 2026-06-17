@@ -502,6 +502,32 @@ impl OpenRouterServer {
     }
 
     #[tool(
+        description = "Return basic information about the OpenRouter API key in use \
+        (GET /api/v1/key): label, creator_user_id (the owning user — the closest available \
+        owner identity, not a name/email), credit usage (total and daily/weekly/monthly), \
+        spending limit and remaining balance in USD (null means unlimited), byok_usage, the \
+        is_free_tier / is_provisioning_key / is_management_key flags, and a deprecated \
+        rate_limit (requests per interval; -1 means unlimited). This is account/key-level \
+        info, not a per-request cost.",
+        annotations(
+            title = "Get Account Info",
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn get_account(&self) -> Result<CallToolResult, ErrorData> {
+        let info = self
+            .client
+            .get_key_info()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let body = serde_json::to_string_pretty(&info)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
         description = "Return in-memory usage statistics for this server process: started_at, \
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
         text_generations (describe_image calls), actual_cost_usd (summed from usage.cost), \
@@ -711,6 +737,32 @@ mod tests {
         assert!(err.message.contains("image_size"));
         assert!(err.message.contains("image_only"));
         assert!(err.message.contains("no defaults"));
+    }
+
+    #[tokio::test]
+    async fn get_account_tool_returns_key_json() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "label": "sk-or-v1-x",
+                    "creator_user_id": "user_42",
+                    "usage": 1.5,
+                    "limit": null,
+                    "is_free_tier": false
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let res = server.get_account().await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["label"], "sk-or-v1-x");
+        assert_eq!(v["creator_user_id"], "user_42");
+        assert_eq!(v["usage"], 1.5);
+        assert!(v["limit"].is_null());
     }
 
     #[tokio::test]

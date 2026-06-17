@@ -11,6 +11,10 @@ per-process usage — all behind one `openrouter-mcp` executable.
   supported params, sort, min context), local search, and pricing.
 - **Image generation** — `generate_image`: text-to-image, image editing /
   image-to-image (multiple local inputs), and **parallel variants** (seed-stepped).
+  - Input images may be PNG, JPEG, WebP, GIF, or **SVG**. SVG inputs are
+    rasterized to PNG (longest side scaled to the dimension cap; transparency
+    preserved). Text in SVGs is not rendered (no fonts are loaded) and is flagged
+    as a warning.
   - The output format (PNG/JPEG) is **chosen by the provider** — it is sniffed
     from the response and the file extension is set to match.
   - Requested `aspect_ratio` / `image_size` are **verified** against the actual
@@ -21,6 +25,9 @@ per-process usage — all behind one `openrouter-mcp` executable.
     tool returns a `task_id`; poll `get_result` for completion.
 - **Image description** — `describe_image`: image → detailed text via any
   vision-capable model (image input, text output).
+- **Account info** — `get_account`: basic info about the API key in use (label,
+  owning user id, credit usage with daily/weekly/monthly breakdown, spending
+  limit / remaining balance, and tier / key-type flags).
 - **Usage stats** — `get_usage_stats` (read-only) and `reset_usage_stats`
   (destructive, requires `confirm: true`): per-process request/cost counters with
   a by-model breakdown.
@@ -62,7 +69,9 @@ OPENROUTER_API_KEY=sk-or-v1-...
 Do not commit `.env`.
 
 Optional: `OPENROUTER_IMAGE_MAX_DIMENSION` (default `800`) caps the longest side
-of input images before they are sent (downscaled to reduce request size/cost).
+of input images before they are sent (raster inputs are downscaled to reduce
+request size/cost; SVG inputs are rasterized with their longest side scaled to
+this cap).
 
 ## MCP usage
 
@@ -96,6 +105,7 @@ block is optional.
 | `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. **No defaults** — `model`, `prompt`, `output`, `aspect_ratio`, `image_size`, and `image_only` must all be set. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
 | `describe_image` | read-only | Describe local image(s) with a vision-capable model; returns text. |
+| `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |
 | `get_usage_stats` | read-only | In-memory request/cost counters with a by-model breakdown. |
 | `reset_usage_stats` | destructive | Reset all counters (`confirm: true` required). |
 
@@ -105,7 +115,13 @@ the full per-variant detail lives in the manifest on disk.
 
 ## CLI usage
 
-The same binary is a CLI. Subcommands: `models`, `image`, `describe`, `mcp`.
+The same binary is a CLI. Subcommands: `models`, `image`, `describe`, `key`, `mcp`.
+
+Show info about the API key in use:
+
+```bash
+openrouter-mcp key
+```
 
 Browse models:
 
