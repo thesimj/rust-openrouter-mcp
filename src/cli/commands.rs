@@ -1,12 +1,13 @@
 //! Per-command handlers for the CLI subcommands.
 
-use super::table::{primary_modality, render_sectioned_table, video_price};
+use super::table::{primary_modality, render_sectioned_table};
 use super::{
     AudioArgs, DescribeArgs, ImageArgs, ModelsArgs, VideoArgs, parse_image_arg,
     resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
 use crate::openrouter::{ModelsQuery, OpenRouterClient};
+use crate::pricing::{models_to_json, video_price};
 use crate::{audio_gen, image_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
@@ -162,7 +163,7 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
         references: args
             .reference_images
             .iter()
-            .map(|v| parse_image_arg(v).path)
+            .map(std::path::PathBuf::from)
             .collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         poll_interval_secs: video_gen::resolve_poll_interval(None),
@@ -229,8 +230,12 @@ pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
     let (models, total) = (filtered.models, filtered.total);
 
     if !args.table {
-        // Default: JSON, matching the `list_models` MCP tool output.
-        println!("{}", serde_json::to_string_pretty(&models)?);
+        // Default: JSON, matching the `list_models` MCP tool output (same
+        // shared enrichment, so the two never diverge).
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&models_to_json(&models))?
+        );
         if !args.all && total > models.len() {
             eprintln!(
                 "\nshowing {} of {} models; pass --all to see the rest",

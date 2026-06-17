@@ -51,10 +51,7 @@ impl OpenRouterClient {
             .await
             .context("failed to decode OpenRouter model-endpoints response")?;
         // Unwrap the `data` envelope (model + endpoints) when present.
-        Ok(body
-            .get_mut("data")
-            .map(Value::take)
-            .unwrap_or(body))
+        Ok(body.get_mut("data").map(Value::take).unwrap_or(body))
     }
 
     /// `GET /api/v1/videos/models`, returning the entry whose `id` matches
@@ -77,14 +74,11 @@ impl OpenRouterClient {
             .json()
             .await
             .context("failed to decode OpenRouter /videos/models response")?;
-        let found = body
-            .get("data")
-            .and_then(Value::as_array)
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
-                    .cloned()
-            });
+        let found = body.get("data").and_then(Value::as_array).and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
+                .cloned()
+        });
         Ok(found)
     }
 }
@@ -156,7 +150,10 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let detail = client.describe_model("anthropic/claude-opus-4.7").await.unwrap();
+        let detail = client
+            .describe_model("anthropic/claude-opus-4.7")
+            .await
+            .unwrap();
         // The `data` envelope is unwrapped; everything underneath is preserved.
         assert_eq!(detail["id"], "anthropic/claude-opus-4.7");
         assert_eq!(detail["endpoints"][0]["provider_name"], "Anthropic");

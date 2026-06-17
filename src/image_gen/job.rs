@@ -159,7 +159,7 @@ pub async fn run_job(
         .map(|(i, (img, p))| InputImageMeta {
             index: i + 1,
             label: img.label.clone(),
-            source: img.path.to_string_lossy().into_owned(),
+            source: img.source_label(),
             source_mime_type: p.source_mime,
             original_width: p.original_width,
             original_height: p.original_height,

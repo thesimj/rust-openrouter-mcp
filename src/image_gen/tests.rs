@@ -34,7 +34,7 @@ fn prepare_inputs_rasterizes_svg_to_png_data_url() {
     let path = std::env::temp_dir().join("openrouter-mcp-test-input.svg");
     std::fs::write(&path, svg).unwrap();
 
-    let images = vec![InputImage { path, label: None }];
+    let images = vec![InputImage::from_path(path, None)];
     let prepared = prepare_inputs(&images, 800).unwrap();
     let p = &prepared[0];
 
@@ -56,10 +56,10 @@ fn build_content_is_plain_text_without_images() {
 
 #[test]
 fn build_content_puts_text_first_then_images() {
-    let images = vec![InputImage {
-        path: temp_png("openrouter-mcp-test-content.png"),
-        label: None,
-    }];
+    let images = vec![InputImage::from_path(
+        temp_png("openrouter-mcp-test-content.png"),
+        None,
+    )];
     let prepared = prepare_inputs(&images, 800).unwrap();
     let content = build_content("edit this", &images, &prepared);
     let v = serde_json::to_value(&content).unwrap();
@@ -78,14 +78,14 @@ fn build_content_puts_text_first_then_images() {
 #[test]
 fn build_content_prepends_label_block_when_labeled() {
     let images = vec![
-        InputImage {
-            path: temp_png("openrouter-mcp-test-bg.png"),
-            label: Some("background".to_string()),
-        },
-        InputImage {
-            path: temp_png("openrouter-mcp-test-fg.png"),
-            label: Some("product".to_string()),
-        },
+        InputImage::from_path(
+            temp_png("openrouter-mcp-test-bg.png"),
+            Some("background".to_string()),
+        ),
+        InputImage::from_path(
+            temp_png("openrouter-mcp-test-fg.png"),
+            Some("product".to_string()),
+        ),
     ];
     let prepared = prepare_inputs(&images, 800).unwrap();
     let content = build_content("compose them", &images, &prepared);
@@ -197,10 +197,10 @@ async fn describe_image_sends_image_and_returns_text() {
     let req = DescribeRequest {
         model: "google/gemini-2.5-flash".to_string(),
         prompt: "What is this?".to_string(),
-        images: vec![InputImage {
-            path: temp_png("openrouter-mcp-test-describe.png"),
-            label: None,
-        }],
+        images: vec![InputImage::from_path(
+            temp_png("openrouter-mcp-test-describe.png"),
+            None,
+        )],
         max_image_dimension: 800,
     };
     let result = describe_image(&client, &req).await.unwrap();

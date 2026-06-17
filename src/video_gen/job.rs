@@ -66,7 +66,7 @@ pub async fn run_job(
     let unlabeled = |paths: Vec<PathBuf>| -> Vec<InputImage> {
         paths
             .into_iter()
-            .map(|path| InputImage { path, label: None })
+            .map(|path| InputImage::from_path(path, None))
             .collect()
     };
 

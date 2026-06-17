@@ -20,11 +20,64 @@ pub(crate) use job::{JobSummary, base_stem, in_parent_of, manifest_path, run_job
 /// Default longest-side cap (px) for normalized input images.
 const DEFAULT_MAX_DIMENSION: u32 = 800;
 
-/// A local image used as input (editing / image-to-image). Order is preserved.
+/// Where an input image's bytes come from. URL inputs are fetched and `base64`/
+/// data-URL inputs are decoded at the tool boundary, so by the time bytes are
+/// needed an input is either a local path or already-decoded inline bytes.
+#[derive(Debug, Clone)]
+pub enum ImageSource {
+    /// A local file path, read lazily in [`prepare_inputs`].
+    Path(PathBuf),
+    /// Already-decoded bytes (from a URL fetch or a base64/data-URL argument),
+    /// with a human-readable `name` for prompts/manifest.
+    Inline { bytes: Vec<u8>, name: String },
+}
+
+/// An image used as input (editing / image-to-image). Order is preserved.
 #[derive(Debug, Clone)]
 pub struct InputImage {
-    pub path: PathBuf,
+    pub source: ImageSource,
     pub label: Option<String>,
+}
+
+impl InputImage {
+    /// An input backed by a local file path.
+    pub fn from_path(path: impl Into<PathBuf>, label: Option<String>) -> Self {
+        Self {
+            source: ImageSource::Path(path.into()),
+            label,
+        }
+    }
+
+    /// An input backed by already-decoded bytes (URL fetch / base64 argument).
+    pub fn inline(bytes: Vec<u8>, name: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            source: ImageSource::Inline {
+                bytes,
+                name: name.into(),
+            },
+            label,
+        }
+    }
+
+    /// Short name used to reference this image in the prompt (file name, URL, or
+    /// inline label).
+    pub fn display_name(&self) -> String {
+        match &self.source {
+            ImageSource::Path(p) => p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ImageSource::Inline { name, .. } => name.clone(),
+        }
+    }
+
+    /// Source descriptor recorded in the manifest.
+    pub fn source_label(&self) -> String {
+        match &self.source {
+            ImageSource::Path(p) => p.to_string_lossy().into_owned(),
+            ImageSource::Inline { name, .. } => name.clone(),
+        }
+    }
 }
 
 /// Inputs for a single image generation.
@@ -82,11 +135,7 @@ fn assemble_prompt(prompt: &str, images: &[InputImage]) -> String {
     }
     let mut block = String::from("Reference images:\n");
     for (i, img) in images.iter().enumerate() {
-        let name = img
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = img.display_name();
         let label = img.label.as_deref().unwrap_or("image");
         block.push_str(&format!("{}. {label}: {name}\n", i + 1));
     }
@@ -118,11 +167,14 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
     images
         .iter()
         .map(|img| {
-            let bytes = std::fs::read(&img.path)
-                .with_context(|| format!("could not read input image {}", img.path.display()))?;
+            let bytes = match &img.source {
+                ImageSource::Path(p) => std::fs::read(p)
+                    .with_context(|| format!("could not read input image {}", p.display()))?,
+                ImageSource::Inline { bytes, .. } => bytes.clone(),
+            };
             if image_io::is_svg(&bytes) {
                 let svg = image_io::svg_to_png(&bytes, max_dim)
-                    .with_context(|| format!("could not rasterize SVG {}", img.path.display()))?;
+                    .with_context(|| format!("could not rasterize SVG {}", img.source_label()))?;
                 let (normalized_width, normalized_height) = image_io::decode_dimensions(&svg.png)?;
                 let mut warnings = Vec::new();
                 if svg.has_text {

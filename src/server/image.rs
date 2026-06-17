@@ -1,6 +1,9 @@
 //! Image tools (`generate_image`, `describe_image`), their argument structs, the
 //! shared `ImageInput` type, and the image-job result builder.
 
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+
+use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -22,29 +25,172 @@ use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
 
-/// A local input image for editing / image-to-image. Order is preserved.
+/// An input image for editing / image-to-image / vision. Exactly one of
+/// `path`, `url`, or `base64` must be set. Order is preserved.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct ImageInput {
-    /// Local file path (png/jpeg/webp/gif).
-    pub path: String,
+    /// Local file path (png/jpeg/webp/gif/svg). One of path/url/base64.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// HTTP(S) URL to fetch the image from. One of path/url/base64.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Inline image data: a full `data:` URL or raw base64. One of path/url/base64.
+    #[serde(default)]
+    pub base64: Option<String>,
     /// Optional label, surfaced to the model as a reference name.
     #[serde(default)]
     pub label: Option<String>,
 }
 
-impl From<ImageInput> for image_gen::InputImage {
-    fn from(i: ImageInput) -> Self {
-        image_gen::InputImage {
-            path: i.path.into(),
-            label: i.label,
+/// Decode an inline `base64`/data-URL argument to raw bytes.
+fn decode_inline(data: &str) -> Result<Vec<u8>, ErrorData> {
+    let data = data.trim();
+    if data.starts_with("data:") {
+        crate::image_io::parse_data_url(data)
+            .map(|(_mime, bytes)| bytes)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid data URL: {e}"), None))
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid base64 image data: {e}"), None))
+    }
+}
+
+/// True for IPs a fetched URL must never reach (SSRF guard): loopback, private
+/// (RFC1918), CGNAT (100.64/10), link-local (incl. cloud metadata 169.254.169.254),
+/// unspecified, broadcast, documentation, multicast, and IPv6 ULA/link-local.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
         }
     }
 }
 
-/// Map a list of tool-level [`ImageInput`]s to the generator's `InputImage`s.
-fn to_input_images(images: Vec<ImageInput>) -> Vec<image_gen::InputImage> {
-    images.into_iter().map(Into::into).collect()
+/// Fetch an image URL's bytes with a plain client. Deliberately does NOT use the
+/// OpenRouter-authenticated client, so the API key is never sent to a
+/// third-party URL. SSRF-hardened: only http/https; the host is resolved and
+/// rejected if it points at a private/loopback/link-local address; redirects are
+/// disabled; and the connection is pinned to the validated IP so DNS can't be
+/// rebound between the check and the request.
+async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
+    let invalid = |msg: String| ErrorData::invalid_params(msg, None);
+
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| invalid(format!("invalid image url: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid(format!("image url must be http(s): {url}")));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid("image url has no host".to_string()))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    // Resolve off the async runtime, then refuse internal/private targets.
+    let lookup = host.clone();
+    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+        (lookup.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| ErrorData::internal_error(format!("dns task failed: {e}"), None))?
+    .map_err(|e| invalid(format!("could not resolve image url host: {e}")))?;
+
+    if addrs.is_empty() {
+        return Err(invalid("image url host did not resolve".to_string()));
+    }
+    if addrs.iter().any(|a| is_blocked_ip(a.ip())) {
+        return Err(invalid(
+            "image url resolves to a private/loopback/link-local address; refused".to_string(),
+        ));
+    }
+
+    // Pin to the validated IP (no second DNS lookup -> no rebinding) and forbid
+    // redirects (a 30x could otherwise bounce to an internal host).
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, addrs[0])
+        .build()
+        .map_err(|e| ErrorData::internal_error(format!("http client build failed: {e}"), None))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| invalid(format!("could not fetch image url: {e}")))?;
+    if resp.status().is_redirection() {
+        return Err(invalid(
+            "image url returned a redirect; refused (SSRF guard)".to_string(),
+        ));
+    }
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| invalid(format!("image url returned an error: {e}")))?;
+    let bytes = resp.bytes().await.map_err(|e| {
+        ErrorData::internal_error(format!("could not read image url body: {e}"), None)
+    })?;
+    Ok(bytes.to_vec())
+}
+
+/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`],
+/// fetching URLs and decoding base64/data-URL inputs. Requires exactly one source.
+async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, ErrorData> {
+    let label = img.label;
+    let count = [&img.path, &img.url, &img.base64]
+        .iter()
+        .filter(|o| o.as_ref().is_some_and(|s| !s.trim().is_empty()))
+        .count();
+    if count != 1 {
+        return Err(ErrorData::invalid_params(
+            "each image needs exactly one of: path, url, or base64".to_string(),
+            None,
+        ));
+    }
+    if let Some(p) = img.path.filter(|s| !s.trim().is_empty()) {
+        Ok(image_gen::InputImage::from_path(p, label))
+    } else if let Some(b64) = img.base64.filter(|s| !s.trim().is_empty()) {
+        Ok(image_gen::InputImage::inline(
+            decode_inline(&b64)?,
+            "inline",
+            label,
+        ))
+    } else {
+        let url = img.url.unwrap();
+        let bytes = fetch_url(&url).await?;
+        Ok(image_gen::InputImage::inline(bytes, url, label))
+    }
+}
+
+/// Resolve a list of tool-level [`ImageInput`]s to generator inputs, in order.
+async fn resolve_image_inputs(
+    images: Vec<ImageInput>,
+) -> Result<Vec<image_gen::InputImage>, ErrorData> {
+    let mut out = Vec::with_capacity(images.len());
+    for img in images {
+        out.push(resolve_image_input(img).await?);
+    }
+    Ok(out)
 }
 
 /// Arguments for the `generate_image` tool.
@@ -71,8 +217,9 @@ pub(crate) struct GenerateImageArgs {
     /// (e.g. Nano Banana, GPT Image).
     #[serde(default, deserialize_with = "de_opt_bool")]
     pub image_only: Option<bool>,
-    /// Local input images to edit/condition on (image-to-image / multi-image).
-    /// Provide them to edit existing images; omit for plain text-to-image.
+    /// Input images to edit/condition on (image-to-image / multi-image). Each
+    /// takes exactly one of: path (local file), url (http/https, fetched), or
+    /// base64 (a data: URL or raw base64). Omit for plain text-to-image.
     #[serde(default)]
     pub images: Vec<ImageInput>,
     /// Longest-side cap (px) for input images before sending (default 800;
@@ -104,7 +251,8 @@ pub(crate) struct DescribeImageArgs {
     /// Vision-capable model id (image input, text output), e.g.
     /// "google/gemini-2.5-flash" or "anthropic/claude-sonnet-4.6".
     pub model: String,
-    /// Local image path(s) to describe (at least one required).
+    /// Image(s) to describe (at least one required). Each takes exactly one of:
+    /// path (local file), url (http/https), or base64 (data: URL or raw base64).
     pub images: Vec<ImageInput>,
     /// Instruction or question about the image(s). Defaults to a detailed description.
     #[serde(default)]
@@ -154,8 +302,9 @@ impl OpenRouterServer {
         google/gemini-3.1-flash-image-preview) and save it. `output` is optional - omit it to \
         get an auto-named file (kind_datetime_model_config_seed_hash) under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). For text-to-image, \
-        pass a prompt. For editing / image-to-image, also pass local `images` (order \
-        preserved; optional per-image label) - the prompt becomes the edit instruction. \
+        pass a prompt. For editing / image-to-image, also pass `images` - each given as a \
+        local path, an http(s) url, or base64/data-URL (order preserved; optional per-image \
+        label) - the prompt becomes the edit instruction. \
         Set variants>1 to generate several in parallel (seed-stepped). Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
@@ -209,6 +358,7 @@ impl OpenRouterServer {
 
         let aspect_ratio = args.aspect_ratio.clone();
         let image_size = args.image_size.clone();
+        let images = resolve_image_inputs(args.images).await?;
         let req = GenerateRequest {
             model: args.model.clone(),
             prompt: args.prompt,
@@ -216,7 +366,7 @@ impl OpenRouterServer {
             image_size: args.image_size,
             seed: args.seed,
             image_only: args.image_only.unwrap_or(false),
-            images: to_input_images(args.images),
+            images,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         };
 
@@ -278,8 +428,9 @@ impl OpenRouterServer {
     #[tool(
         description = "Describe or answer a question about local image(s) using a vision-capable \
         model (image input, text output, e.g. google/gemini-2.5-flash, anthropic/claude-sonnet-4.6, \
-        or openai/gpt-5.4). Pass one or more image paths and an optional prompt/question (defaults \
-        to a detailed description); returns the model's text. Images are downscaled before sending. \
+        or openai/gpt-5.4). Pass one or more images (each a local path, an http(s) url, or \
+        base64/data-URL) and an optional prompt/question (defaults to a detailed description); \
+        returns the model's text. Images are downscaled before sending. \
         To create or edit an image instead, use generate_image.",
         annotations(
             title = "Describe Image",
@@ -304,7 +455,7 @@ impl OpenRouterServer {
             prompt: args
                 .prompt
                 .unwrap_or_else(|| "Describe this image in detail.".to_string()),
-            images: to_input_images(args.images),
+            images: resolve_image_inputs(args.images).await?,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         };
         match image_gen::describe_image(&self.client, &req).await {
@@ -323,10 +474,96 @@ impl OpenRouterServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_gen::ImageSource;
     use crate::server::test_support::{server_for, tool_result_json, valid_png_b64};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn img_input(path: Option<&str>, url: Option<&str>, base64: Option<&str>) -> ImageInput {
+        ImageInput {
+            path: path.map(str::to_string),
+            url: url.map(str::to_string),
+            base64: base64.map(str::to_string),
+            label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_image_input_decodes_base64_and_data_url() {
+        // Raw base64 -> inline bytes.
+        let resolved = resolve_image_input(img_input(None, None, Some(&valid_png_b64())))
+            .await
+            .unwrap();
+        match resolved.source {
+            ImageSource::Inline { bytes, .. } => assert!(!bytes.is_empty()),
+            _ => panic!("expected inline bytes from base64"),
+        }
+
+        // A full data: URL also decodes to inline bytes.
+        let data_url = format!("data:image/png;base64,{}", valid_png_b64());
+        let resolved = resolve_image_input(img_input(None, None, Some(&data_url)))
+            .await
+            .unwrap();
+        assert!(matches!(resolved.source, ImageSource::Inline { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_image_input_keeps_path_and_rejects_bad_input() {
+        let resolved = resolve_image_input(img_input(Some("/tmp/a.png"), None, None))
+            .await
+            .unwrap();
+        assert!(matches!(resolved.source, ImageSource::Path(_)));
+
+        // No source -> error.
+        let err = resolve_image_input(img_input(None, None, None))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exactly one of"));
+
+        // Two sources -> error.
+        let err = resolve_image_input(img_input(Some("/tmp/a.png"), None, Some("x")))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exactly one of"));
+
+        // Non-http url -> rejected (never sent anywhere).
+        let err = resolve_image_input(img_input(None, Some("file:///etc/passwd"), None))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("http"));
+    }
+
+    #[test]
+    fn is_blocked_ip_blocks_internal_allows_public() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Blocked: loopback, private, link-local (incl. cloud metadata), CGNAT.
+        assert!(is_blocked_ip(Ipv4Addr::new(127, 0, 0, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(10, 0, 0, 5).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(192, 168, 1, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(172, 16, 0, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(169, 254, 169, 254).into())); // metadata
+        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into())); // CGNAT
+        assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
+        // Allowed: public addresses.
+        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
+        assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
+    }
+
+    #[tokio::test]
+    async fn fetch_url_refuses_loopback_and_metadata_targets() {
+        // SSRF guard: a loopback URL is refused before any connection.
+        let err = resolve_image_input(img_input(None, Some("http://127.0.0.1:9/pic.png"), None))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("private/loopback"));
+
+        // The cloud metadata endpoint is link-local and likewise refused.
+        let err = resolve_image_input(img_input(None, Some("http://169.254.169.254/latest"), None))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("private/loopback"));
+    }
 
     #[tokio::test]
     async fn generate_image_runs_async_and_get_result_fetches_it() {

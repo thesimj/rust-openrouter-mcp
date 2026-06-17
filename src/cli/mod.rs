@@ -290,14 +290,8 @@ fn parse_image_arg(value: &str) -> image_gen::InputImage {
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
         if is_label {
-            return image_gen::InputImage {
-                path: PathBuf::from(path),
-                label: Some(label.to_string()),
-            };
+            return image_gen::InputImage::from_path(path, Some(label.to_string()));
         }
     }
-    image_gen::InputImage {
-        path: PathBuf::from(value),
-        label: None,
-    }
+    image_gen::InputImage::from_path(value, None)
 }

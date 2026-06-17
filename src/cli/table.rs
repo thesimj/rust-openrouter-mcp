@@ -2,23 +2,7 @@
 //! table layout used by `openrouter-mcp models --table`.
 
 use crate::openrouter;
-
-/// Format an OpenRouter per-token price string as USD per 1M tokens.
-/// Returns "-" when missing/unparseable and "0" for zero.
-pub(crate) fn per_million(price: &Option<String>) -> String {
-    match price.as_deref().and_then(|s| s.parse::<f64>().ok()) {
-        Some(0.0) => "0".to_string(),
-        // Negative values are sentinels (e.g. openrouter/auto uses -1 = "varies").
-        Some(p) if p < 0.0 => "-".to_string(),
-        Some(p) => {
-            // Trim trailing zeros from a fixed-precision render.
-            let s = format!("{:.4}", p * 1_000_000.0);
-            let s = s.trim_end_matches('0').trim_end_matches('.');
-            format!("${s}")
-        }
-        None => "-".to_string(),
-    }
-}
+use crate::pricing::per_million;
 
 /// Human-readable context length, e.g. 131072 -> "128K", 1000000 -> "1M".
 /// Prefers exact decimal (÷1000) then exact binary (÷1024), else 1-decimal.
@@ -51,48 +35,6 @@ pub(crate) fn human_context(n: Option<u64>) -> String {
         return trim(n as f64 / 1000.0, "K");
     }
     n.to_string()
-}
-
-/// Trim a float to a compact decimal string (up to 8 places, no trailing zeros).
-pub(crate) fn trim_num(v: f64) -> String {
-    let s = format!("{v:.8}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// Render a list of prices as `$x<unit>` or `$min-max<unit>`.
-pub(crate) fn range_str(vals: &[f64], unit: &str) -> String {
-    let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < f64::EPSILON {
-        format!("${}{}", trim_num(min), unit)
-    } else {
-        format!("${}-{}{}", trim_num(min), trim_num(max), unit)
-    }
-}
-
-/// Derive a concise price for a video model from its heterogeneous
-/// `pricing_skus`: dollars-per-second, cents-per-second, or per video-token.
-pub(crate) fn video_price(skus: &std::collections::BTreeMap<String, String>) -> String {
-    let collect = |pred: &dyn Fn(&str) -> bool| -> Vec<f64> {
-        skus.iter()
-            .filter(|(k, _)| pred(k))
-            .filter_map(|(_, v)| v.parse::<f64>().ok())
-            .collect()
-    };
-    let secs = collect(&|k| k.contains("duration_seconds"));
-    if !secs.is_empty() {
-        return range_str(&secs, "/s");
-    }
-    let cents = collect(&|k| k.contains("second"));
-    if !cents.is_empty() {
-        let dollars: Vec<f64> = cents.iter().map(|c| c / 100.0).collect();
-        return range_str(&dollars, "/s");
-    }
-    let toks = collect(&|k| k.contains("token"));
-    if !toks.is_empty() {
-        return range_str(&toks, "/vid-tok");
-    }
-    "-".to_string()
 }
 
 /// Format a raw decimal price string as `$<value>`, or "-" if missing/zero.
@@ -254,8 +196,6 @@ pub(crate) fn render_sectioned_table(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::openrouter::{Architecture, Model, Pricing};
 
@@ -276,16 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn per_million_formats_prices_and_sentinels() {
-        assert_eq!(per_million(&Some("0".to_string())), "0");
-        assert_eq!(per_million(&Some("-1".to_string())), "-");
-        assert_eq!(per_million(&Some("0.00000075".to_string())), "$0.75");
-        assert_eq!(per_million(&Some("0.00003".to_string())), "$30");
-        assert_eq!(per_million(&Some("not-a-number".to_string())), "-");
-        assert_eq!(per_million(&None), "-");
-    }
-
-    #[test]
     fn human_context_uses_compact_units() {
         assert_eq!(human_context(None), "-");
         assert_eq!(human_context(Some(0)), "-");
@@ -294,44 +224,6 @@ mod tests {
         assert_eq!(human_context(Some(1_050_000)), "1.05M");
         assert_eq!(human_context(Some(1_048_576)), "1M");
         assert_eq!(human_context(Some(999)), "999");
-    }
-
-    #[test]
-    fn video_price_prefers_seconds_then_cents_then_video_tokens() {
-        let mut skus = BTreeMap::new();
-        skus.insert("duration_seconds".to_string(), "0.12".to_string());
-        skus.insert("video_tokens".to_string(), "0.01".to_string());
-        assert_eq!(video_price(&skus), "$0.12/s");
-
-        let mut skus = BTreeMap::new();
-        skus.insert("second_with_audio".to_string(), "3".to_string());
-        skus.insert("second_without_audio".to_string(), "2".to_string());
-        assert_eq!(video_price(&skus), "$0.02-0.03/s");
-
-        let mut skus = BTreeMap::new();
-        skus.insert("video_tokens".to_string(), "0.0002".to_string());
-        assert_eq!(video_price(&skus), "$0.0002/vid-tok");
-
-        assert_eq!(video_price(&BTreeMap::new()), "-");
-    }
-
-    #[test]
-    fn trim_num_drops_trailing_zeros_and_caps_precision() {
-        assert_eq!(trim_num(1.0), "1");
-        assert_eq!(trim_num(1.50), "1.5");
-        assert_eq!(trim_num(0.12000000), "0.12");
-        // Capped at 8 decimal places.
-        assert_eq!(trim_num(0.123456789), "0.12345679");
-    }
-
-    #[test]
-    fn range_str_collapses_equal_bounds_and_renders_ranges() {
-        assert_eq!(range_str(&[0.02], "/s"), "$0.02/s");
-        // Equal min/max collapse to a single value.
-        assert_eq!(range_str(&[0.5, 0.5], "/s"), "$0.5/s");
-        assert_eq!(range_str(&[0.02, 0.03], "/s"), "$0.02-0.03/s");
-        // Order-independent: min and max are derived, not positional.
-        assert_eq!(range_str(&[0.03, 0.02], "/s"), "$0.02-0.03/s");
     }
 
     #[test]
@@ -344,27 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn per_million_trims_and_handles_fractions() {
-        // 0.000001 * 1e6 = 1.0 -> "$1"
-        assert_eq!(per_million(&Some("0.000001".to_string())), "$1");
-        // Fractional cents survive the 4-decimal render.
-        assert_eq!(per_million(&Some("0.0000012345".to_string())), "$1.2345");
-    }
-
-    #[test]
     fn human_context_handles_binary_and_fractional_units() {
         assert_eq!(human_context(Some(2048)), "2K");
         assert_eq!(human_context(Some(1500)), "1.5K");
         assert_eq!(human_context(Some(1_000_000)), "1M");
         assert_eq!(human_context(Some(2_500_000)), "2.5M");
-    }
-
-    #[test]
-    fn video_price_renders_single_cents_value() {
-        let mut skus = std::collections::BTreeMap::new();
-        skus.insert("second_with_audio".to_string(), "5".to_string());
-        // 5 cents/second -> $0.05/s
-        assert_eq!(video_price(&skus), "$0.05/s");
     }
 
     #[test]

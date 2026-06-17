@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "openrouter-mcp",
   "display_name": "OpenRouter - Models & Images",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Discover OpenRouter models and generate images, video, and speech (and describe images) from Claude.",
   "long_description": "A single Rust binary that exposes OpenRouter to Claude over MCP. Discover models with their capabilities and pricing, generate and edit images (with parallel seed-stepped variants and a sidecar manifest), generate video (text-to-video / image-to-video, async with poll-by-task_id), generate speech (text-to-speech), describe local images with a vision model, and track per-process usage. Bring your own OpenRouter API key.",
   "author": {
