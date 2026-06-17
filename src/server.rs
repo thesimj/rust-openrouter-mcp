@@ -1,5 +1,6 @@
 //! The rmcp stdio MCP server and its tools.
 
+use base64::Engine;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -78,6 +79,60 @@ fn job_result_json(
         result["errors"] = json!(summary.errors);
     }
     result
+}
+
+/// Map a saved-image path to its MCP image MIME type by extension.
+fn mime_for_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Read each saved image named in a completed result envelope off disk and
+/// return it as an inline MCP image content block (base64 + MIME). This lets a
+/// client that can't reach the server's filesystem — e.g. a remote/sandboxed
+/// connector — still display the result. Best-effort: unreadable files are
+/// skipped (the path-only JSON already carries the authoritative result).
+fn embedded_image_blocks(env: &serde_json::Value) -> Vec<Content> {
+    let Some(images) = env.get("images").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    images
+        .iter()
+        .filter_map(|img| {
+            let path = img.get("path").and_then(|p| p.as_str())?;
+            let bytes = std::fs::read(path).ok()?;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(Content::image(data, mime_for_path(path)))
+        })
+        .collect()
+}
+
+/// Parse a loosely-typed boolean env value: `true/1/yes/on` → Some(true),
+/// `false/0/no/off` → Some(false), anything else (incl. None) → None.
+fn parse_embed_flag(raw: Option<String>) -> Option<bool> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Decide whether to embed inline image blocks: an explicit per-call value wins,
+/// else the `OPENROUTER_EMBED_IMAGES` env default, else false.
+fn resolve_embed_images(explicit: Option<bool>) -> bool {
+    explicit
+        .or_else(|| parse_embed_flag(std::env::var("OPENROUTER_EMBED_IMAGES").ok()))
+        .unwrap_or(false)
 }
 
 /// Wrap a task snapshot into the response envelope returned by `generate_image`
@@ -189,6 +244,16 @@ pub struct GenerateImageArgs {
     /// Output file path (single image, or the base name for variants). The
     /// extension is corrected to the actual returned format.
     pub output: String,
+    /// When true, also return the generated image(s) as inline MCP image
+    /// content blocks (base64) in addition to the saved file path. Lets clients
+    /// that can't read the server's filesystem (e.g. a remote/sandboxed
+    /// connector) display the result directly. Defaults to the
+    /// OPENROUTER_EMBED_IMAGES env var (else false, the lean path-only
+    /// response); set explicitly here to override it. Only applies once the job
+    /// completes within the fast-return window; otherwise poll get_result with
+    /// embed_images=true.
+    #[serde(default)]
+    pub embed_images: Option<bool>,
 }
 
 /// Arguments for the `describe_image` tool.
@@ -212,6 +277,12 @@ pub struct DescribeImageArgs {
 pub struct GetResultArgs {
     /// The task_id returned by generate_image (or a future generate_video).
     pub task_id: String,
+    /// When true and the job has completed, also return the image(s) as inline
+    /// MCP image content blocks (base64) alongside the path-only JSON. Defaults
+    /// to the OPENROUTER_EMBED_IMAGES env var (else false). Use this to fetch the
+    /// displayable image after a pending job.
+    #[serde(default)]
+    pub embed_images: Option<bool>,
 }
 
 /// Arguments for the `reset_usage_stats` tool.
@@ -290,7 +361,10 @@ impl OpenRouterServer {
         image_size and image_only must all be specified, or the call fails with an error \
         naming what is missing. Runs asynchronously: if the job is still going after \
         wait_seconds (default 10), it returns status \"pending\" with a task_id to poll via \
-        get_result; otherwise it returns the completed result inline. To analyze or caption \
+        get_result; otherwise it returns the completed result inline. Set embed_images=true to \
+        also return the image(s) as inline MCP image content blocks (base64) so clients that \
+        can't read the saved file off disk can display them directly (defaults to the \
+        OPENROUTER_EMBED_IMAGES env var). To analyze or caption \
         an existing image instead of creating one, use describe_image.",
         annotations(
             title = "Generate Image",
@@ -414,15 +488,21 @@ impl OpenRouterServer {
         let env = snapshot_to_envelope(&task_id, &snap);
         let body = serde_json::to_string_pretty(&env)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        let mut content = vec![Content::text(body)];
+        if resolve_embed_images(args.embed_images) && snap.status == "completed" {
+            content.extend(embedded_image_blocks(&env));
+        }
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(
         description = "Fetch the status and result of a generation job by task_id (returned \
         by generate_image when a job is still running after its fast-return window). Returns \
         status pending|completed|failed; when completed, the same lean result (image paths, \
-        dimensions, manifest) generate_image would have returned. Tasks are in-memory per \
-        server process and are lost if the server restarts.",
+        dimensions, manifest) generate_image would have returned. Set embed_images=true to also \
+        return completed image(s) as inline MCP image content blocks (base64) (defaults to the \
+        OPENROUTER_EMBED_IMAGES env var). Tasks are \
+        in-memory per server process and are lost if the server restarts.",
         annotations(
             title = "Get Job Result",
             read_only_hint = true,
@@ -438,7 +518,11 @@ impl OpenRouterServer {
                 let env = snapshot_to_envelope(&args.task_id, &snap);
                 let body = serde_json::to_string_pretty(&env)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                let mut content = vec![Content::text(body)];
+                if resolve_embed_images(args.embed_images) && snap.status == "completed" {
+                    content.extend(embedded_image_blocks(&env));
+                }
+                Ok(CallToolResult::success(content))
             }
             None => Err(ErrorData::invalid_params(
                 format!(
@@ -618,6 +702,7 @@ mod tests {
             variants: None,
             wait_seconds: Some(30),
             output: out.to_string_lossy().into_owned(),
+            embed_images: None,
         };
         // Fast mock completes within the wait window -> inline completed result.
         let res = server.generate_image(Parameters(args)).await.unwrap();
@@ -631,12 +716,26 @@ mod tests {
         let res2 = server
             .get_result(Parameters(GetResultArgs {
                 task_id: task_id.clone(),
+                embed_images: None,
             }))
             .await
             .unwrap();
         let v2 = tool_result_json(&res2);
         assert_eq!(v2["status"], "completed");
         assert_eq!(v2["task_id"], task_id);
+
+        // With embed_images, get_result appends an inline image content block.
+        let res3 = server
+            .get_result(Parameters(GetResultArgs {
+                task_id: task_id.clone(),
+                embed_images: Some(true),
+            }))
+            .await
+            .unwrap();
+        let v3 = serde_json::to_value(&res3).unwrap();
+        assert_eq!(v3["content"][1]["type"], "image");
+        assert_eq!(v3["content"][1]["mimeType"], "image/png");
+        assert!(!v3["content"][1]["data"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -655,12 +754,32 @@ mod tests {
         assert_eq!(v["images_generated"], 0);
     }
 
+    #[test]
+    fn parse_embed_flag_reads_truthy_and_falsy_values() {
+        for v in ["true", "1", "yes", "on", "TRUE", " On "] {
+            assert_eq!(parse_embed_flag(Some(v.to_string())), Some(true), "{v:?}");
+        }
+        for v in ["false", "0", "no", "off", "FALSE"] {
+            assert_eq!(parse_embed_flag(Some(v.to_string())), Some(false), "{v:?}");
+        }
+        assert_eq!(parse_embed_flag(Some("maybe".to_string())), None);
+        assert_eq!(parse_embed_flag(None), None);
+    }
+
+    #[test]
+    fn resolve_embed_images_prefers_explicit_over_env() {
+        // An explicit per-call value wins regardless of the env var.
+        assert!(resolve_embed_images(Some(true)));
+        assert!(!resolve_embed_images(Some(false)));
+    }
+
     #[tokio::test]
     async fn get_result_unknown_task_errors() {
         let server = server_for("http://127.0.0.1:9".to_string());
         let err = server
             .get_result(Parameters(GetResultArgs {
                 task_id: "nope".to_string(),
+                embed_images: None,
             }))
             .await
             .unwrap_err();
@@ -705,6 +824,7 @@ mod tests {
             variants: None,
             wait_seconds: None,
             output: "out.png".to_string(),
+            embed_images: None,
         };
         let err = server.generate_image(Parameters(args)).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));

@@ -39,6 +39,22 @@ From crates.io (once published):
 cargo install openrouter-mcp
 ```
 
+### As a Desktop Extension (`.mcpb`)
+
+For one-click install in desktop apps that support MCP bundles (e.g. Claude
+Desktop), build a `.mcpb`:
+
+```bash
+./scripts/build-mcpb.sh        # -> dist/openrouter-mcp.mcpb
+```
+
+Then open `dist/openrouter-mcp.mcpb` in the app and provide your API key when
+prompted. The bundle ships with **Embed images inline** on by default
+(`OPENROUTER_EMBED_IMAGES=true`), so generated images render even when the app
+can't read the saved file off disk; toggle it off in the extension settings for
+the leaner path-only response. The bundle is **platform-specific** (it contains a
+native binary) — build it on each OS you want to ship.
+
 ## Configuration
 
 Set an OpenRouter API key:
@@ -63,6 +79,12 @@ Do not commit `.env`.
 
 Optional: `OPENROUTER_IMAGE_MAX_DIMENSION` (default `800`) caps the longest side
 of input images before they are sent (downscaled to reduce request size/cost).
+
+Optional: `OPENROUTER_EMBED_IMAGES` (default `false`) sets the default for
+`generate_image`/`get_result`'s `embed_images` flag — when true, generated
+images are also returned as inline MCP image content blocks (base64), so a client
+that can't read the saved file off disk (e.g. a remote/sandboxed connector) can
+still display them. The per-call `embed_images` argument overrides this.
 
 ## MCP usage
 

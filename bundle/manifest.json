@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.2",
+  "name": "openrouter-mcp",
+  "display_name": "OpenRouter MCP",
+  "version": "0.1.1",
+  "description": "OpenRouter MCP: model discovery, image generation/editing, and image description.",
+  "long_description": "A local MCP server for OpenRouter. Discover models and pricing (list_models), generate and edit images (generate_image / get_result), and caption or analyze images (describe_image), plus per-process usage stats. Image generation can also return results as inline image content blocks so clients that can't read the saved file off disk still display them.",
+  "author": {
+    "name": "Nick Bubelich",
+    "email": "n+github@bubelich.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thesimj/rust-openrouter-mcp"
+  },
+  "homepage": "https://github.com/thesimj/rust-openrouter-mcp",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["openrouter", "image-generation", "vision", "cli"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/openrouter-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/openrouter-mcp",
+      "args": [],
+      "env": {
+        "OPENROUTER_API_KEY": "${user_config.api_key}",
+        "OPENROUTER_EMBED_IMAGES": "${user_config.embed_images}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "list_models", "description": "List OpenRouter models with capabilities and pricing." },
+    { "name": "generate_image", "description": "Generate or edit an image with an OpenRouter image model." },
+    { "name": "get_result", "description": "Fetch the status/result of an image generation job by task_id." },
+    { "name": "describe_image", "description": "Describe or answer a question about local image(s) with a vision model." },
+    { "name": "get_usage_stats", "description": "Report this process's image/describe spend and counts." },
+    { "name": "reset_usage_stats", "description": "Reset the in-memory usage counters." }
+  ],
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "OpenRouter API Key",
+      "description": "Your OpenRouter API key (https://openrouter.ai/keys).",
+      "sensitive": true,
+      "required": true
+    },
+    "embed_images": {
+      "type": "boolean",
+      "title": "Embed images inline",
+      "description": "Return generated images as inline image content blocks (base64) in addition to the saved file path. Keep on if the app can't read the saved file off disk; turn off for the leaner path-only response.",
+      "default": true,
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": {}
+  }
+}

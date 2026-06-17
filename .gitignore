@@ -3,6 +3,9 @@
 debug/
 target/
 
+# Packaged MCP bundles (built via scripts/build-mcpb.sh)
+dist/
+
 # Cargo.lock is intentionally NOT ignored: this is a binary crate
 # (cargo install openrouter-mcp), so the lockfile is committed for
 # reproducible builds. See:
