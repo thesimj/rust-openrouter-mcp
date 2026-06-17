@@ -125,7 +125,7 @@ fn is_png_within_bound(bytes: &[u8], max_side: u32) -> bool {
 /// count at [`MAX_INLINE_PREVIEWS`]; unreadable/undecodable files are skipped (the
 /// JSON text block still reports their paths), so this never fails the call.
 ///
-/// Blocking: does disk I/O and image decode/encode — run it via `spawn_blocking`,
+/// Blocking: does disk I/O and image decode/encode - run it via `spawn_blocking`,
 /// never directly on the async runtime.
 fn encode_preview_blocks(paths: &[String]) -> Vec<Content> {
     paths
@@ -147,7 +147,7 @@ fn encode_preview_blocks(paths: &[String]) -> Vec<Content> {
 /// Decide whether to embed inline image previews for the connected client.
 ///
 /// Why this is client-dependent: a local CLI (Claude Code) shares the
-/// filesystem, so a returned path *is* the image — inline base64 only bloats
+/// filesystem, so a returned path *is* the image - inline base64 only bloats
 /// context. Claude Desktop, by contrast, runs the MCP server in a sandbox whose
 /// filesystem the app can't read, so a path is useless and the bytes must be
 /// returned inline or the image is stranded.
@@ -208,14 +208,14 @@ async fn job_call_result(
 
 /// Wrap a task snapshot into the response envelope returned by `generate_image`
 /// (fast path) and `get_result`: the completed result, an error, or a pending
-/// note — always carrying `task_id`, `status`, and `kind`.
+/// note - always carrying `task_id`, `status`, and `kind`.
 fn snapshot_to_envelope(task_id: &str, snap: &TaskSnapshot) -> serde_json::Value {
     let mut env = match snap.status {
         "completed" => snap.result.clone().unwrap_or_else(|| json!({ "ok": true })),
         "failed" => json!({ "ok": false, "error": snap.error }),
         _ => json!({
             "ok": true,
-            "message": format!("still generating — call get_result with task_id \"{task_id}\""),
+            "message": format!("still generating - call get_result with task_id \"{task_id}\""),
         }),
     };
     env["task_id"] = json!(task_id);
@@ -236,7 +236,7 @@ pub struct ListModelsArgs {
     #[serde(default)]
     pub search: Option<String>,
     /// Filter by output modalities. Comma-separated list of: text, image, audio,
-    /// embeddings, video, rerank, speech, transcription — or "all". Defaults to
+    /// embeddings, video, rerank, speech, transcription - or "all". Defaults to
     /// text on the API when omitted (so pass "all" or a value to see others).
     #[serde(default)]
     pub output_modalities: Option<String>,
@@ -303,7 +303,7 @@ pub struct GenerateImageArgs {
     #[serde(default)]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
-    /// With >1, files are named <output>-var-001, -002, … and one manifest covers all.
+    /// With >1, files are named <output>-var-001, -002, ... and one manifest covers all.
     #[serde(default)]
     #[schemars(range(min = 1, max = 16))]
     pub variants: Option<usize>,
@@ -343,7 +343,7 @@ pub struct GetResultArgs {
 /// Arguments for the `reset_usage_stats` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResetUsageStatsArgs {
-    /// Must be true to confirm — this clears all in-memory usage counters.
+    /// Must be true to confirm - this clears all in-memory usage counters.
     #[serde(default)]
     pub confirm: bool,
 }
@@ -356,7 +356,7 @@ impl OpenRouterServer {
         happen server-side: search by name (query), filter by output/input modalities \
         or supported parameters, sort by newest/most-popular/pricing/context, and set a \
         minimum context length. Output modalities include text, image, audio, embeddings, \
-        video, rerank, speech, transcription (default is text only — pass \
+        video, rerank, speech, transcription (default is text only - pass \
         output_modalities=\"all\" or a specific value to see the rest). Returns the \
         first 20 models by default; set all=true for the complete list.",
         annotations(
@@ -406,7 +406,7 @@ impl OpenRouterServer {
         description = "Generate or edit an image with an OpenRouter image model (e.g. \
         google/gemini-3.1-flash-image-preview) and save it to `output`. For text-to-image, \
         pass a prompt. For editing / image-to-image, also pass local `images` (order \
-        preserved; optional per-image label) — the prompt becomes the edit instruction. \
+        preserved; optional per-image label) - the prompt becomes the edit instruction. \
         Set variants>1 to generate several in parallel (seed-stepped). Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
@@ -459,7 +459,7 @@ impl OpenRouterServer {
         if !missing.is_empty() {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "generate_image has no defaults — specify every parameter explicitly. \
+                    "generate_image has no defaults - specify every parameter explicitly. \
                      Missing: {}. (model, prompt and output are also required.) Use list_models \
                      with output_modalities=\"image\" to choose a model.",
                     missing.join("; ")
@@ -649,7 +649,7 @@ impl OpenRouterServer {
 
     #[tool(
         description = "Return basic information about the OpenRouter API key in use \
-        (GET /api/v1/key): label, creator_user_id (the owning user — the closest available \
+        (GET /api/v1/key): label, creator_user_id (the owning user - the closest available \
         owner identity, not a name/email), credit usage (total and daily/weekly/monthly), \
         spending limit and remaining balance in USD (null means unlimited), byok_usage, the \
         is_free_tier / is_provisioning_key / is_management_key flags, and a deprecated \

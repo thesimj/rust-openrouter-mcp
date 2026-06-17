@@ -3,19 +3,19 @@
 MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
 single Rust binary. Discover models, generate and edit images (with parallel
 variants and a sidecar manifest), describe images with a vision model, and track
-per-process usage — all behind one `openrouter-mcp` executable.
+per-process usage - all behind one `openrouter-mcp` executable.
 
 ## Features
 
-- **Model discovery** — `list_models` with server-side filters (modality,
+- **Model discovery** - `list_models` with server-side filters (modality,
   supported params, sort, min context), local search, and pricing.
-- **Image generation** — `generate_image`: text-to-image, image editing /
+- **Image generation** - `generate_image`: text-to-image, image editing /
   image-to-image (multiple local inputs), and **parallel variants** (seed-stepped).
   - Input images may be PNG, JPEG, WebP, GIF, or **SVG**. SVG inputs are
     rasterized to PNG (longest side scaled to the dimension cap; transparency
     preserved). Text in SVGs is not rendered (no fonts are loaded) and is flagged
     as a warning.
-  - The output format (PNG/JPEG) is **chosen by the provider** — it is sniffed
+  - The output format (PNG/JPEG) is **chosen by the provider** - it is sniffed
     from the response and the file extension is set to match.
   - Requested `aspect_ratio` / `image_size` are **verified** against the actual
     decoded pixels; mismatches are surfaced as warnings.
@@ -23,23 +23,23 @@ per-process usage — all behind one `openrouter-mcp` executable.
     per-variant metadata, cost, provider, timing).
   - **Asynchronous**: if a job runs longer than `wait_seconds` (default 10) the
     tool returns a `task_id`; poll `get_result` for completion.
-- **Image description** — `describe_image`: image → detailed text via any
+- **Image description** - `describe_image`: image -> detailed text via any
   vision-capable model (image input, text output).
-- **Account info** — `get_account`: basic info about the API key in use (label,
+- **Account info** - `get_account`: basic info about the API key in use (label,
   owning user id, credit usage with daily/weekly/monthly breakdown, spending
   limit / remaining balance, and tier / key-type flags).
-- **Usage stats** — `get_usage_stats` (read-only) and `reset_usage_stats`
+- **Usage stats** - `get_usage_stats` (read-only) and `reset_usage_stats`
   (destructive, requires `confirm: true`): per-process request/cost counters with
   a by-model breakdown.
 
 ## Add to Claude Desktop (one-click)
 
-This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS** — no
+This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS** - no
 terminal or Rust toolchain required.
 
 1. Download `openrouter-mcp.mcpb` from the
    [latest release](https://github.com/thesimj/rust-openrouter-mcp/releases/latest).
-2. Double-click it (or drag it into **Claude Desktop → Settings → Extensions**).
+2. Double-click it (or drag it into **Claude Desktop -> Settings -> Extensions**).
 3. Click **Install**, paste your
    [OpenRouter API key](https://openrouter.ai/keys), and enable it.
 
@@ -104,13 +104,13 @@ Optional: `OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image` /
 `get_result` embed the generated image **inline** (base64) in the tool result, in
 addition to saving it to disk:
 
-- `auto` (default) — inline previews for every client **except** the local
+- `auto` (default) - inline previews for every client **except** the local
   `claude-code` CLI, which shares the filesystem and can open the saved file
   directly.
-- `always` — always embed previews. The Claude Desktop connector sets this,
+- `always` - always embed previews. The Claude Desktop connector sets this,
   because Desktop runs the server in a sandboxed filesystem it can't read, so the
   saved path is unreachable and the image must come back inline.
-- `never` — paths only, never inline bytes.
+- `never` - paths only, never inline bytes.
 
 Inline previews are downscaled to a 1568px longest side; the full-resolution
 image is always the file saved on disk.
@@ -144,14 +144,14 @@ block is optional.
 | Tool | Kind | Description |
 | --- | --- | --- |
 | `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search). |
-| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. **No defaults** — `model`, `prompt`, `output`, `aspect_ratio`, `image_size`, and `image_only` must all be set. |
+| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. **No defaults** - `model`, `prompt`, `output`, `aspect_ratio`, `image_size`, and `image_only` must all be set. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
 | `describe_image` | read-only | Describe local image(s) with a vision-capable model; returns text. |
 | `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |
 | `get_usage_stats` | read-only | In-memory request/cost counters with a by-model breakdown. |
 | `reset_usage_stats` | destructive | Reset all counters (`confirm: true` required). |
 
-`generate_image` returns a lean result — saved paths, decoded width/height,
+`generate_image` returns a lean result - saved paths, decoded width/height,
 requested vs. actual aspect/size, seeds, and a pointer to the sidecar manifest;
 the full per-variant detail lives in the manifest on disk.
 

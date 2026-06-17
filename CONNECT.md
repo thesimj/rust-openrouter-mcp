@@ -1,10 +1,10 @@
 # Connecting `openrouter-mcp` to your client
 
-`openrouter-mcp` is a **local stdio MCP server** — a single binary that speaks the
+`openrouter-mcp` is a **local stdio MCP server** - a single binary that speaks the
 Model Context Protocol over stdin/stdout. Almost every MCP-capable CLI, agent, and
 editor can use it. This guide gives the exact config for the popular ones.
 
-> **Claude Desktop** users: don't use this file — install the one-click
+> **Claude Desktop** users: don't use this file - install the one-click
 > [`.mcpb` extension](README.md#add-to-claude-desktop-one-click) instead.
 
 ## Prerequisites
@@ -26,8 +26,8 @@ editor can use it. This guide gives the exact config for the popular ones.
 | env | `OPENROUTER_API_KEY=sk-or-...` |
 
 Every client below is just a different way of expressing those three things. The
-canonical JSON shape — used by **Claude Code, Cursor, Windsurf, Cline, Roo Code,
-Gemini CLI, Antigravity** — is:
+canonical JSON shape - used by **Claude Code, Cursor, Windsurf, Cline, Roo Code,
+Gemini CLI, Antigravity** - is:
 
 ```json
 {
@@ -94,7 +94,7 @@ Docs: <https://google-gemini.github.io/gemini-cli/docs/tools/mcp-server.html>
 
 ### Google Antigravity
 Shared config at `~/.gemini/config/mcp_config.json`, key `mcpServers` (canonical
-shape above). Add via Settings → Customizations → **Open MCP Config**, then hit
+shape above). Add via Settings -> Customizations -> **Open MCP Config**, then hit
 refresh in *Installed MCP Servers*.
 Docs: <https://composio.dev/content/howto-mcp-antigravity>
 
@@ -150,8 +150,8 @@ extensions:
     envs:
       OPENROUTER_API_KEY: "sk-or-..."
 ```
-Easiest: run `goose configure` → Add Extension → Command-line Extension (stdio) →
-command `openrouter-mcp mcp` → add `OPENROUTER_API_KEY`.
+Easiest: run `goose configure` -> Add Extension -> Command-line Extension (stdio) ->
+command `openrouter-mcp mcp` -> add `OPENROUTER_API_KEY`.
 Docs: <https://block.github.io/goose/docs/getting-started/using-extensions>
 
 ### Amp (Sourcegraph)
@@ -171,7 +171,7 @@ Or: `amp mcp add openrouter --env OPENROUTER_API_KEY=... -- openrouter-mcp mcp`.
 Docs: <https://ampcode.com/manual>
 
 ### OpenHands (All Hands AI)
-`config.toml` (project or `~/.openhands/config.toml`), `[mcp]` → `stdio_servers`:
+`config.toml` (project or `~/.openhands/config.toml`), `[mcp]` -> `stdio_servers`:
 ```toml
 [mcp]
 stdio_servers = [
@@ -185,16 +185,16 @@ Docs: <https://docs.openhands.dev/openhands/usage/settings/mcp-settings>
 ## Editors & IDEs
 
 ### Cursor
-`.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global) — canonical
+`.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global) - canonical
 `mcpServers` shape. Docs: <https://cursor.com/docs/mcp>
 
 ### Windsurf (Codeium)
 `~/.codeium/windsurf/mcp_config.json` (Linux: `~/.config/windsurf/mcp_config.json`)
-— canonical `mcpServers` shape. Edit via Cascade → Plugins → *View raw config*;
+- canonical `mcpServers` shape. Edit via Cascade -> Plugins -> *View raw config*;
 Windsurf hot-reloads on save. Docs: <https://docs.windsurf.com/windsurf/cascade/mcp>
 
 ### VS Code (GitHub Copilot, agent mode) ⚠️
-`.vscode/mcp.json` — **the odd one out**: top-level key is `servers` (not
+`.vscode/mcp.json` - **the odd one out**: top-level key is `servers` (not
 `mcpServers`) and `type: "stdio"` is **required**:
 ```json
 {
@@ -211,7 +211,7 @@ Windsurf hot-reloads on save. Docs: <https://docs.windsurf.com/windsurf/cascade/
 Docs: <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>
 
 ### Zed ⚠️
-`settings.json` (`cmd-,`) — key is `context_servers` (not `mcpServers`):
+`settings.json` (`cmd-,`) - key is `context_servers` (not `mcpServers`):
 ```json
 {
   "context_servers": {
@@ -230,17 +230,17 @@ Docs: <https://zed.dev/docs/ai/mcp>
 ## VS Code extensions
 
 ### Cline
-Click the **MCP Servers** icon → *Configure MCP Servers* to open
+Click the **MCP Servers** icon -> *Configure MCP Servers* to open
 `cline_mcp_settings.json` (key `mcpServers`, canonical shape; supports `disabled`
 and `autoApprove` fields).
 
 ### Roo Code
-`.roo/mcp.json` (project) or the global settings file via the MCP UI — key
+`.roo/mcp.json` (project) or the global settings file via the MCP UI - key
 `mcpServers`, canonical shape. Supports `${env:OPENROUTER_API_KEY}` expansion.
 Docs: <https://docs.roocode.com/features/mcp/using-mcp-in-roo>
 
 ### Continue
-**YAML** at `~/.continue/config.yaml` — `mcpServers` is a **list**:
+**YAML** at `~/.continue/config.yaml` - `mcpServers` is a **list**:
 ```yaml
 mcpServers:
   - name: openrouter
@@ -262,7 +262,7 @@ exceptions:
 | Client | Key | Notable difference |
 | --- | --- | --- |
 | VS Code (Copilot) | `servers` | `type: "stdio"` required |
-| Zed | `context_servers` | — |
+| Zed | `context_servers` | - |
 | Goose | `extensions` | YAML; `cmd` not `command`; `envs` not `env` |
 | opencode | `mcp` | `type: "local"`; `command` is one array; env is `environment` |
 | Crush | `mcp` | `type: "stdio"` |
@@ -274,7 +274,7 @@ exceptions:
 
 `generate_image` always saves to disk **and**, by default (`auto`), returns the
 image inline for clients that can't read your filesystem. Local CLIs that share
-your filesystem (detected as `claude-code`) get paths only — they can open the
+your filesystem (detected as `claude-code`) get paths only - they can open the
 file directly. Force it either way with `OPENROUTER_MCP_IMAGE_PREVIEWS=always|never`
 in the server's `env`. See [Configuration](README.md#configuration).
 
@@ -296,4 +296,4 @@ A JSON line naming the `rmcp` server back means stdio is healthy.
 
 <sub>Not included: **Aider** has no native MCP client support as of 2026 (tracked in
 Aider issue #4506). "openclaw" and "Hermes" were investigated and are **not**
-real, popular MCP coding clients — avoid configs claiming otherwise.</sub>
+real, popular MCP coding clients - avoid configs claiming otherwise.</sub>

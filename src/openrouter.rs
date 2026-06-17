@@ -42,10 +42,10 @@ impl OpenRouterClient {
         }
     }
 
-    /// `GET /api/v1/models` — every model with capabilities and pricing.
+    /// `GET /api/v1/models` - every model with capabilities and pricing.
     ///
     /// `query` carries OpenRouter's server-side filters (modalities, sort,
-    /// free-text, price/context bounds, …) so the API does the filtering.
+    /// free-text, price/context bounds, ...) so the API does the filtering.
     pub async fn list_models(&self, query: &ModelsQuery) -> Result<Vec<Model>> {
         let resp = self
             .http
@@ -67,7 +67,7 @@ impl OpenRouterClient {
 }
 
 impl OpenRouterClient {
-    /// `GET /api/v1/videos/models` — video-generation models with `pricing_skus`
+    /// `GET /api/v1/videos/models` - video-generation models with `pricing_skus`
     /// (per video-second / per video-token), resolutions, durations, etc.
     pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
         let resp = self
@@ -89,7 +89,7 @@ impl OpenRouterClient {
 }
 
 impl OpenRouterClient {
-    /// `GET /api/v1/key` — basic information about the API key in use: its label,
+    /// `GET /api/v1/key` - basic information about the API key in use: its label,
     /// the owning `creator_user_id`, credit usage (total and per period), spending
     /// limit / remaining balance, tier/management flags, and the (deprecated)
     /// rate limit. This is key/account-level info, not the owner's name or email.
@@ -271,7 +271,7 @@ pub fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) ->
 }
 
 impl OpenRouterClient {
-    /// `POST /api/v1/chat/completions` — used for image generation (and, later,
+    /// `POST /api/v1/chat/completions` - used for image generation (and, later,
     /// text/vision). Returns the parsed completion plus the `X-Generation-Id`
     /// response header when present. On a non-2xx status the upstream error body
     /// is surfaced verbatim (OpenRouter wraps provider errors there).
@@ -640,7 +640,7 @@ mod tests {
         assert!(err.to_string().contains("error status"));
     }
 
-    /// Build `n` placeholder models with ids `model-0`, `model-1`, … so list
+    /// Build `n` placeholder models with ids `model-0`, `model-1`, ... so list
     /// filtering/truncation can be exercised without hitting the network.
     fn models(n: usize) -> Vec<Model> {
         (0..n)
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn apply_filters_search_runs_before_truncation() {
-        // 30 models; only "model-1", "model-1x", "model-1y"… match "model-1".
+        // 30 models; only "model-1", "model-1x", "model-1y"... match "model-1".
         let mut all = models(30);
         all[1].name = Some("special".to_string());
         // Search narrows to ids containing "model-2" => model-2, model-20..29 = 11 matches.

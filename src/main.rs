@@ -1,4 +1,4 @@
-//! `openrouter-mcp` — an MCP (stdio) server for OpenRouter, doubling as a CLI.
+//! `openrouter-mcp` - an MCP (stdio) server for OpenRouter, doubling as a CLI.
 //!
 //! Run the MCP server with: `openrouter-mcp` (or `openrouter-mcp mcp`)
 //! Or use it directly, e.g.: `openrouter-mcp models --output-modalities image --sort newest`
@@ -25,7 +25,7 @@ use openrouter::{ModelsQuery, OpenRouterClient};
 #[command(
     name = "openrouter-mcp",
     version,
-    about = "MCP (stdio) server and CLI for OpenRouter — models, image generation & description"
+    about = "MCP (stdio) server and CLI for OpenRouter - models, image generation & description"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -189,7 +189,7 @@ struct ModelsArgs {
     #[arg(short, long)]
     search: Option<String>,
     /// Output modalities (comma-separated): text, image, audio, embeddings,
-    /// video, rerank, speech, transcription — or "all".
+    /// video, rerank, speech, transcription - or "all".
     #[arg(long)]
     output_modalities: Option<String>,
     /// Input modalities (comma-separated): text, image, audio, file.
@@ -237,10 +237,10 @@ async fn run_key() -> anyhow::Result<()> {
     let usd = |o: Option<f64>| o.map_or_else(|| "unlimited".to_string(), |v| format!("${v}"));
     let flag = |o: Option<bool>| if o.unwrap_or(false) { "yes" } else { "no" };
 
-    println!("label:            {}", info.label.as_deref().unwrap_or("—"));
+    println!("label:            {}", info.label.as_deref().unwrap_or("-"));
     println!(
         "owner (user id):  {}",
-        info.creator_user_id.as_deref().unwrap_or("—")
+        info.creator_user_id.as_deref().unwrap_or("-")
     );
     println!("free tier:        {}", flag(info.is_free_tier));
     println!("provisioning key: {}", flag(info.is_provisioning_key));

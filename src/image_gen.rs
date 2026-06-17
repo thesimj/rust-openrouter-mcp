@@ -441,7 +441,7 @@ pub async fn run_job(
     base_output: &Path,
     prompt_source: &str,
 ) -> Result<JobSummary> {
-    // Normalize input images once, up front — reused for every variant request
+    // Normalize input images once, up front - reused for every variant request
     // and for the manifest (a read/decode failure fails the whole job before any
     // generation, so no spend occurs).
     let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
@@ -587,7 +587,7 @@ mod tests {
     // 1x1 transparent PNG.
     const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-    /// Single-image generation (prepare inputs, build content, run core) — the
+    /// Single-image generation (prepare inputs, build content, run core) - the
     /// path production drives via run_job/generate_variants, exercised directly.
     async fn generate_image(
         client: &OpenRouterClient,

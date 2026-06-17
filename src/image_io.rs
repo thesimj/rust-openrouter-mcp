@@ -47,8 +47,8 @@ pub fn normalize_to_png(bytes: &[u8], max_side: u32) -> Result<Vec<u8>> {
 
 /// Heuristically detect an SVG document from its leading bytes (the `image`
 /// crate can't decode SVG, so these inputs are routed to [`svg_to_png`] instead).
-/// Skips a UTF-8 BOM and leading whitespace, then looks for an `<svg` root —
-/// directly, or after an `<?xml …?>` declaration within the first chunk.
+/// Skips a UTF-8 BOM and leading whitespace, then looks for an `<svg` root -
+/// directly, or after an `<?xml ...?>` declaration within the first chunk.
 pub fn is_svg(bytes: &[u8]) -> bool {
     let head = bytes.get(..1024).unwrap_or(bytes);
     let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head);
@@ -60,7 +60,7 @@ pub fn is_svg(bytes: &[u8]) -> bool {
 }
 
 /// A rasterized SVG: PNG bytes plus the source's intrinsic (viewBox) size and
-/// whether it contains `<text>` (which is not rendered — no fonts are loaded).
+/// whether it contains `<text>` (which is not rendered - no fonts are loaded).
 pub struct RasterizedSvg {
     pub png: Vec<u8>,
     pub intrinsic_width: u32,
@@ -127,7 +127,7 @@ pub fn extension_for(mime: &str) -> &'static str {
 }
 
 /// Decode the pixel dimensions of an encoded image, auto-detecting the format
-/// (do not assume PNG — the format varies per provider/response).
+/// (do not assume PNG - the format varies per provider/response).
 pub fn decode_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()

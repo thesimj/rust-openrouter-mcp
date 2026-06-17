@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generates mcpb/icon.png — a 512x512 connector icon with no external deps.
+// Generates mcpb/icon.png - a 512x512 connector icon with no external deps.
 // Pure Node: builds an RGBA buffer and encodes a PNG via zlib. Run:
 //   node mcpb/make-icon.mjs
 import { deflateSync } from "node:zlib";

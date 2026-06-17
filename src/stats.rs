@@ -1,7 +1,7 @@
 //! In-memory usage statistics for the server process.
 //!
 //! Updated whenever a generation job finishes, and exposed via `get_usage_stats`
-//! (read-only) / `reset_usage_stats` (destructive). Per process, not persisted —
+//! (read-only) / `reset_usage_stats` (destructive). Per process, not persisted -
 //! a stdio MCP server is normally one process per client session.
 
 use std::collections::BTreeMap;

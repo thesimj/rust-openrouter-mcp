@@ -34,7 +34,7 @@ impl TaskKind {
 
 enum Status {
     Pending,
-    /// The lean result object (paths, dims, manifest, …).
+    /// The lean result object (paths, dims, manifest, ...).
     Completed(Value),
     Failed(String),
 }

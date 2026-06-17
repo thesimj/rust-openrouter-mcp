@@ -14,7 +14,7 @@ of its own.
 
 ## What the software sends, and to whom
 
-`openrouter-mcp` communicates with exactly one third party — **OpenRouter** —
+`openrouter-mcp` communicates with exactly one third party - **OpenRouter** -
 and only to perform the actions you (or your AI assistant) explicitly request:
 
 - **Model discovery** (`list_models`): sends your query/filter parameters to
