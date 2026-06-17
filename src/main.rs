@@ -5,6 +5,7 @@
 //!
 //! Requires the `OPENROUTER_API_KEY` environment variable (or a local `.env`).
 
+mod audio_gen;
 mod image_gen;
 mod image_io;
 mod manifest;
@@ -12,6 +13,7 @@ mod openrouter;
 mod server;
 mod stats;
 mod tasks;
+mod video_gen;
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +27,7 @@ use openrouter::{ModelsQuery, OpenRouterClient};
 #[command(
     name = "openrouter-mcp",
     version,
-    about = "MCP (stdio) server and CLI for OpenRouter - models, image generation & description"
+    about = "MCP (stdio) server and CLI for OpenRouter - models, image/video/audio generation & description"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +42,10 @@ enum Command {
     Models(ModelsArgs),
     /// Generate an image from a text prompt and save it to disk.
     Image(ImageArgs),
+    /// Generate a video from a prompt (and optional first/last frame or reference images).
+    Video(VideoArgs),
+    /// Generate speech (text-to-speech) and save it to disk.
+    Audio(AudioArgs),
     /// Describe local image(s) with a vision-capable model.
     Describe(DescribeArgs),
     /// Show basic info about the API key in use (label, owner, credits, limits).
@@ -109,6 +115,86 @@ struct ImageArgs {
     /// Output base name (used with --output-dir).
     #[arg(long)]
     output_name: Option<String>,
+}
+
+/// CLI flags for `video`, mirroring the `generate_video` MCP tool.
+#[derive(clap::Args)]
+struct VideoArgs {
+    /// Model id, e.g. google/veo-3.1.
+    #[arg(short, long)]
+    model: String,
+    /// Prompt text. Use --prompt-file to read from a file/stdin instead.
+    #[arg(short, long)]
+    prompt: Option<String>,
+    /// Read the prompt from a file (use '-' for stdin).
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Clip duration in seconds.
+    #[arg(long)]
+    duration: Option<u32>,
+    /// Resolution, e.g. 480p, 720p, 1080p, 1K, 2K, 4K.
+    #[arg(long)]
+    resolution: Option<String>,
+    /// Aspect ratio, e.g. 16:9, 9:16, 1:1.
+    #[arg(long)]
+    aspect_ratio: Option<String>,
+    /// Size as WIDTHxHEIGHT (interchangeable with resolution + aspect_ratio).
+    #[arg(long)]
+    size: Option<String>,
+    /// Generate an audio track (for audio-capable models).
+    #[arg(long)]
+    generate_audio: bool,
+    /// Seed (provider support varies).
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Local image used as the first frame (image-to-video).
+    #[arg(long)]
+    first_frame: Option<PathBuf>,
+    /// Local image used as the last frame (image-to-video).
+    #[arg(long)]
+    last_frame: Option<PathBuf>,
+    /// Reference image (repeatable) for reference-to-video. Ignored, with a
+    /// warning, when a first/last frame is given (frames win).
+    #[arg(long = "reference-image")]
+    reference_images: Vec<String>,
+    /// Longest-side cap (px) for input frame/reference images (default 800).
+    #[arg(long)]
+    max_image_dimension: Option<u32>,
+    /// Output path (extension corrected to the returned format, e.g. .mp4).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Output directory (alternative to --output; use with --output-name).
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    /// Output base name (used with --output-dir).
+    #[arg(long)]
+    output_name: Option<String>,
+}
+
+/// CLI flags for `audio`, mirroring the `generate_audio` MCP tool.
+#[derive(clap::Args)]
+struct AudioArgs {
+    /// Model id, e.g. openai/gpt-4o-mini-tts or hexgrad/kokoro-82m.
+    #[arg(short, long)]
+    model: String,
+    /// Text to synthesize. Use --input-file to read from a file/stdin instead.
+    #[arg(short, long)]
+    input: Option<String>,
+    /// Read the input text from a file (use '-' for stdin).
+    #[arg(long)]
+    input_file: Option<PathBuf>,
+    /// Voice id (varies by model, e.g. alloy).
+    #[arg(long)]
+    voice: String,
+    /// Output audio format: mp3 (default) or pcm.
+    #[arg(long)]
+    response_format: Option<String>,
+    /// Playback speed (select models only).
+    #[arg(long)]
+    speed: Option<f64>,
+    /// Output path (extension corrected to the returned format, e.g. .mp3).
+    #[arg(short, long)]
+    output: PathBuf,
 }
 
 /// Resolve the prompt text and its source (`inline`/`file`/`stdin`).
@@ -222,6 +308,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Models(args)) => run_models(args).await,
         Some(Command::Image(args)) => run_image(args).await,
+        Some(Command::Video(args)) => run_video(args).await,
+        Some(Command::Audio(args)) => run_audio(args).await,
         Some(Command::Describe(args)) => run_describe(args).await,
         Some(Command::Key) => run_key().await,
         Some(Command::Mcp) | None => server::run().await,
@@ -328,6 +416,97 @@ async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
     for img in &summary.images {
         println!("{}", img.path.display());
     }
+    Ok(())
+}
+
+/// Generate a video and save it, plus a sidecar manifest. The CLI blocks
+/// synchronously through the submit + poll loop (unlike the async MCP tool).
+async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
+    let base = resolve_base_output(args.output, args.output_dir, args.output_name)?;
+
+    let mut frames = Vec::new();
+    if let Some(p) = args.first_frame {
+        frames.push(video_gen::VideoInput {
+            path: p,
+            frame_type: "first_frame".to_string(),
+        });
+    }
+    if let Some(p) = args.last_frame {
+        frames.push(video_gen::VideoInput {
+            path: p,
+            frame_type: "last_frame".to_string(),
+        });
+    }
+
+    let req = video_gen::VideoGenRequest {
+        model: args.model,
+        prompt,
+        duration: args.duration,
+        resolution: args.resolution,
+        aspect_ratio: args.aspect_ratio,
+        size: args.size,
+        generate_audio: Some(args.generate_audio),
+        seed: args.seed,
+        frames,
+        references: args
+            .reference_images
+            .iter()
+            .map(|v| parse_image_arg(v).path)
+            .collect(),
+        max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+        poll_interval_secs: video_gen::resolve_poll_interval(None),
+        poll_timeout_secs: video_gen::resolve_poll_timeout(None),
+    };
+
+    let summary = video_gen::run_job(&client, &req, &base, &prompt_source).await?;
+
+    for v in &summary.videos {
+        eprintln!(
+            "saved {}{}",
+            v.path.display(),
+            if v.has_audio { " (with audio)" } else { "" },
+        );
+    }
+    for warning in &summary.warnings {
+        eprintln!("note: {warning}");
+    }
+    for error in &summary.errors {
+        eprintln!("error: {error}");
+    }
+    eprintln!("manifest: {}", summary.manifest_path.display());
+
+    if summary.videos.is_empty() {
+        anyhow::bail!("no video clip was produced");
+    }
+    for v in &summary.videos {
+        println!("{}", v.path.display());
+    }
+    Ok(())
+}
+
+/// Generate speech and save it, plus a sidecar manifest.
+async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let (input, input_source) = resolve_prompt(args.input, args.input_file)?;
+
+    let req = audio_gen::SpeechGenRequest {
+        model: args.model,
+        input,
+        voice: args.voice,
+        response_format: args.response_format,
+        speed: args.speed,
+    };
+
+    let result = audio_gen::run_job(&client, &req, &args.output, &input_source).await?;
+
+    eprintln!("voice: {}", result.audio.voice);
+    for warning in &result.warnings {
+        eprintln!("note: {warning}");
+    }
+    eprintln!("manifest: {}", result.manifest_path.display());
+    println!("{}", result.audio.path.display());
     Ok(())
 }
 

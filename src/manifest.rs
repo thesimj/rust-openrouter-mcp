@@ -78,10 +78,116 @@ pub struct VariantMeta {
     pub error: Option<String>,
 }
 
-/// Write the manifest as pretty JSON to `path`.
-pub fn write(path: &Path, manifest: &Manifest) -> Result<()> {
-    let json = serde_json::to_string_pretty(manifest).context("could not serialize manifest")?;
+/// Serialize `value` as pretty JSON and write it to `path`. Shared by all
+/// manifest writers so the serialize+write+error wrapping stays in one place.
+fn write_value(path: &Path, value: &impl Serialize) -> Result<()> {
+    let json = serde_json::to_string_pretty(value).context("could not serialize manifest")?;
     std::fs::write(path, json)
         .with_context(|| format!("could not write manifest {}", path.display()))?;
     Ok(())
+}
+
+/// Write the image manifest as pretty JSON to `path`.
+pub fn write(path: &Path, manifest: &Manifest) -> Result<()> {
+    write_value(path, manifest)
+}
+
+/// The complete record for one video-generation job.
+#[derive(Debug, Serialize)]
+pub struct VideoManifest {
+    pub endpoint: &'static str,
+    pub model: String,
+    pub prompt: String,
+    /// `inline`, `file`, or `stdin`.
+    pub prompt_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    pub max_image_dimension: u32,
+    pub created_at: String,
+    pub frame_images: Vec<FrameImageMeta>,
+    pub input_references: Vec<String>,
+    pub clips: Vec<VideoClipMeta>,
+}
+
+/// Normalization metadata for one first/last frame sent as image-to-video input.
+#[derive(Debug, Serialize)]
+pub struct FrameImageMeta {
+    pub index: usize,
+    pub frame_type: String,
+    pub source: String,
+    pub normalized_width: u32,
+    pub normalized_height: u32,
+}
+
+/// Output details for one generated clip. Fields are absent on failure (`error`).
+#[derive(Debug, Default, Serialize)]
+pub struct VideoClipMeta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Write the video manifest as pretty JSON to `path`.
+pub fn write_video(path: &Path, manifest: &VideoManifest) -> Result<()> {
+    write_value(path, manifest)
+}
+
+/// The complete record for one text-to-speech job.
+#[derive(Debug, Serialize)]
+pub struct AudioManifest {
+    pub endpoint: &'static str,
+    pub model: String,
+    pub input: String,
+    /// `inline`, `file`, or `stdin`.
+    pub input_source: String,
+    pub voice: String,
+    pub response_format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+    pub created_at: String,
+    pub output: AudioOutputMeta,
+}
+
+/// Output details for the saved audio file (or its `error`).
+#[derive(Debug, Default, Serialize)]
+pub struct AudioOutputMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Write the audio manifest as pretty JSON to `path`.
+pub fn write_audio(path: &Path, manifest: &AudioManifest) -> Result<()> {
+    write_value(path, manifest)
 }

@@ -370,14 +370,14 @@ pub async fn generate_variants(
 /// at least 4 digits, so it is self-identifying and reproducible); when no seed
 /// is set the variant `index` is used instead, zero-padded so 10+ sort.
 /// The file stem of `base`, or `"image"` if it has none.
-fn base_stem(base: &Path) -> String {
+pub(crate) fn base_stem(base: &Path) -> String {
     base.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".to_string())
 }
 
 /// Join `name` onto `base`'s parent directory (or use it bare when there is none).
-fn in_parent_of(base: &Path, name: String) -> PathBuf {
+pub(crate) fn in_parent_of(base: &Path, name: String) -> PathBuf {
     match base.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(name),
         _ => PathBuf::from(name),
