@@ -100,9 +100,17 @@ fn build_content_prepends_label_block_when_labeled() {
 }
 
 #[test]
-fn resolve_max_dimension_defaults_to_800() {
-    assert_eq!(resolve_max_dimension(Some(1024)), 1024);
+fn resolve_max_dimension_defaults_and_clamps_to_800() {
+    // Default when nothing is supplied.
     assert_eq!(resolve_max_dimension(None), 800);
+    // Values at or below the ceiling pass through unchanged.
+    assert_eq!(resolve_max_dimension(Some(640)), 640);
+    assert_eq!(resolve_max_dimension(Some(800)), 800);
+    // Anything above the ceiling is clamped down to 800.
+    assert_eq!(resolve_max_dimension(Some(1024)), 800);
+    assert_eq!(resolve_max_dimension(Some(u32::MAX)), 800);
+    // A zero cap is unusable; clamp it up to a valid minimum.
+    assert_eq!(resolve_max_dimension(Some(0)), 1);
 }
 
 #[tokio::test]

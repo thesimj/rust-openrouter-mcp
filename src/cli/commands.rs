@@ -94,11 +94,16 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
 
     let result = chat_gen::complete(
         &client,
-        &args.model,
-        args.system.as_deref(),
-        &prompt,
-        args.temperature,
-        args.max_tokens,
+        &chat_gen::ChatInputs {
+            model: &args.model,
+            system: args.system.as_deref(),
+            prompt: &prompt,
+            temperature: args.temperature,
+            max_tokens: args.max_tokens,
+            // The CLI `chat` subcommand is text-only; no input images (cap unused).
+            images: &[],
+            max_image_dimension: 0,
+        },
     )
     .await?;
     println!("{}", result.text);

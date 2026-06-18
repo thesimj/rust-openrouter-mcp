@@ -6,6 +6,27 @@ use serde_json::Value;
 use crate::openrouter::{Model, ModelsQuery, ModelsResponse, OpenRouterClient};
 
 impl OpenRouterClient {
+    /// The `input_modalities` declared for a single model id (e.g.
+    /// `["text", "image"]`). Searches `/models?q=<id>` and returns the
+    /// architecture of the entry whose id matches `model_id` exactly. Errors if
+    /// no such model is found. Used to gate multimodal inputs before sending.
+    pub async fn model_input_modalities(&self, model_id: &str) -> Result<Vec<String>> {
+        let query = ModelsQuery {
+            q: Some(model_id.to_string()),
+            ..Default::default()
+        };
+        let model = self
+            .list_models(&query)
+            .await?
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .with_context(|| format!("model '{model_id}' not found on OpenRouter"))?;
+        Ok(model
+            .architecture
+            .map(|a| a.input_modalities)
+            .unwrap_or_default())
+    }
+
     /// `GET /api/v1/models` - every model with capabilities and pricing.
     ///
     /// `query` carries OpenRouter's server-side filters (modalities, sort,
@@ -157,6 +178,49 @@ mod tests {
         // The `data` envelope is unwrapped; everything underneath is preserved.
         assert_eq!(detail["id"], "anthropic/claude-opus-4.7");
         assert_eq!(detail["endpoints"][0]["provider_name"], "Anthropic");
+    }
+
+    #[tokio::test]
+    async fn model_input_modalities_returns_matching_model_capabilities() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("q", "google/gemini-2.5-flash"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    // A near-match that must be ignored (id differs).
+                    {"id": "google/gemini-2.5-flash-lite", "architecture": {"input_modalities": ["text"]}},
+                    {"id": "google/gemini-2.5-flash", "architecture": {"input_modalities": ["text", "image"]}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let mods = client
+            .model_input_modalities("google/gemini-2.5-flash")
+            .await
+            .unwrap();
+        assert_eq!(mods, vec!["text".to_string(), "image".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn model_input_modalities_errors_when_id_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "some/other-model", "architecture": {"input_modalities": ["text"]}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let err = client
+            .model_input_modalities("missing/model")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[tokio::test]

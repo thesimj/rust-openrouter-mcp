@@ -16,8 +16,11 @@ use crate::openrouter::OpenRouterClient;
 use crate::stats::UsageStats;
 use crate::tasks::TaskRegistry;
 
+use caps::ModelCapsCache;
+
 mod account;
 mod audio;
+mod caps;
 mod chat;
 mod image;
 mod models;
@@ -35,6 +38,9 @@ pub struct OpenRouterServer {
     pub(crate) client: OpenRouterClient,
     pub(crate) tasks: TaskRegistry,
     pub(crate) stats: UsageStats,
+    /// Cache of per-model input modalities, used to gate `chat_completion` image
+    /// inputs against what the target model supports.
+    pub(crate) model_caps: ModelCapsCache,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -44,6 +50,7 @@ impl OpenRouterServer {
             client,
             tasks: TaskRegistry::new(),
             stats: UsageStats::new(),
+            model_caps: ModelCapsCache::new(),
             tool_router: Self::models_router()
                 + Self::image_router()
                 + Self::video_router()

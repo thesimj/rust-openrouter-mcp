@@ -62,7 +62,7 @@ pub(crate) struct GenerateVideoArgs {
     /// warning, when first_frame/last_frame are given (frame_images wins).
     #[serde(default)]
     pub reference_images: Vec<String>,
-    /// Longest-side cap (px) for input frame/reference images (default 800).
+    /// Longest-side cap (px) for input frame/reference images (default 800, capped at 800).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
     /// Seconds to wait inline before returning a task_id (1-60, default 20).

@@ -41,8 +41,10 @@ per-process usage - all behind one `openrouter-mcp` executable.
 - **Image description** - `describe_image`: image -> detailed text via any
   vision-capable model (image input, text output).
 - **Chat completion** - `chat_completion`: send a prompt to any OpenRouter
-  chat/text model and get its text reply (text in, text out) - route a sub-task
-  to a different model (optional `system`, `temperature`, `max_tokens`).
+  chat/text model and get its text reply - route a sub-task to a different model
+  (optional `system`, `temperature`, `max_tokens`). Optionally attach `images`
+  (path/url/base64) for a vision-capable model; the call is rejected only when the
+  model is known not to accept image input (otherwise it is sent as-is).
 - **Account info** - `get_account`: basic info about the API key in use (label,
   owning user id, credit usage with daily/weekly/monthly breakdown, spending
   limit / remaining balance, and tier / key-type flags).
@@ -131,7 +133,7 @@ All environment variables read by the server/CLI:
 | `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
 | `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image` / `get_result` embed inline base64 image previews: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
 | `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
-| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. | `800` |
+| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `800`; larger values are reduced to `800`. | `800` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
 | `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
 | `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |
@@ -191,7 +193,7 @@ block is optional.
 | `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`, `image_only`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
-| `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply (text in, text out); route a sub-task to a different model. |
+| `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
 | `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
 | `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |

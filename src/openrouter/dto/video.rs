@@ -119,3 +119,46 @@ pub struct VideoUsage {
     #[serde(default)]
     pub is_byok: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Locks the exact `/videos` image-to-video wire shape documented by OpenRouter:
+    // each frame is an OpenAI-style content part with a `type`, an `image_url`
+    // OBJECT, and the `frame_type` discriminator. Guards against regressing to a
+    // bare-string / wrong-key element (the shape upstream rejects with a ZodError).
+    #[test]
+    fn frame_image_serializes_to_documented_image_url_part() {
+        let fi = FrameImage::new(
+            ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+            },
+            "first_frame".to_string(),
+        );
+        assert_eq!(
+            serde_json::to_value(&fi).unwrap(),
+            json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" },
+                "frame_type": "first_frame"
+            })
+        );
+    }
+
+    // input_references use the same content-part shape, minus `frame_type`.
+    #[test]
+    fn input_reference_serializes_to_documented_image_url_part() {
+        let ir = InputReference::new(ImageUrl {
+            url: "https://example.com/ref.png".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&ir).unwrap(),
+            json!({
+                "type": "image_url",
+                "image_url": { "url": "https://example.com/ref.png" }
+            })
+        );
+    }
+}

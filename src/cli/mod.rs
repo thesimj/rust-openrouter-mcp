@@ -58,7 +58,7 @@ pub(crate) struct DescribeArgs {
     /// Instruction/question about the image(s) (default: a detailed description).
     #[arg(short, long)]
     prompt: Option<String>,
-    /// Longest-side cap (px) for input images before sending (default 800).
+    /// Longest-side cap (px) for input images before sending (default 800, capped at 800).
     #[arg(long)]
     max_image_dimension: Option<u32>,
 }
@@ -91,8 +91,8 @@ pub(crate) struct ImageArgs {
     /// Use `label=path` to label a reference, e.g. --image product=./p.jpg.
     #[arg(long = "image")]
     images: Vec<String>,
-    /// Longest-side cap (px) for input images before sending (default 800;
-    /// env OPENROUTER_IMAGE_MAX_DIMENSION).
+    /// Longest-side cap (px) for input images before sending (default 800,
+    /// capped at 800; env OPENROUTER_IMAGE_MAX_DIMENSION).
     #[arg(long)]
     max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped).
@@ -150,7 +150,7 @@ pub(crate) struct VideoArgs {
     /// warning, when a first/last frame is given (frames win).
     #[arg(long = "reference-image")]
     reference_images: Vec<String>,
-    /// Longest-side cap (px) for input frame/reference images (default 800).
+    /// Longest-side cap (px) for input frame/reference images (default 800, capped at 800).
     #[arg(long)]
     max_image_dimension: Option<u32>,
     /// Output path (extension corrected to the returned format, e.g. .mp4).

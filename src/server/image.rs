@@ -153,10 +153,11 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
     Ok(bytes.to_vec())
 }
 
-/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`],
-/// fetching URLs and decoding base64/data-URL inputs. Requires exactly one source.
-async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, ErrorData> {
-    let label = img.label;
+/// Validate that an image spec carries exactly one source (path/url/base64),
+/// cheaply and without any network fetch. Lets a caller (e.g. `chat_completion`)
+/// surface a malformed-image error before running the network-bound model-
+/// capability gate.
+pub(crate) fn check_image_input(img: &ImageInput) -> Result<(), ErrorData> {
     let count = [&img.path, &img.url, &img.base64]
         .iter()
         .filter(|o| o.as_ref().is_some_and(|s| !s.trim().is_empty()))
@@ -167,6 +168,14 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
             None,
         ));
     }
+    Ok(())
+}
+
+/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`],
+/// fetching URLs and decoding base64/data-URL inputs. Requires exactly one source.
+async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, ErrorData> {
+    check_image_input(&img)?;
+    let label = img.label;
     if let Some(p) = img.path.filter(|s| !s.trim().is_empty()) {
         Ok(image_gen::InputImage::from_path(p, label))
     } else if let Some(b64) = img.base64.filter(|s| !s.trim().is_empty()) {
@@ -183,7 +192,7 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
 }
 
 /// Resolve a list of tool-level [`ImageInput`]s to generator inputs, in order.
-async fn resolve_image_inputs(
+pub(crate) async fn resolve_image_inputs(
     images: Vec<ImageInput>,
 ) -> Result<Vec<image_gen::InputImage>, ErrorData> {
     let mut out = Vec::with_capacity(images.len());
@@ -222,8 +231,8 @@ pub(crate) struct GenerateImageArgs {
     /// base64 (a data: URL or raw base64). Omit for plain text-to-image.
     #[serde(default)]
     pub images: Vec<ImageInput>,
-    /// Longest-side cap (px) for input images before sending (default 800;
-    /// env OPENROUTER_IMAGE_MAX_DIMENSION).
+    /// Longest-side cap (px) for input images before sending (default 800,
+    /// capped at 800; env OPENROUTER_IMAGE_MAX_DIMENSION).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
@@ -257,7 +266,7 @@ pub(crate) struct DescribeImageArgs {
     /// Instruction or question about the image(s). Defaults to a detailed description.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Longest-side cap (px) for input images before sending (default 800).
+    /// Longest-side cap (px) for input images before sending (default 800, capped at 800).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
 }

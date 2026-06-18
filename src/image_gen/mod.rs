@@ -17,7 +17,10 @@ pub(crate) mod job;
 
 pub(crate) use job::{JobSummary, base_stem, in_parent_of, manifest_path, run_job};
 
-/// Default longest-side cap (px) for normalized input images.
+/// Default and hard ceiling for the input-image longest-side cap (px). Larger
+/// explicit arguments or env overrides are clamped down to this, so input images
+/// are never sent with a longest side above it (keeps request payloads bounded;
+/// providers gain nothing from larger inputs here).
 const DEFAULT_MAX_DIMENSION: u32 = 800;
 
 /// Where an input image's bytes come from. URL inputs are fetched and `base64`/
@@ -98,7 +101,9 @@ pub struct GenerateRequest {
 }
 
 /// Resolve the input-image dimension cap: explicit value, else the
-/// `OPENROUTER_IMAGE_MAX_DIMENSION` env var, else [`DEFAULT_MAX_DIMENSION`].
+/// `OPENROUTER_IMAGE_MAX_DIMENSION` env var, else [`DEFAULT_MAX_DIMENSION`]. The
+/// result is clamped to `1..=`[`DEFAULT_MAX_DIMENSION`] so an oversized argument
+/// or env override can never push input images above the ceiling.
 pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
     explicit
         .or_else(|| {
@@ -107,6 +112,7 @@ pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(DEFAULT_MAX_DIMENSION)
+        .clamp(1, DEFAULT_MAX_DIMENSION)
 }
 
 /// A generated image plus the metadata worth recording.
