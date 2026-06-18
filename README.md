@@ -5,7 +5,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp/blob/main/Cargo.toml)
 
 <p align="center">
-  <img src="assets/hero.png" alt="rust-openrouter-mcp - one Rust binary routing an AI assistant to OpenRouter's models" width="100%">
+  <img src="assets/hero.jpg" alt="rust-openrouter-mcp - one Rust binary routing an AI assistant to OpenRouter's models" width="100%">
 </p>
 
 MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
