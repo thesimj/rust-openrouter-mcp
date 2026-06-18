@@ -353,6 +353,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_call_result_emits_video_resource_link_when_inline() {
+        // A completed video job with a clip on disk yields a file:// ResourceLink
+        // (rmcp 1.7 has no native video block) when the client wants inline media.
+        let clip = std::env::temp_dir().join("openrouter-mcp-clip.mp4");
+        std::fs::write(&clip, b"FAKE-MP4-BYTES").unwrap();
+        let env = json!({
+            "status": "completed",
+            "kind": "video",
+            "videos": [ { "path": clip.to_string_lossy() } ],
+        });
+
+        let res = job_call_result(&env, true).await.unwrap();
+        let link = serde_json::to_value(&res).unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "resource_link")
+            .cloned()
+            .expect("a video resource_link block is present");
+        assert_eq!(link["mimeType"], "video/mp4");
+        assert!(link["uri"].as_str().unwrap().starts_with("file://"));
+
+        // With inline media off, only the JSON text block remains.
+        let res_off = job_call_result(&env, false).await.unwrap();
+        assert!(
+            !serde_json::to_value(&res_off).unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "resource_link"),
+        );
+    }
+
+    #[tokio::test]
     async fn job_call_result_gates_previews_on_the_flag() {
         let good = std::env::temp_dir().join("openrouter-mcp-gate-good.png");
         let png = base64::engine::general_purpose::STANDARD

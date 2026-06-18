@@ -217,6 +217,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_audio_embeds_inline_audio_block_for_sandboxed_clients() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-inline/voice.mp3");
+        let args = GenerateAudioArgs {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: Some("hello".to_string()),
+            voice: Some("alloy".to_string()),
+            response_format: None,
+            speed: None,
+            output: Some(out.to_string_lossy().into_owned()),
+        };
+        // inline_previews=true (a sandboxed client like Claude Desktop): the
+        // small file is embedded as a native audio content block alongside JSON.
+        let res = server.run_generate_audio(args, true).await.unwrap();
+        let full = serde_json::to_value(&res).unwrap();
+        let audio_block = full["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "audio")
+            .expect("an audio content block is present");
+        assert_eq!(audio_block["mimeType"], "audio/mpeg");
+        assert!(!audio_block["data"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn generate_audio_requires_input_and_voice() {
         // Validation runs before any HTTP call.
         let server = server_for("http://127.0.0.1:9".to_string());
