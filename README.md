@@ -73,10 +73,6 @@ binary), run the cross-platform generator on the target platform:
 node scripts/build-mcpb.mjs   # -> dist/openrouter-mcp-<os>.mcpb
 ```
 
-The bundle is signed automatically: a self-signed certificate by default, or your
-own code-signing cert when `MCPB_SIGN_CERT` and `MCPB_SIGN_KEY` point at PEM files
-(with optional `MCPB_SIGN_INTERMEDIATE`).
-
 ## Connect another client (CLI, IDE, agent)
 
 `openrouter-mcp` is a universal local stdio MCP server. **[CONNECT.md](CONNECT.md)**
