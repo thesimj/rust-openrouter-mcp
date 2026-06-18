@@ -43,7 +43,8 @@ impl OpenRouterServer {
         annotations(
             title = "Get Job Result",
             read_only_hint = true,
-            destructive_hint = false
+            destructive_hint = false,
+            open_world_hint = false
         )
     )]
     async fn get_result(
@@ -112,7 +113,8 @@ impl OpenRouterServer {
         annotations(
             title = "Get Usage Stats",
             read_only_hint = true,
-            destructive_hint = false
+            destructive_hint = false,
+            open_world_hint = false
         )
     )]
     pub(crate) async fn get_usage_stats(&self) -> Result<CallToolResult, ErrorData> {
@@ -129,7 +131,8 @@ impl OpenRouterServer {
             title = "Reset Usage Stats",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = true
+            idempotent_hint = true,
+            open_world_hint = false
         )
     )]
     async fn reset_usage_stats(
