@@ -1,7 +1,9 @@
 name: Release MCPB (Claude Desktop)
 
-# Builds the macOS Claude Desktop extension (.mcpb) and attaches it to the
-# GitHub Release when a version tag is pushed (e.g. v0.1.0).
+# Builds the Claude Desktop extension (.mcpb) for each platform and attaches the
+# bundles to the GitHub Release when a version tag is pushed (e.g. v0.1.0).
+# Produces openrouter-mcp-linux.mcpb, openrouter-mcp-macos.mcpb, and
+# openrouter-mcp-windows.mcpb.
 on:
   push:
     tags:
@@ -13,14 +15,27 @@ permissions:
 
 jobs:
   build-mcpb:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            slug: linux
+            targets: ""
+          - os: macos-latest
+            slug: macos
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-latest
+            slug: windows
+            targets: ""
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable) with macOS targets
+      - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.targets }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -28,17 +43,17 @@ jobs:
         with:
           node-version: 22
 
-      - name: Build universal binary and pack .mcpb
-        run: scripts/build-mcpb.sh
+      - name: Build and pack .mcpb
+        run: node scripts/build-mcpb.mjs
 
       - name: Upload .mcpb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openrouter-mcp-mcpb
-          path: dist/openrouter-mcp.mcpb
+          name: openrouter-mcp-${{ matrix.slug }}
+          path: dist/openrouter-mcp-${{ matrix.slug }}.mcpb
 
       - name: Attach .mcpb to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/openrouter-mcp.mcpb
+          files: dist/openrouter-mcp-${{ matrix.slug }}.mcpb

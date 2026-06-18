@@ -52,22 +52,25 @@ per-process usage - all behind one `openrouter-mcp` executable.
 
 ## Add to Claude Desktop (one-click)
 
-This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS** - no
-terminal or Rust toolchain required.
+This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS,
+Windows, and Linux** - no terminal or Rust toolchain required.
 
-1. Download `openrouter-mcp.mcpb` from the
-   [latest release](https://github.com/thesimj/rust-openrouter-mcp/releases/latest).
+1. Download the bundle for your platform from the
+   [latest release](https://github.com/thesimj/rust-openrouter-mcp/releases/latest):
+   `openrouter-mcp-macos.mcpb`, `openrouter-mcp-windows.mcpb`, or
+   `openrouter-mcp-linux.mcpb`.
 2. Double-click it (or drag it into **Claude Desktop -> Settings -> Extensions**).
 3. Click **Install**, paste your
    [OpenRouter API key](https://openrouter.ai/keys), and enable it.
 
-Your API key is stored in the macOS keychain by Claude Desktop and injected into
-the server as `OPENROUTER_API_KEY`. See [Privacy Policy](#privacy-policy).
+Your API key is stored by Claude Desktop (the OS keychain/credential store) and
+injected into the server as `OPENROUTER_API_KEY`. See [Privacy Policy](#privacy-policy).
 
-To build the bundle yourself (produces a universal arm64+x86_64 binary):
+To build the bundle yourself (the macOS build is a universal arm64+x86_64
+binary), run the cross-platform generator on the target platform:
 
 ```bash
-scripts/build-mcpb.sh        # -> dist/openrouter-mcp.mcpb
+node scripts/build-mcpb.mjs   # -> dist/openrouter-mcp-<os>.mcpb
 ```
 
 ## Connect another client (CLI, IDE, agent)
