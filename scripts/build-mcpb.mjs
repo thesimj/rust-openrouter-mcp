@@ -107,7 +107,38 @@ function main() {
   npx(["-y", "@anthropic-ai/mcpb", "pack", stageDir, outFile]);
 
   rmSync(stageDir, { recursive: true, force: true });
+
+  signBundle(outFile);
   console.log(`==> Done: ${outFile}`);
+}
+
+// Sign the packed bundle with the mcpb toolchain (appends a PKCS#7 SignedData
+// block). Uses an explicit cert/key when MCPB_SIGN_CERT + MCPB_SIGN_KEY point at
+// PEM files (e.g. a stable identity injected from CI secrets), otherwise falls
+// back to a self-signed certificate. Best-effort: a signing failure warns but
+// does not fail the build, since the unsigned bundle is still installable.
+//
+// Note: `mcpb verify` is broken in v2.1.2 (reports "not signed" for a correctly
+// signed bundle), so we do not gate on it here.
+function signBundle(outFile) {
+  const cert = process.env.MCPB_SIGN_CERT;
+  const key = process.env.MCPB_SIGN_KEY;
+  const args = ["-y", "@anthropic-ai/mcpb", "sign", outFile];
+  if (cert && key) {
+    console.log("==> Signing .mcpb (cert/key from env)");
+    args.push("-c", cert, "-k", key);
+    if (process.env.MCPB_SIGN_INTERMEDIATE) {
+      args.push("-i", process.env.MCPB_SIGN_INTERMEDIATE);
+    }
+  } else {
+    console.log("==> Signing .mcpb (self-signed)");
+    args.push("--self-signed");
+  }
+  try {
+    npx(args);
+  } catch (e) {
+    console.warn(`WARNING: signing failed, shipping unsigned bundle: ${e.message}`);
+  }
 }
 
 main();
