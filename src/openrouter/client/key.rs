@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::openrouter::{KeyInfo, KeyInfoResponse, OpenRouterClient};
+use crate::openrouter::{Credits, CreditsResponse, KeyInfo, KeyInfoResponse, OpenRouterClient};
 
 impl OpenRouterClient {
     /// `GET /api/v1/key` - basic information about the API key in use: its label,
@@ -25,6 +25,27 @@ impl OpenRouterClient {
             .await
             .context("failed to decode OpenRouter /key response")?;
         Ok(parsed.data)
+    }
+
+    /// `GET /api/v1/credits` - account-wide credit totals (purchased and used)
+    /// across every key on the account, not just the one in use. The derived
+    /// remaining balance is filled in before returning.
+    pub async fn get_credits(&self) -> Result<Credits> {
+        let resp = self
+            .http
+            .get(format!("{}/credits", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request to OpenRouter /credits failed")?
+            .error_for_status()
+            .context("OpenRouter /credits returned an error status")?;
+
+        let parsed: CreditsResponse = resp
+            .json()
+            .await
+            .context("failed to decode OpenRouter /credits response")?;
+        Ok(parsed.data.with_remaining())
     }
 }
 
@@ -102,6 +123,24 @@ mod tests {
         let rl = info.rate_limit.unwrap();
         assert_eq!(rl.requests, Some(-1));
         assert_eq!(rl.interval.as_deref(), Some("10s"));
+    }
+
+    #[tokio::test]
+    async fn get_credits_parses_and_derives_remaining() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "total_credits": 130.0, "total_usage": 110.04 }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let credits = client.get_credits().await.unwrap();
+        assert_eq!(credits.total_credits, Some(130.0));
+        assert_eq!(credits.total_usage, Some(110.04));
+        assert_eq!(credits.remaining, Some(130.0 - 110.04));
     }
 
     #[tokio::test]

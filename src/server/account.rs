@@ -83,8 +83,11 @@ impl OpenRouterServer {
         owner identity, not a name/email), credit usage (total and daily/weekly/monthly), \
         spending limit and remaining balance in USD (null means unlimited), byok_usage, the \
         is_free_tier / is_provisioning_key / is_management_key flags, and a deprecated \
-        rate_limit (requests per interval; -1 means unlimited). This is account/key-level \
-        info, not a per-request cost.",
+        rate_limit (requests per interval; -1 means unlimited). Also includes a `credits` \
+        object (GET /api/v1/credits) with account-wide totals across ALL of the account's \
+        keys: total_credits (purchased/granted), total_usage (spent), and the derived \
+        remaining balance in USD - note these are account-wide and so usually larger than \
+        this key's own `usage`. This is account/key-level info, not a per-request cost.",
         annotations(
             title = "Get Account Info",
             read_only_hint = true,
@@ -93,12 +96,26 @@ impl OpenRouterServer {
         )
     )]
     async fn get_account(&self) -> Result<CallToolResult, ErrorData> {
-        let info = self
-            .client
-            .get_key_info()
-            .await
+        // Key info is the core payload; credits is account-wide and best-effort
+        // (e.g. some keys can't read it), so fetch both at once but only fail the
+        // tool if /key fails. Both calls are independent, so run them concurrently.
+        let (key_res, credits_res) =
+            tokio::join!(self.client.get_key_info(), self.client.get_credits());
+        let info = key_res.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let mut body = serde_json::to_value(&info)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let body = serde_json::to_string_pretty(&info)
+        if let serde_json::Value::Object(map) = &mut body {
+            let credits = match credits_res {
+                Ok(c) => serde_json::to_value(c)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                // Surface the failure inline rather than dropping the whole tool.
+                Err(e) => serde_json::json!({ "error": e.to_string() }),
+            };
+            map.insert("credits".to_string(), credits);
+        }
+
+        let body = serde_json::to_string_pretty(&body)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
@@ -206,6 +223,13 @@ mod tests {
             })))
             .mount(&mock)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "total_credits": 130.0, "total_usage": 110.04 }
+            })))
+            .mount(&mock)
+            .await;
 
         let server = server_for(mock.uri());
         let res = server.get_account().await.unwrap();
@@ -214,6 +238,35 @@ mod tests {
         assert_eq!(v["creator_user_id"], "user_42");
         assert_eq!(v["usage"], 1.5);
         assert!(v["limit"].is_null());
+        // Account-wide credits are merged in, with a derived remaining balance.
+        assert_eq!(v["credits"]["total_credits"], 130.0);
+        assert_eq!(v["credits"]["total_usage"], 110.04);
+        assert_eq!(v["credits"]["remaining"], 130.0 - 110.04);
+    }
+
+    /// /key succeeds but /credits is unavailable: the tool still returns the key
+    /// info and surfaces the credits failure inline instead of failing outright.
+    #[tokio::test]
+    async fn get_account_tolerates_credits_failure() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "label": "sk-or-v1-x" }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let res = server.get_account().await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["label"], "sk-or-v1-x");
+        assert!(v["credits"]["error"].is_string());
     }
 
     /// Stringified booleans/floats are also accepted for the other tools.

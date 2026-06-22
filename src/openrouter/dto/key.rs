@@ -63,3 +63,39 @@ pub struct RateLimit {
     #[serde(default)]
     pub interval: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct CreditsResponse {
+    pub data: Credits,
+}
+
+/// Account-wide credit totals (`GET /api/v1/credits`). Unlike [`KeyInfo`], which
+/// is scoped to the single API key in use, these aggregate across all of the
+/// account's keys: `total_credits` is everything purchased/granted and
+/// `total_usage` is everything spent. `remaining` is derived (`total_credits -
+/// total_usage`) on the way out so callers don't have to do the subtraction.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Credits {
+    /// Total credits ever purchased or granted to the account (USD).
+    #[serde(default)]
+    pub total_credits: Option<f64>,
+    /// Total credits ever consumed across all of the account's keys (USD).
+    #[serde(default)]
+    pub total_usage: Option<f64>,
+    /// Derived remaining balance (`total_credits - total_usage`, USD); `None`
+    /// when either input is missing. Serialized for the caller, ignored on input.
+    #[serde(default)]
+    pub remaining: Option<f64>,
+}
+
+impl Credits {
+    /// Populate the derived [`remaining`](Self::remaining) balance from the two
+    /// totals OpenRouter returns. No-op if either total is absent.
+    pub fn with_remaining(mut self) -> Self {
+        self.remaining = match (self.total_credits, self.total_usage) {
+            (Some(c), Some(u)) => Some(c - u),
+            _ => None,
+        };
+        self
+    }
+}
