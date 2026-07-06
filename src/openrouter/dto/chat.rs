@@ -70,19 +70,10 @@ pub struct ImageUrl {
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub completion: ChatCompletion,
-    pub generation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletion {
-    #[serde(default)]
-    pub id: Option<String>,
-    // `model`/`finish_reason` are not yet surfaced; `provider` feeds the manifest.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub provider: Option<String>,
     #[serde(default)]
     pub choices: Vec<Choice>,
     #[serde(default)]
@@ -97,19 +88,12 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
-/// Assistant message in a response. `content` is null for image-only output;
-/// generated images arrive in `images`.
+/// Assistant message in a text/vision response (`chat_completion`, `describe_image`).
+/// Image generation now uses the dedicated `/images` endpoint, so no image field.
 #[derive(Debug, Deserialize)]
 pub struct ResponseMessage {
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
-    pub images: Vec<OutImage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OutImage {
-    pub image_url: ImageUrl,
 }
 
 #[derive(Debug, Deserialize)]

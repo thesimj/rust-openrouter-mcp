@@ -3,12 +3,14 @@
 //! `crate::openrouter::X` regardless of which submodule they live in.
 
 mod chat;
+mod images;
 mod key;
 mod models;
 mod speech;
 mod video;
 
 pub(crate) use chat::*;
+pub(crate) use images::*;
 pub(crate) use key::*;
 pub(crate) use models::*;
 pub(crate) use speech::*;

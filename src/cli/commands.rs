@@ -127,7 +127,6 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
         aspect_ratio: args.aspect_ratio,
         image_size: args.image_size,
         seed: args.seed,
-        image_only: args.image_only,
         images: args.images.iter().map(|v| parse_image_arg(v)).collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
     };

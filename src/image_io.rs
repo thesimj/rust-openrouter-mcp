@@ -122,8 +122,44 @@ pub fn extension_for(mime: &str) -> &'static str {
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
         "image/gif" => "gif",
+        "image/svg+xml" => "svg",
         _ => "bin",
     }
+}
+
+/// Decode raw base64 image bytes (no `data:` prefix). Used for the Images API,
+/// which returns bytes in `data[].b64_json` rather than as a data URL.
+pub fn decode_base64(data: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .context("failed to base64-decode image data")
+}
+
+/// Sniff a raster image's MIME type from its magic bytes. Returns `None` for
+/// formats the `image` crate can't identify (e.g. SVG), so the caller can fall
+/// back to a response-supplied `media_type` or a default.
+pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Intrinsic (viewBox) pixel size of an SVG document, if it parses. Used to
+/// record dimensions for vector outputs (e.g. Recraft), which the raster
+/// [`decode_dimensions`] cannot read.
+pub fn svg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    use resvg::usvg;
+    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (w, h) = (size.width(), size.height());
+    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some((w.round() as u32, h.round() as u32))
 }
 
 /// Decode the pixel dimensions of an encoded image, auto-detecting the format
@@ -289,7 +325,30 @@ mod tests {
         assert_eq!(extension_for("image/jpeg"), "jpg");
         assert_eq!(extension_for("image/webp"), "webp");
         assert_eq!(extension_for("image/gif"), "gif");
+        assert_eq!(extension_for("image/svg+xml"), "svg");
         assert_eq!(extension_for("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn decode_base64_reads_raw_png_bytes() {
+        let bytes = decode_base64(PNG_1X1_B64).unwrap();
+        assert_eq!(&bytes[1..4], b"PNG");
+        assert!(decode_base64("!!!not base64!!!").is_err());
+    }
+
+    #[test]
+    fn sniff_mime_identifies_raster_and_skips_svg() {
+        let png = decode_base64(PNG_1X1_B64).unwrap();
+        assert_eq!(sniff_mime(&png), Some("image/png"));
+        // SVG is not a raster format the `image` crate recognizes.
+        assert_eq!(sniff_mime(SVG_200X100.as_bytes()), None);
+    }
+
+    #[test]
+    fn svg_dimensions_reads_viewbox_and_rejects_raster() {
+        assert_eq!(svg_dimensions(SVG_200X100.as_bytes()), Some((200, 100)));
+        let png = decode_base64(PNG_1X1_B64).unwrap();
+        assert_eq!(svg_dimensions(&png), None);
     }
 
     #[test]

@@ -17,7 +17,6 @@ pub struct Manifest {
     pub prompt: String,
     /// `inline`, `file`, or `stdin`.
     pub prompt_source: String,
-    pub modalities: Vec<String>,
     pub aspect_ratio: Option<String>,
     pub image_size: Option<String>,
     pub base_seed: Option<u64>,

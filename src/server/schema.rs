@@ -178,10 +178,6 @@ mod tests {
     /// tool-argument structs (and nested types).
     #[test]
     fn optional_params_use_scalar_types_not_nullable_unions() {
-        assert_eq!(
-            prop_type::<GenerateImageArgs>("image_only"),
-            json!("boolean")
-        );
         assert_eq!(prop_type::<GenerateImageArgs>("seed"), json!("integer"));
         assert_eq!(
             prop_type::<GenerateImageArgs>("image_size"),
@@ -208,13 +204,13 @@ mod tests {
     #[test]
     fn collapsed_optionals_drop_null_default() {
         let schema = schema_for_type::<GenerateImageArgs>();
-        let image_only = schema
+        let seed = schema
             .get("properties")
-            .and_then(|p| p.get("image_only"))
+            .and_then(|p| p.get("seed"))
             .unwrap();
         assert!(
-            image_only.get("default").is_none(),
-            "expected no `default` on image_only, got {image_only}"
+            seed.get("default").is_none(),
+            "expected no `default` on seed, got {seed}"
         );
     }
 }

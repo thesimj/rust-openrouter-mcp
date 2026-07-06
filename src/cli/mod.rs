@@ -75,18 +75,15 @@ pub(crate) struct ImageArgs {
     /// Read the prompt from a file (use '-' for stdin).
     #[arg(long)]
     prompt_file: Option<PathBuf>,
-    /// Aspect ratio, e.g. 1:1, 16:9 (mapped to image_config.aspect_ratio).
+    /// Aspect ratio, e.g. 1:1, 16:9 (Images API `aspect_ratio`).
     #[arg(long)]
     aspect_ratio: Option<String>,
-    /// Resolution tier, e.g. 1K, 2K, 4K (mapped to image_config.image_size).
+    /// Resolution tier, e.g. 1K, 2K, 4K (Images API `resolution`).
     #[arg(long)]
     image_size: Option<String>,
     /// Base seed; variant N uses seed+N (provider support varies).
     #[arg(long)]
     seed: Option<u64>,
-    /// Use image-only output modality (for models that only output images).
-    #[arg(long)]
-    image_only: bool,
     /// Input image for editing / image-to-image (repeatable, order preserved).
     /// Use `label=path` to label a reference, e.g. --image product=./p.jpg.
     #[arg(long = "image")]

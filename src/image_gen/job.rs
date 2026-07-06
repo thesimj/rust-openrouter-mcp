@@ -8,10 +8,10 @@ use anyhow::Result;
 
 use crate::image_io;
 use crate::manifest::{self, InputImageMeta, Manifest, VariantMeta};
-use crate::openrouter::{Content, OpenRouterClient};
+use crate::openrouter::OpenRouterClient;
 
 use super::{
-    GenerateRequest, GeneratedImage, build_content, generate_core, modalities_for, prepare_inputs,
+    GenContent, GenerateRequest, GeneratedImage, build_gen_content, generate_core, prepare_inputs,
 };
 
 /// Outcome of one variant generation (an image, or a per-variant error).
@@ -30,7 +30,7 @@ pub async fn generate_variants(
     client: &OpenRouterClient,
     req: &GenerateRequest,
     variants: usize,
-    content: Content,
+    content: GenContent,
 ) -> Vec<VariantOutcome> {
     let base_seed = req.seed;
     // saturating_add: a base seed near u64::MAX must not overflow-panic.
@@ -169,7 +169,7 @@ pub async fn run_job(
             normalization_max_side: req.max_image_dimension,
         })
         .collect();
-    let content = build_content(&req.prompt, &req.images, &prepared);
+    let content = build_gen_content(&req.prompt, &req.images, &prepared);
 
     let outcomes = generate_variants(client, req, variants, content).await;
 
@@ -253,11 +253,10 @@ pub async fn run_job(
     }
 
     let manifest = Manifest {
-        endpoint: "/api/v1/chat/completions",
+        endpoint: "/api/v1/images",
         model: req.model.clone(),
         prompt: req.prompt.clone(),
         prompt_source: prompt_source.to_string(),
-        modalities: modalities_for(req.image_only),
         aspect_ratio: req.aspect_ratio.clone(),
         image_size: req.image_size.clone(),
         base_seed: req.seed,

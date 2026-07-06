@@ -3,6 +3,7 @@
 //! [`OpenRouterClient`](super::OpenRouterClient); none export new items.
 
 mod chat;
+mod images;
 mod key;
 mod models;
 mod speech;

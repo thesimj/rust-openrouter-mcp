@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -14,7 +15,7 @@ async fn generate_image(
     req: &GenerateRequest,
 ) -> Result<GeneratedImage> {
     let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
-    let content = build_content(&req.prompt, &req.images, &prepared);
+    let content = build_gen_content(&req.prompt, &req.images, &prepared);
     generate_core(client, req, content).await
 }
 
@@ -116,28 +117,25 @@ fn resolve_max_dimension_defaults_and_clamps_to_800() {
 #[tokio::test]
 async fn generate_image_sends_request_and_decodes_response() {
     let server = MockServer::start().await;
-    let data_url = format!("data:image/png;base64,{PNG_1X1_B64}");
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        // Verify the request shape we build.
+        .and(path("/images"))
+        // Verify the Images API request shape we build (image_size -> resolution).
         .and(body_partial_json(json!({
             "model": "google/gemini-3.1-flash-image-preview",
-            "modalities": ["image", "text"],
+            "prompt": "an owl",
             "seed": 1200,
-            "stream": false,
-            "image_config": { "aspect_ratio": "1:1", "image_size": "1K" }
+            "resolution": "1K",
+            "aspect_ratio": "1:1"
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "gen-abc",
-            "model": "google/gemini-3.1-flash-image-preview",
-            "provider": "Google",
-            "choices": [{
-                "message": { "content": null, "images": [
-                    { "type": "image_url", "image_url": { "url": data_url } }
-                ]}
-            }],
-            "usage": { "cost": 0.0684 }
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-generation-id", "gen-abc")
+                .set_body_json(json!({
+                    "created": 1748372400,
+                    "data": [{ "b64_json": PNG_1X1_B64 }],
+                    "usage": { "cost": 0.0684 }
+                })),
+        )
         .mount(&server)
         .await;
 
@@ -148,25 +146,27 @@ async fn generate_image_sends_request_and_decodes_response() {
         aspect_ratio: Some("1:1".to_string()),
         image_size: Some("1K".to_string()),
         seed: Some(1200),
-        image_only: false,
         images: vec![],
         max_image_dimension: 800,
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!((img.width, img.height), (1, 1));
+    // No media_type in the response -> the PNG magic bytes are sniffed.
     assert_eq!(img.mime, "image/png");
     assert_eq!(img.cost, Some(0.0684));
     assert_eq!(img.generation_id.as_deref(), Some("gen-abc"));
 }
 
 #[tokio::test]
-async fn generate_image_surfaces_provider_error() {
+async fn generate_image_maps_half_k_resolution() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid image_size\"}"),
-        )
+        .and(path("/images"))
+        // The 0.5K tier is spelled `512` on the Images API.
+        .and(body_partial_json(json!({ "resolution": "512" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "b64_json": PNG_1X1_B64 }]
+        })))
         .mount(&server)
         .await;
 
@@ -177,12 +177,35 @@ async fn generate_image_surfaces_provider_error() {
         aspect_ratio: None,
         image_size: Some("0.5K".to_string()),
         seed: None,
-        image_only: false,
+        images: vec![],
+        max_image_dimension: 800,
+    };
+    assert!(generate_image(&client, &req).await.is_ok());
+}
+
+#[tokio::test]
+async fn generate_image_surfaces_provider_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string("{\"error\":\"Internal Server Error\"}"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let req = GenerateRequest {
+        model: "openai/gpt-image-2".to_string(),
+        prompt: "p".to_string(),
+        aspect_ratio: None,
+        image_size: Some("1K".to_string()),
+        seed: None,
         images: vec![],
         max_image_dimension: 800,
     };
     let err = generate_image(&client, &req).await.unwrap_err();
-    assert!(err.to_string().contains("invalid image_size"));
+    assert!(err.to_string().contains("Internal Server Error"));
 }
 
 #[tokio::test]
@@ -229,32 +252,31 @@ async fn describe_image_requires_an_image() {
 }
 
 #[tokio::test]
-async fn generate_image_only_uses_image_modality() {
+async fn generate_image_honors_declared_media_type_for_vector() {
+    // A tiny SVG document (a vector model returns bytes + an explicit media_type).
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" viewBox="0 0 120 60"><rect width="120" height="60"/></svg>"#;
+    let svg_b64 = base64::engine::general_purpose::STANDARD.encode(svg);
     let server = MockServer::start().await;
-    let data_url = format!("data:image/jpeg;base64,{PNG_1X1_B64}");
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_partial_json(json!({ "modalities": ["image"] })))
+        .and(path("/images"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{ "message": { "images": [
-                { "image_url": { "url": data_url } }
-            ]}}]
+            "data": [{ "b64_json": svg_b64, "media_type": "image/svg+xml" }]
         })))
         .mount(&server)
         .await;
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "x-ai/grok-imagine-image-quality".to_string(),
+        model: "recraft/recraft-v4.1-vector".to_string(),
         prompt: "p".to_string(),
         aspect_ratio: None,
         image_size: None,
         seed: None,
-        image_only: true,
         images: vec![],
         max_image_dimension: 800,
     };
-    // mime is sniffed from the data URL prefix, even when the bytes are PNG.
     let img = generate_image(&client, &req).await.unwrap();
-    assert_eq!(img.mime, "image/jpeg");
+    // media_type is trusted over sniffing, and SVG dimensions come from the viewBox.
+    assert_eq!(img.mime, "image/svg+xml");
+    assert_eq!((img.width, img.height), (120, 60));
 }

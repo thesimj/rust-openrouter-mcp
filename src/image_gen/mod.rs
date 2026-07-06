@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 
 use crate::image_io;
 use crate::openrouter::{
-    ChatRequest, Content, ContentPart, ImageConfig, ImageUrl, Message, OpenRouterClient,
+    ChatRequest, Content, ContentPart, ImageUrl, ImagesRequest, InputReference, Message,
+    OpenRouterClient,
 };
 
 pub(crate) mod job;
@@ -91,9 +92,6 @@ pub struct GenerateRequest {
     pub aspect_ratio: Option<String>,
     pub image_size: Option<String>,
     pub seed: Option<u64>,
-    /// Image-only-output models (e.g. Grok/Seedream/FLUX) need `["image"]`;
-    /// dual-output models (Nano Banana, GPT Image) use `["image","text"]`.
-    pub image_only: bool,
     /// Local images to edit/condition on. Empty for plain text-to-image.
     pub images: Vec<InputImage>,
     /// Longest-side cap (px) for normalized input images.
@@ -240,83 +238,95 @@ pub(crate) fn build_content(
     Content::Parts(parts)
 }
 
-/// Build a single-user-message chat request for the given content. Shared by the
-/// image-generation and image-description paths so the request envelope is built
-/// in one place.
-fn user_chat(
-    model: &str,
-    content: Content,
-    modalities: Option<Vec<String>>,
-    image_config: Option<ImageConfig>,
-    seed: Option<u64>,
-) -> ChatRequest {
-    ChatRequest {
-        model: model.to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content,
-        }],
-        modalities,
-        image_config,
-        seed,
-        temperature: None,
-        max_tokens: None,
-        stream: false,
+/// Pre-built inputs for one generation, computed once and cloned per variant:
+/// the assembled prompt and the reference-image data URLs (sent as
+/// `input_references`). Mirrors the old pre-built `Content`, adapted to the
+/// Images API request shape.
+#[derive(Debug, Clone)]
+pub(crate) struct GenContent {
+    prompt: String,
+    reference_urls: Vec<String>,
+}
+
+/// Assemble the prompt (with any labeled-reference preamble) and collect the
+/// prepared input-image data URLs into a [`GenContent`], once per job.
+pub(crate) fn build_gen_content(
+    prompt: &str,
+    images: &[InputImage],
+    prepared: &[PreparedInput],
+) -> GenContent {
+    GenContent {
+        prompt: assemble_prompt(prompt, images),
+        reference_urls: prepared.iter().map(|p| p.data_url.clone()).collect(),
     }
 }
 
-/// Issue one chat-completions request for the given pre-built `content` and
+/// Map the tool's `image_size` tier to the Images API `resolution` value: the
+/// half-K tier is spelled `512` upstream; the other tiers pass through as-is.
+fn resolution_for(image_size: &str) -> String {
+    match image_size.trim() {
+        "0.5K" | "0.5k" | "512" => "512".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Issue one `POST /api/v1/images` request for the given pre-built `content` and
 /// extract the generated image. Shared by single and variant generation so the
-/// content (including normalized input images) is built once and reused.
+/// content (including normalized input images) is built once and reused. Each
+/// call asks for a single image (`n` defaults to 1 upstream); variants fan out
+/// across multiple calls, since most models cap `n` at 1.
 pub(crate) async fn generate_core(
     client: &OpenRouterClient,
     req: &GenerateRequest,
-    content: Content,
+    content: GenContent,
 ) -> Result<GeneratedImage> {
-    let image_config =
-        (req.aspect_ratio.is_some() || req.image_size.is_some()).then(|| ImageConfig {
-            aspect_ratio: req.aspect_ratio.clone(),
-            image_size: req.image_size.clone(),
-        });
-    let chat = user_chat(
-        &req.model,
-        content,
-        Some(modalities_for(req.image_only)),
-        image_config,
-        req.seed,
-    );
+    let input_references = content
+        .reference_urls
+        .into_iter()
+        .map(|url| InputReference::new(ImageUrl { url }))
+        .collect();
+    let request = ImagesRequest {
+        model: req.model.clone(),
+        prompt: content.prompt,
+        resolution: req.image_size.as_deref().map(resolution_for),
+        aspect_ratio: req.aspect_ratio.clone(),
+        seed: req.seed,
+        n: None,
+        input_references,
+    };
 
-    let resp = client.chat_completion(&chat).await?;
-    let generation_id = resp.generation_id.or(resp.completion.id);
-    let provider = resp.completion.provider;
-    let cost = resp.completion.usage.and_then(|u| u.cost);
-
-    let choice = resp
-        .completion
-        .choices
+    let (resp, generation_id) = client.generate_images(&request).await?;
+    let cost = resp.usage.and_then(|u| u.cost);
+    let item = resp
+        .data
         .into_iter()
         .next()
-        .context("OpenRouter returned no choices")?;
-    let text = choice.message.content.filter(|t| !t.is_empty());
-    let image = choice
-        .message
-        .images
-        .into_iter()
-        .next()
-        .context("model returned no image (it may be a vision-only model or have refused)")?;
+        .context("model returned no image (it may have refused)")?;
 
-    let (mime, bytes) = image_io::parse_data_url(&image.image_url.url)?;
-    let (width, height) = image_io::decode_dimensions(&bytes)?;
+    let bytes = image_io::decode_base64(&item.b64_json)?;
+    // Prefer the response-declared MIME (only sent for vector output), else sniff
+    // the raster magic bytes, else default to PNG.
+    let mime = item
+        .media_type
+        .or_else(|| image_io::sniff_mime(&bytes).map(str::to_string))
+        .unwrap_or_else(|| "image/png".to_string());
+    let (width, height) = if mime == "image/svg+xml" {
+        image_io::svg_dimensions(&bytes).unwrap_or((0, 0))
+    } else {
+        image_io::decode_dimensions(&bytes)?
+    };
 
     Ok(GeneratedImage {
         bytes,
         mime,
         width,
         height,
-        text,
+        // The Images API returns image bytes only, no assistant commentary.
+        text: None,
         cost,
         generation_id,
-        provider,
+        // The Images API response body carries no provider attribution.
+        provider: None,
     })
 }
 
@@ -349,7 +359,21 @@ pub async fn describe_image(
     }
     let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
     let content = build_content(&req.prompt, &req.images, &prepared);
-    let chat = user_chat(&req.model, content, None, None, None);
+    // Description is a plain text-output vision call over /chat/completions (no
+    // `modalities`/`image_config`), distinct from the /images generation path.
+    let chat = ChatRequest {
+        model: req.model.clone(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content,
+        }],
+        modalities: None,
+        image_config: None,
+        seed: None,
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+    };
 
     let resp = client.chat_completion(&chat).await?;
     let cost = resp.completion.usage.and_then(|u| u.cost);
@@ -365,16 +389,6 @@ pub async fn describe_image(
         .filter(|t| !t.is_empty())
         .context("model returned no text (use a vision-capable model with text output)")?;
     Ok(DescribeResult { text, cost })
-}
-
-/// Output modalities for the request: image-only models get `["image"]`,
-/// dual-output models get `["image","text"]`.
-pub(crate) fn modalities_for(image_only: bool) -> Vec<String> {
-    if image_only {
-        vec!["image".to_string()]
-    } else {
-        vec!["image".to_string(), "text".to_string()]
-    }
 }
 
 #[cfg(test)]

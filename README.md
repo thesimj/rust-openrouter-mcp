@@ -190,7 +190,7 @@ block is optional.
 | --- | --- | --- |
 | `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing). |
 | `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, and (for video models) real `pricing_skus`. |
-| `generate_image` | write | Generate or edit images; supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`, `image_only`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
+| `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
 | `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |

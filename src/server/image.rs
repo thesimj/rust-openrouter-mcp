@@ -20,7 +20,7 @@ use crate::server::naming;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
-use crate::server::schema::{de_opt_bool, de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{de_opt_uint, require_all, scalarize_nullable};
 use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
@@ -221,11 +221,6 @@ pub(crate) struct GenerateImageArgs {
     /// Seed for reproducible-ish generation (provider support varies).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub seed: Option<u64>,
-    /// REQUIRED (no default): true for image-only-output models
-    /// (e.g. Grok/Seedream/FLUX), false for dual text+image models
-    /// (e.g. Nano Banana, GPT Image).
-    #[serde(default, deserialize_with = "de_opt_bool")]
-    pub image_only: Option<bool>,
     /// Input images to edit/condition on (image-to-image / multi-image). Each
     /// takes exactly one of: path (local file), url (http/https, fetched), or
     /// base64 (a data: URL or raw base64). Omit for plain text-to-image.
@@ -317,11 +312,12 @@ impl OpenRouterServer {
         Set variants>1 to generate several in parallel (seed-stepped). Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
-        warnings. The output format (PNG or JPEG) is chosen by the provider and the \
-        extension is set to match. Set image_only=true for models that only output images \
-        (e.g. Grok/FLUX). This tool has NO defaults: model, prompt, aspect_ratio, \
-        image_size and image_only must all be specified, or the call fails with an error \
-        naming what is missing (output is optional, see above). Runs asynchronously: if the job is still going after \
+        warnings. The output format (PNG, JPEG, or SVG) is chosen by the provider and the \
+        extension is set to match. Works with any OpenRouter image model (Nano Banana, Grok, \
+        Seedream, FLUX, GPT Image, Recraft, ...) via the dedicated image endpoint. This tool \
+        has NO defaults: model, prompt, aspect_ratio and image_size must all be specified, or \
+        the call fails with an error naming what is missing (output is optional, see above). \
+        Runs asynchronously: if the job is still going after \
         wait_seconds (default 10), it returns status \"pending\" with a task_id to poll via \
         get_result; otherwise it returns the completed result inline. To analyze or caption \
         an existing image instead of creating one, use describe_image.",
@@ -357,12 +353,6 @@ impl OpenRouterServer {
         if args.image_size.is_none() {
             missing.push("image_size (e.g. \"1K\", \"2K\", \"4K\")");
         }
-        if args.image_only.is_none() {
-            missing.push(
-                "image_only (true for image-only models e.g. Grok/Seedream/FLUX, \
-                 false for dual text+image models e.g. Nano Banana/GPT Image)",
-            );
-        }
         require_all("generate_image", "image", &missing)?;
 
         let aspect_ratio = args.aspect_ratio.clone();
@@ -374,7 +364,6 @@ impl OpenRouterServer {
             aspect_ratio: args.aspect_ratio,
             image_size: args.image_size,
             seed: args.seed,
-            image_only: args.image_only.unwrap_or(false),
             images,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         };
@@ -577,11 +566,12 @@ mod tests {
     #[tokio::test]
     async fn generate_image_runs_async_and_get_result_fetches_it() {
         let mock = MockServer::start().await;
-        let data_url = format!("data:image/png;base64,{}", valid_png_b64());
+        // The Images API returns raw base64 bytes in data[].b64_json.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/images"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{ "message": { "images": [ { "image_url": { "url": data_url } } ] } }],
+                "created": 1748372400,
+                "data": [{ "b64_json": valid_png_b64() }],
                 "usage": { "cost": 0.04 }
             })))
             .mount(&mock)
@@ -595,7 +585,6 @@ mod tests {
             aspect_ratio: Some("1:1".to_string()),
             image_size: Some("1K".to_string()),
             seed: Some(5),
-            image_only: Some(true),
             images: vec![],
             max_image_dimension: None,
             variants: None,
@@ -661,7 +650,6 @@ mod tests {
             aspect_ratio: None,
             image_size: None,
             seed: None,
-            image_only: None,
             images: vec![],
             max_image_dimension: None,
             variants: None,
@@ -671,13 +659,11 @@ mod tests {
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));
         assert!(err.message.contains("image_size"));
-        assert!(err.message.contains("image_only"));
         assert!(err.message.contains("no defaults"));
     }
 
     /// Defense in depth: even with a scalar schema, clients that stringify all
-    /// arguments must still deserialize. `image_only: "true"` is the exact payload
-    /// from the bug report.
+    /// arguments must still deserialize (the exact failure mode from the bug report).
     #[test]
     fn generate_image_args_accept_stringified_scalars() {
         let args: GenerateImageArgs = serde_json::from_value(json!({
@@ -685,13 +671,11 @@ mod tests {
             "prompt": "a small test image",
             "aspect_ratio": "1:1",
             "image_size": "1K",
-            "image_only": "true",
             "seed": "42",
             "variants": "2",
             "output": "out.png",
         }))
         .expect("stringified scalars should deserialize");
-        assert_eq!(args.image_only, Some(true));
         assert_eq!(args.seed, Some(42));
         assert_eq!(args.variants, Some(2));
     }
@@ -700,18 +684,18 @@ mod tests {
     #[test]
     fn generate_image_args_accept_native_and_absent_scalars() {
         let native: GenerateImageArgs = serde_json::from_value(json!({
-            "model": "m", "prompt": "p", "image_only": false, "seed": 7, "output": "o.png",
+            "model": "m", "prompt": "p", "seed": 7, "variants": 3, "output": "o.png",
         }))
         .unwrap();
-        assert_eq!(native.image_only, Some(false));
         assert_eq!(native.seed, Some(7));
+        assert_eq!(native.variants, Some(3));
 
         let absent: GenerateImageArgs = serde_json::from_value(json!({
-            "model": "m", "prompt": "p", "image_only": null, "output": "o.png",
+            "model": "m", "prompt": "p", "seed": null, "output": "o.png",
         }))
         .unwrap();
-        assert_eq!(absent.image_only, None);
         assert_eq!(absent.seed, None);
+        assert_eq!(absent.variants, None);
     }
 
     /// Garbage strings are rejected with a clear message rather than silently
@@ -719,9 +703,9 @@ mod tests {
     #[test]
     fn invalid_stringified_scalars_are_rejected() {
         let err = serde_json::from_value::<GenerateImageArgs>(json!({
-            "model": "m", "prompt": "p", "image_only": "yes", "output": "o.png",
+            "model": "m", "prompt": "p", "seed": "not-a-number", "output": "o.png",
         }))
         .unwrap_err();
-        assert!(err.to_string().contains("boolean"), "got: {err}");
+        assert!(err.to_string().contains("integer"), "got: {err}");
     }
 }
