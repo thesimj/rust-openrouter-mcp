@@ -12,6 +12,7 @@ mod image_gen;
 mod image_io;
 mod manifest;
 mod openrouter;
+mod output;
 mod pricing;
 mod server;
 mod stats;

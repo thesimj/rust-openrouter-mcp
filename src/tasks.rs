@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -40,7 +41,12 @@ enum Status {
 struct TaskEntry {
     kind: TaskKind,
     status: Status,
+    created_at: Instant,
+    finished_at: Option<Instant>,
 }
+
+const MAX_RETAINED_TASKS: usize = 256;
+const TERMINAL_TASK_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// A read-only view of a task for building a response.
 pub struct TaskSnapshot {
@@ -63,19 +69,25 @@ impl TaskRegistry {
 
     /// Register a new pending task.
     pub async fn insert_pending(&self, id: &str, kind: TaskKind) {
-        self.inner.lock().await.insert(
+        let now = Instant::now();
+        let mut entries = self.inner.lock().await;
+        entries.insert(
             id.to_string(),
             TaskEntry {
                 kind,
                 status: Status::Pending,
+                created_at: now,
+                finished_at: None,
             },
         );
+        prune_terminal(&mut entries, now);
     }
 
     /// Mark a task completed with its result.
     pub async fn complete(&self, id: &str, result: Value) {
         if let Some(entry) = self.inner.lock().await.get_mut(id) {
             entry.status = Status::Completed(result);
+            entry.finished_at = Some(Instant::now());
         }
     }
 
@@ -83,12 +95,14 @@ impl TaskRegistry {
     pub async fn fail(&self, id: &str, error: String) {
         if let Some(entry) = self.inner.lock().await.get_mut(id) {
             entry.status = Status::Failed(error);
+            entry.finished_at = Some(Instant::now());
         }
     }
 
     /// Snapshot a task's current state, or `None` if the id is unknown.
     pub async fn snapshot(&self, id: &str) -> Option<TaskSnapshot> {
-        let guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        prune_terminal(&mut guard, Instant::now());
         let entry = guard.get(id)?;
         Some(match &entry.status {
             Status::Pending => TaskSnapshot {
@@ -110,6 +124,30 @@ impl TaskRegistry {
                 error: Some(err.clone()),
             },
         })
+    }
+}
+
+/// Drop expired terminal tasks, then evict the oldest terminal results until
+/// the registry is within its retention bound. Pending jobs are never evicted.
+fn prune_terminal(entries: &mut HashMap<String, TaskEntry>, now: Instant) {
+    entries.retain(|_, entry| {
+        entry
+            .finished_at
+            .is_none_or(|finished| now.duration_since(finished) < TERMINAL_TASK_TTL)
+    });
+
+    while entries.len() > MAX_RETAINED_TASKS {
+        let oldest = entries
+            .iter()
+            .filter(|(_, entry)| entry.finished_at.is_some())
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(id, _)| id.clone());
+        match oldest {
+            Some(id) => {
+                entries.remove(&id);
+            }
+            None => break,
+        }
     }
 }
 
@@ -140,5 +178,22 @@ mod tests {
         assert_eq!(s.status, "failed");
         assert_eq!(s.kind, "video");
         assert_eq!(s.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_evicted_at_the_retention_bound() {
+        let reg = TaskRegistry::new();
+        for i in 0..=MAX_RETAINED_TASKS {
+            let id = format!("task-{i}");
+            reg.insert_pending(&id, TaskKind::Image).await;
+            reg.complete(&id, json!({"i": i})).await;
+        }
+
+        assert!(reg.snapshot("task-0").await.is_none());
+        assert!(
+            reg.snapshot(&format!("task-{MAX_RETAINED_TASKS}"))
+                .await
+                .is_some()
+        );
     }
 }

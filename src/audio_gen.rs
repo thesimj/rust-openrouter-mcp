@@ -96,10 +96,8 @@ pub async fn run_job(
     let result = client.speech(&body).await?;
     let ext = extension_for(&result.mime, &response_format);
     let path = output.with_extension(ext);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, &result.bytes)
+    crate::output::write_bytes(&path, &result.bytes)
+        .await
         .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
 
     let mut warnings = Vec::new();

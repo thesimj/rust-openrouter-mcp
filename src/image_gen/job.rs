@@ -2,17 +2,21 @@
 //! sidecar manifest, and return a lean summary. Shared by the CLI and the MCP tool.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use tokio::sync::Semaphore;
 
 use crate::image_io;
 use crate::manifest::{self, InputImageMeta, Manifest, VariantMeta};
 use crate::openrouter::OpenRouterClient;
 
-use super::{
-    GenContent, GenerateRequest, GeneratedImage, build_gen_content, generate_core, prepare_inputs,
-};
+use super::{GenContent, GenerateRequest, GeneratedImage, build_gen_content, generate_core};
+
+/// Avoid multiplying large base64 reference-image request bodies across every
+/// requested variant at once. Four still provides useful API parallelism.
+const MAX_CONCURRENT_VARIANTS: usize = 4;
 
 /// Outcome of one variant generation (an image, or a per-variant error).
 pub struct VariantOutcome {
@@ -22,10 +26,10 @@ pub struct VariantOutcome {
     pub result: Result<GeneratedImage>,
 }
 
-/// Generate `variants` images concurrently (all at once). With a base seed each
-/// variant uses `base + index` for reproducible, distinct outputs. A failed
-/// variant is captured in its `result` without aborting the others. Returned
-/// ordered by index.
+/// Generate `variants` images concurrently (at most [`MAX_CONCURRENT_VARIANTS`]
+/// in flight). With a base seed each variant uses `base + index` for
+/// reproducible, distinct outputs. A failed variant is captured in its `result`
+/// without aborting the others. Returned ordered by index.
 pub async fn generate_variants(
     client: &OpenRouterClient,
     req: &GenerateRequest,
@@ -35,16 +39,24 @@ pub async fn generate_variants(
     let base_seed = req.seed;
     // saturating_add: a base seed near u64::MAX must not overflow-panic.
     let seed_for = |i: usize| base_seed.map(|s| s.saturating_add(i as u64));
+    // One shared copy of the request and pre-built content; each task builds
+    // its request body only once it holds a permit, so at most
+    // MAX_CONCURRENT_VARIANTS copies of the reference images exist at a time.
+    let req = Arc::new(req.clone());
+    let content = Arc::new(content);
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_VARIANTS));
     let handles: Vec<_> = (0..variants)
         .map(|i| {
             let client = client.clone();
-            let mut r = req.clone();
+            let req = Arc::clone(&req);
+            let content = Arc::clone(&content);
+            let permits = Arc::clone(&permits);
             let seed = seed_for(i);
-            r.seed = seed;
-            let content = content.clone();
             tokio::spawn(async move {
+                // The semaphore is never closed, so acquire cannot fail.
+                let _permit = permits.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
-                let result = generate_core(&client, &r, content).await;
+                let result = generate_core(&client, &req, seed, &content).await;
                 (seed, start.elapsed().as_millis(), result)
             })
         })
@@ -150,7 +162,7 @@ pub async fn run_job(
     // Normalize input images once, up front - reused for every variant request
     // and for the manifest (a read/decode failure fails the whole job before any
     // generation, so no spend occurs).
-    let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
+    let prepared = super::prepare_inputs_async(&req.images, req.max_image_dimension).await?;
     let input_images: Vec<InputImageMeta> = req
         .images
         .iter()
@@ -200,12 +212,9 @@ pub async fn run_job(
                 let ext = image_io::extension_for(&img.mime);
                 let path =
                     variant_output_path(base_output, outcome.seed, outcome.index, variants, ext);
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent).ok();
-                }
                 // Isolate a write failure to this variant rather than aborting
                 // the whole batch (the image was generated and paid for).
-                match std::fs::write(&path, &img.bytes) {
+                match crate::output::write_bytes(&path, &img.bytes).await {
                     Ok(()) => {
                         let check = image_io::check_dimensions(
                             img.width,

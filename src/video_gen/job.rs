@@ -2,7 +2,6 @@
 //! manifest, and return a lean summary. Shared by the CLI and the MCP tool.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::Result;
 
@@ -72,7 +71,8 @@ pub async fn run_job(
 
     // Normalize frames once, up front (a read/decode failure fails before spend).
     let frame_inputs = unlabeled(req.frames.iter().map(|f| f.path.clone()).collect());
-    let frame_prepared = image_gen::prepare_inputs(&frame_inputs, req.max_image_dimension)?;
+    let frame_prepared =
+        image_gen::prepare_inputs_async(&frame_inputs, req.max_image_dimension).await?;
     let mut frame_images = Vec::new();
     let mut frame_meta = Vec::new();
     for (i, (f, p)) in req.frames.iter().zip(&frame_prepared).enumerate() {
@@ -99,7 +99,8 @@ pub async fn run_job(
     let mut reference_meta = Vec::new();
     if !use_frames {
         let ref_inputs = unlabeled(req.references.clone());
-        let ref_prepared = image_gen::prepare_inputs(&ref_inputs, req.max_image_dimension)?;
+        let ref_prepared =
+            image_gen::prepare_inputs_async(&ref_inputs, req.max_image_dimension).await?;
         for (p, prep) in req.references.iter().zip(&ref_prepared) {
             input_references.push(InputReference::new(ImageUrl {
                 url: prep.data_url.clone(),
@@ -128,13 +129,22 @@ pub async fn run_job(
     // Submit, then poll until a terminal status or the poll timeout elapses.
     let submitted = client.submit_video(&body).await?;
     let job_id = submitted.id;
-    let start = Instant::now();
     let interval = std::time::Duration::from_secs(req.poll_interval_secs);
+    let timeout = std::time::Duration::from_secs(req.poll_timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     let mut terminal: Option<crate::openrouter::VideoPollResponse> = None;
+    let mut timed_out = false;
     loop {
-        tokio::time::sleep(interval).await;
-        let poll = client.poll_video(&job_id).await?;
+        // Poll immediately after submission. Bound the request itself by the
+        // overall deadline so a slow network call cannot overrun the job timeout.
+        let poll = match tokio::time::timeout_at(deadline, client.poll_video(&job_id)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        };
         match poll.status.as_str() {
             "completed" | "succeeded" => {
                 terminal = Some(poll);
@@ -148,13 +158,18 @@ pub async fn run_job(
                 // pending/processing/queued/running/unknown -> keep waiting.
             }
         }
-        if start.elapsed().as_secs() >= req.poll_timeout_secs {
-            errors.push(format!(
-                "video generation timed out after {}s (job {job_id})",
-                req.poll_timeout_secs
-            ));
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            timed_out = true;
             break;
         }
+        tokio::time::sleep_until((now + interval).min(deadline)).await;
+    }
+    if timed_out {
+        errors.push(format!(
+            "video generation timed out after {}s (job {job_id})",
+            req.poll_timeout_secs
+        ));
     }
 
     if let Some(poll) = terminal {
@@ -174,10 +189,7 @@ pub async fn run_job(
                 Ok((mime, bytes)) => {
                     let ext = extension_for(&mime);
                     let path = clip_output_path(base_output, index, total, ext);
-                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    match std::fs::write(&path, &bytes) {
+                    match crate::output::write_bytes(&path, &bytes).await {
                         Ok(()) => {
                             let has_audio = req.generate_audio.unwrap_or(false);
                             meta.path = Some(path.to_string_lossy().into_owned());

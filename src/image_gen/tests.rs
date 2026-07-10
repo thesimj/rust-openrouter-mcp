@@ -16,7 +16,7 @@ async fn generate_image(
 ) -> Result<GeneratedImage> {
     let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
     let content = build_gen_content(&req.prompt, &req.images, &prepared);
-    generate_core(client, req, content).await
+    generate_core(client, req, req.seed, &content).await
 }
 
 /// Write a small valid PNG to a temp file and return its path.

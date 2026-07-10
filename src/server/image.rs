@@ -25,6 +25,11 @@ use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
 
+/// Hard ceiling for images fetched from third-party URLs. Input images are
+/// normalized to at most 800px before use, so accepting arbitrarily large
+/// source bodies only increases memory pressure without improving output.
+const MAX_REMOTE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
 /// An input image for editing / image-to-image / vision. Exactly one of
 /// `path`, `url`, or `base64` must be set. Order is preserved.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,13 +149,34 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
             "image url returned a redirect; refused (SSRF guard)".to_string(),
         ));
     }
-    let resp = resp
+    let mut resp = resp
         .error_for_status()
         .map_err(|e| invalid(format!("image url returned an error: {e}")))?;
-    let bytes = resp.bytes().await.map_err(|e| {
+    let content_length = resp.content_length();
+    if let Some(length) = content_length
+        && length > MAX_REMOTE_IMAGE_BYTES
+    {
+        return Err(invalid(format!(
+            "image url body is too large ({length} bytes; maximum is {MAX_REMOTE_IMAGE_BYTES})"
+        )));
+    }
+
+    // Enforce the limit while streaming as Content-Length may be absent or
+    // inaccurate. `Response::bytes()` would buffer an unbounded body first.
+    let capacity = content_length.unwrap_or(0).min(MAX_REMOTE_IMAGE_BYTES) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
         ErrorData::internal_error(format!("could not read image url body: {e}"), None)
-    })?;
-    Ok(bytes.to_vec())
+    })? {
+        let next_len = bytes.len().saturating_add(chunk.len());
+        if next_len as u64 > MAX_REMOTE_IMAGE_BYTES {
+            return Err(invalid(format!(
+                "image url body exceeds the {MAX_REMOTE_IMAGE_BYTES}-byte maximum"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Validate that an image spec carries exactly one source (path/url/base64),

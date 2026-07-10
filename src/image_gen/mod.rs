@@ -214,6 +214,19 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
         .collect()
 }
 
+/// Async boundary for input preparation. Image decoding, resizing, SVG
+/// rasterization, PNG encoding, and local file reads are blocking/CPU-heavy and
+/// must not occupy a Tokio executor worker.
+pub(crate) async fn prepare_inputs_async(
+    images: &[InputImage],
+    max_dim: u32,
+) -> Result<Vec<PreparedInput>> {
+    let images = images.to_vec();
+    tokio::task::spawn_blocking(move || prepare_inputs(&images, max_dim))
+        .await
+        .context("input image preparation task failed")?
+}
+
 /// Build the message content from already-prepared inputs: a plain string for
 /// text-to-image, or a text-first array of parts (text prompt, then each input
 /// image data URL) for editing / multi-image requests.
@@ -238,11 +251,11 @@ pub(crate) fn build_content(
     Content::Parts(parts)
 }
 
-/// Pre-built inputs for one generation, computed once and cloned per variant:
-/// the assembled prompt and the reference-image data URLs (sent as
+/// Pre-built inputs for one generation, computed once and shared across
+/// variants: the assembled prompt and the reference-image data URLs (sent as
 /// `input_references`). Mirrors the old pre-built `Content`, adapted to the
 /// Images API request shape.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct GenContent {
     prompt: String,
     reference_urls: Vec<String>,
@@ -272,25 +285,27 @@ fn resolution_for(image_size: &str) -> String {
 
 /// Issue one `POST /api/v1/images` request for the given pre-built `content` and
 /// extract the generated image. Shared by single and variant generation so the
-/// content (including normalized input images) is built once and reused. Each
-/// call asks for a single image (`n` defaults to 1 upstream); variants fan out
-/// across multiple calls, since most models cap `n` at 1.
+/// content (including normalized input images) is built once and reused; `seed`
+/// is passed separately because it is the only field that varies per variant.
+/// Each call asks for a single image (`n` defaults to 1 upstream); variants fan
+/// out across multiple calls, since most models cap `n` at 1.
 pub(crate) async fn generate_core(
     client: &OpenRouterClient,
     req: &GenerateRequest,
-    content: GenContent,
+    seed: Option<u64>,
+    content: &GenContent,
 ) -> Result<GeneratedImage> {
     let input_references = content
         .reference_urls
-        .into_iter()
-        .map(|url| InputReference::new(ImageUrl { url }))
+        .iter()
+        .map(|url| InputReference::new(ImageUrl { url: url.clone() }))
         .collect();
     let request = ImagesRequest {
         model: req.model.clone(),
-        prompt: content.prompt,
+        prompt: content.prompt.clone(),
         resolution: req.image_size.as_deref().map(resolution_for),
         aspect_ratio: req.aspect_ratio.clone(),
-        seed: req.seed,
+        seed,
         n: None,
         input_references,
     };
@@ -357,7 +372,7 @@ pub async fn describe_image(
     if req.images.is_empty() {
         anyhow::bail!("describe_image requires at least one input image");
     }
-    let prepared = prepare_inputs(&req.images, req.max_image_dimension)?;
+    let prepared = prepare_inputs_async(&req.images, req.max_image_dimension).await?;
     let content = build_content(&req.prompt, &req.images, &prepared);
     // Description is a plain text-output vision call over /chat/completions (no
     // `modalities`/`image_config`), distinct from the /images generation path.

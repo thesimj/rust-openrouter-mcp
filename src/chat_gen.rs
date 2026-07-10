@@ -48,7 +48,8 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         // input image. Built here rather than via image_gen::build_content so the
         // chat prompt isn't wrapped in that path's image-editing "Reference
         // images:" preamble, which doesn't belong in a Q&A chat.
-        let prepared = image_gen::prepare_inputs(inputs.images, inputs.max_image_dimension)?;
+        let prepared =
+            image_gen::prepare_inputs_async(inputs.images, inputs.max_image_dimension).await?;
         let mut parts = vec![ContentPart::Text {
             text: inputs.prompt.to_string(),
         }];
