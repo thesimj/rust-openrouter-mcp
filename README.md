@@ -68,12 +68,20 @@ Windows, and Linux** - no terminal or Rust toolchain required.
 Your API key is stored by Claude Desktop (the OS keychain/credential store) and
 injected into the server as `OPENROUTER_API_KEY`. See [Privacy Policy](#privacy-policy).
 
-To build the bundle yourself (the macOS build is a universal arm64+x86_64
-binary), run the cross-platform generator on the target platform:
+To build the bundle yourself, run the cross-platform generator on the target
+platform:
 
 ```bash
 node scripts/build-mcpb.mjs   # -> dist/openrouter-mcp-<os>.mcpb
 ```
+
+Per-platform specifics, all handled by the generator: macOS produces a universal
+arm64+x86_64 binary (via `lipo`); Linux builds a static `x86_64-unknown-linux-musl`
+binary so the bundle runs on any distro regardless of the host's glibc version;
+Windows statically links the CRT so it starts on a fresh install with no Visual
+C++ Redistributable. TLS is pure-Rust [rustls](https://github.com/rustls/rustls)
+trusting the OS certificate store, so no system OpenSSL is needed to build any
+target and custom/corporate root CAs installed on the machine still work.
 
 ## Connect another client (CLI, IDE, agent)
 
@@ -295,6 +303,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo llvm-cov --summary-only        # coverage (cargo install cargo-llvm-cov)
 ```
+
+CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, and the
+test suite on every push and pull request; the release workflow only fires on a
+version tag, so this is the gate that runs before anything ships.
 
 Live smoke tests (require `OPENROUTER_API_KEY`):
 

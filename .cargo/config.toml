@@ -1,0 +1,21 @@
+# --- Per-target build parameters ------------------------------------------
+# Each section is target-scoped, so it only affects builds for that platform and
+# can't break the others. rustflags do NOT merge across sections, so each array
+# must be complete on its own. macOS uses the default linker and wants no extra
+# flags, so it has no section.
+
+# Windows (MSVC): statically link the CRT (`+crt-static`) so the shipped binary is
+# self-contained and starts on a *fresh* Windows 10/11 with no Visual C++
+# Redistributable installed. Without this it imports `VCRUNTIME140.dll`, which the
+# OS does not ship by default, so the .mcpb extension fails on first run with a
+# missing-DLL error. (The `api-ms-win-crt-*` UCRT DLLs are part of Windows 10/11,
+# so the VC++ runtime is the only gap `+crt-static` closes.)
+#
+# Deliberately NOT set here: `-C force-unwind-tables=yes`. That flag keeps
+# backtraces reliable under `panic = "unwind"`; this crate ships `panic = "abort"`
+# (see [profile.release] in Cargo.toml), so it would only add size.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

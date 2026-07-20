@@ -24,8 +24,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN_NAME = "openrouter-mcp";
 
 // Map Node's process.platform to a friendly OS slug + manifest values.
+//
+// `target` is a rustc triple the binary is built for instead of the host default:
+// Linux ships the static musl build so the .mcpb runs on any distro regardless of
+// the host's glibc version (a glibc binary carries a floor set by the build box).
+// Requires `rustup target add x86_64-unknown-linux-musl`; the pure-Rust rustls TLS
+// stack (see Cargo.toml) means no OpenSSL to cross-link into the static binary.
 const PLATFORMS = {
-  linux: { slug: "linux", nodePlatform: "linux", exe: "" },
+  linux: { slug: "linux", nodePlatform: "linux", exe: "", target: "x86_64-unknown-linux-musl" },
   darwin: { slug: "macos", nodePlatform: "darwin", exe: "" },
   win32: { slug: "windows", nodePlatform: "win32", exe: ".exe" },
 };
@@ -67,6 +73,11 @@ function buildBinary(stageBinDir) {
       join(ROOT, "target", targets[1], "release", BIN_NAME),
     ]);
     run("lipo", ["-info", out]);
+  } else if (platform.target) {
+    console.log(`==> Building release binary for ${platform.target}`);
+    run("rustup", ["target", "add", platform.target]);
+    run("cargo", ["build", "--release", "--locked", "--target", platform.target]);
+    copyFileSync(join(ROOT, "target", platform.target, "release", `${BIN_NAME}${platform.exe}`), out);
   } else {
     console.log("==> Building release binary");
     run("cargo", ["build", "--release", "--locked"]);

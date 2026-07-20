@@ -1,6 +1,6 @@
 [package]
 name = "openrouter-mcp"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
@@ -30,7 +30,15 @@ tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", 
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# rustls (pure Rust) instead of the default native-tls/OpenSSL backend: no C
+# toolchain or system OpenSSL to link, so the static musl build (shipped as the
+# Linux .mcpb) is a plain cross-compile. `rustls-tls-native-roots` (not the plain
+# `rustls-tls`, which bundles a fixed Mozilla root set and ignores the OS store)
+# keeps trust anchored to the system certificate store, matching the old
+# native-tls behavior - so a user behind a corporate TLS-inspecting proxy whose
+# custom root CA lives in the OS store still connects. `charset` + `http2` are
+# default reqwest features re-added after `default-features = false`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "rustls-tls-native-roots"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
