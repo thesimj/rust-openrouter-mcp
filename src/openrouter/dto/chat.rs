@@ -68,11 +68,6 @@ pub struct ImageUrl {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatResponse {
-    pub completion: ChatCompletion,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct ChatCompletion {
     #[serde(default)]
     pub choices: Vec<Choice>,
@@ -83,9 +78,6 @@ pub struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 pub struct Choice {
     pub message: ResponseMessage,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub finish_reason: Option<String>,
 }
 
 /// Assistant message in a text/vision response (`chat_completion`, `describe_image`).

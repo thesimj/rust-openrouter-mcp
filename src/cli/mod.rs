@@ -37,6 +37,8 @@ enum Command {
     Video(VideoArgs),
     /// Generate speech (text-to-speech) and save it to disk.
     Audio(AudioArgs),
+    /// Transcribe a local audio file to text (speech-to-text).
+    Transcribe(TranscribeArgs),
     /// Describe local image(s) with a vision-capable model.
     Describe(DescribeArgs),
     /// Send a prompt to any chat/text model and print its reply.
@@ -187,6 +189,23 @@ pub(crate) struct AudioArgs {
     output: PathBuf,
 }
 
+/// CLI flags for `transcribe`, mirroring the `transcribe_audio` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct TranscribeArgs {
+    /// STT model id, e.g. openai/gpt-4o-mini-transcribe or openai/whisper-1.
+    #[arg(short, long)]
+    model: String,
+    /// Local audio file to transcribe (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB).
+    #[arg(short, long)]
+    file: PathBuf,
+    /// Container format; inferred from the file extension when omitted.
+    #[arg(long)]
+    format: Option<String>,
+    /// ISO-639-1 language hint (e.g. en, ja) to improve accuracy.
+    #[arg(short, long)]
+    language: Option<String>,
+}
+
 /// CLI flags for `chat`, mirroring the `chat_completion` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct ChatArgs {
@@ -251,6 +270,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Image(args)) => commands::run_image(args).await,
         Some(Command::Video(args)) => commands::run_video(args).await,
         Some(Command::Audio(args)) => commands::run_audio(args).await,
+        Some(Command::Transcribe(args)) => commands::run_transcribe(args).await,
         Some(Command::Describe(args)) => commands::run_describe(args).await,
         Some(Command::Chat(args)) => commands::run_chat(args).await,
         Some(Command::Key) => commands::run_key().await,
@@ -302,7 +322,7 @@ fn resolve_base_output(
 }
 
 /// Parse a CLI `--image` value, which is either `path` or `label=path`.
-fn parse_image_arg(value: &str) -> image_gen::InputImage {
+pub(crate) fn parse_image_arg(value: &str) -> image_gen::InputImage {
     // Only treat `left=right` as a labeled reference when `left` looks like a
     // bare label (alphanumeric/`_`/`-`), so a real path containing '=' (e.g.
     // `./a=b/img.png`) is kept whole instead of being mis-split.
@@ -317,4 +337,78 @@ fn parse_image_arg(value: &str) -> image_gen::InputImage {
         }
     }
     image_gen::InputImage::from_path(value, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_gen::ImageSource;
+
+    /// The label/path split has to distinguish a real label from a path that
+    /// merely contains '=' - the case the function exists to get right.
+    #[test]
+    fn parse_image_arg_splits_labels_but_keeps_paths_containing_equals() {
+        let labeled = parse_image_arg("product=./p.jpg");
+        assert_eq!(labeled.label.as_deref(), Some("product"));
+        assert_eq!(labeled.display_name(), "p.jpg");
+
+        // A path with '=' in a directory name is NOT a label - keep it whole.
+        let awkward = parse_image_arg("./a=b/img.png");
+        assert_eq!(awkward.label, None);
+        match &awkward.source {
+            ImageSource::Path(p) => assert_eq!(p.to_string_lossy(), "./a=b/img.png"),
+            _ => panic!("expected a path source"),
+        }
+
+        // Plain path, and the degenerate empty-side forms, stay unlabeled.
+        assert_eq!(parse_image_arg("./plain.png").label, None);
+        assert_eq!(parse_image_arg("=/leading.png").label, None);
+        assert_eq!(parse_image_arg("trailing=").label, None);
+    }
+
+    #[test]
+    fn resolve_prompt_reads_inline_and_file_and_rejects_empty() {
+        // Inline wins and reports its source.
+        let (text, source) = resolve_prompt(Some("a kite".to_string()), None).unwrap();
+        assert_eq!((text.as_str(), source.as_str()), ("a kite", "inline"));
+
+        // A file is read and trimmed, and reports source "file".
+        let path = std::env::temp_dir().join("openrouter-mcp-prompt-test.txt");
+        std::fs::write(&path, "  from a file \n").unwrap();
+        let (text, source) = resolve_prompt(None, Some(path.clone())).unwrap();
+        assert_eq!((text.as_str(), source.as_str()), ("from a file", "file"));
+
+        // Neither source, an empty file, and a missing file are all errors.
+        assert!(resolve_prompt(None, None).is_err());
+        std::fs::write(&path, "   \n").unwrap();
+        let err = resolve_prompt(None, Some(path)).unwrap_err().to_string();
+        assert!(err.contains("empty"), "got: {err}");
+        let missing = std::env::temp_dir().join("openrouter-mcp-no-such-prompt.txt");
+        assert!(resolve_prompt(None, Some(missing)).is_err());
+    }
+
+    #[test]
+    fn resolve_base_output_accepts_output_or_dir_plus_name() {
+        let direct = resolve_base_output(Some(PathBuf::from("out/hero.png")), None, None).unwrap();
+        assert_eq!(direct, PathBuf::from("out/hero.png"));
+
+        let joined =
+            resolve_base_output(None, Some(PathBuf::from("out")), Some("hero".to_string()))
+                .unwrap();
+        assert_eq!(joined, PathBuf::from("out").join("hero"));
+
+        // --output wins when both forms are given.
+        let both = resolve_base_output(
+            Some(PathBuf::from("explicit.png")),
+            Some(PathBuf::from("out")),
+            Some("hero".to_string()),
+        )
+        .unwrap();
+        assert_eq!(both, PathBuf::from("explicit.png"));
+
+        // Half of the dir+name pair is not enough.
+        assert!(resolve_base_output(None, None, None).is_err());
+        assert!(resolve_base_output(None, Some(PathBuf::from("out")), None).is_err());
+        assert!(resolve_base_output(None, None, Some("hero".to_string())).is_err());
+    }
 }

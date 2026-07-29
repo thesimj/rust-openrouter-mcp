@@ -85,22 +85,15 @@ impl InputReference {
     }
 }
 
+/// The submit ack. Everything else it returns (`polling_url`, `status`) is
+/// ignored: we poll by id.
 #[derive(Debug, Deserialize)]
 pub struct VideoSubmitResponse {
     pub id: String,
-    // Captured for completeness; we poll by id rather than following these.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub polling_url: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct VideoPollResponse {
-    #[allow(dead_code)]
-    pub id: String,
     #[serde(default)]
     pub generation_id: Option<String>,
     pub status: String,
@@ -114,10 +107,6 @@ pub struct VideoPollResponse {
 pub struct VideoUsage {
     #[serde(default)]
     pub cost: Option<f64>,
-    // Parsed defensively; not surfaced today.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub is_byok: Option<bool>,
 }
 
 #[cfg(test)]

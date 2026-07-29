@@ -3,7 +3,7 @@
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     service::RequestContext,
     tool, tool_router,
 };
@@ -117,7 +117,7 @@ impl OpenRouterServer {
 
         let body = serde_json::to_string_pretty(&body)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -138,7 +138,7 @@ impl OpenRouterServer {
         let snapshot = self.stats.snapshot().await;
         let body = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -164,7 +164,7 @@ impl OpenRouterServer {
             ));
         }
         self.stats.reset().await;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "usage stats reset".to_string(),
         )]))
     }

@@ -21,9 +21,7 @@ pub(crate) struct ModelCapsCache {
 
 impl ModelCapsCache {
     pub(crate) fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     /// The cached input modalities for `model`, if it was looked up before.

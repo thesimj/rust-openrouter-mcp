@@ -67,6 +67,21 @@ pub(in crate::openrouter) fn content_type(resp: &reqwest::Response, default: &st
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Most characters of an upstream error body kept in an error message. A JSON
+/// provider error is well under this; a proxy's HTML error page is not, and these
+/// errors surface in an MCP tool result, so an unbounded body would dump the whole
+/// page into the caller's context.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// Bound an upstream error body to [`MAX_ERROR_BODY_CHARS`], marking a cut.
+fn truncate_error_body(mut body: String) -> String {
+    if let Some((cut, _)) = body.char_indices().nth(MAX_ERROR_BODY_CHARS) {
+        body.truncate(cut);
+        body.push_str("... [truncated]");
+    }
+    body
+}
+
 impl OpenRouterClient {
     /// Build a client, reading the key from `OPENROUTER_API_KEY`.
     pub fn from_env() -> Result<Self> {
@@ -91,25 +106,39 @@ impl OpenRouterClient {
     }
 
     /// Send a prepared request, surfacing the verbatim upstream error body on a
-    /// non-2xx status. `context_label` is the human-readable endpoint label used
-    /// in the transport-failure context; `bail_label` is the path rendered in
-    /// the non-success error string.
+    /// non-2xx status (OpenRouter wraps provider errors there, so discarding it
+    /// loses the only useful diagnostic). `label` is the endpoint path rendered
+    /// in both the transport-failure context and the non-success error.
     pub(in crate::openrouter) async fn send_checked(
         &self,
         rb: reqwest::RequestBuilder,
-        context_label: &str,
-        bail_label: &str,
+        label: &str,
     ) -> Result<reqwest::Response> {
         let resp = rb
             .send()
             .await
-            .with_context(|| format!("request to OpenRouter {context_label} failed"))?;
+            .with_context(|| format!("request to OpenRouter {label} failed"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenRouter {bail_label} returned {status}: {body}");
+            let body = truncate_error_body(resp.text().await.unwrap_or_default());
+            anyhow::bail!("OpenRouter {label} returned {status}: {body}");
         }
         Ok(resp)
+    }
+
+    /// [`send_checked`](Self::send_checked) plus JSON decoding, deriving the
+    /// decode-failure context from the same `label`. The endpoints that need the
+    /// raw response first (a header or the body bytes) call `send_checked`.
+    pub(in crate::openrouter) async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+        label: &str,
+    ) -> Result<T> {
+        self.send_checked(rb, label)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("failed to decode OpenRouter {label} response"))
     }
 }
 
@@ -150,6 +179,23 @@ pub fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_error_body_bounds_long_bodies_only() {
+        // A normal provider error passes through untouched.
+        let short = r#"{"error":"unsupported model"}"#;
+        assert_eq!(truncate_error_body(short.to_string()), short);
+
+        // An HTML error page is cut to the cap, and says so.
+        let long = "x".repeat(MAX_ERROR_BODY_CHARS * 3);
+        let cut = truncate_error_body(long);
+        assert!(cut.starts_with(&"x".repeat(MAX_ERROR_BODY_CHARS)));
+        assert!(cut.ends_with("... [truncated]"));
+
+        // Cutting mid-multibyte-character must not panic or split a char.
+        let wide = "é".repeat(MAX_ERROR_BODY_CHARS * 2);
+        assert!(truncate_error_body(wide).starts_with(&"é".repeat(MAX_ERROR_BODY_CHARS)));
+    }
 
     /// Build `n` placeholder models with ids `model-0`, `model-1`, ... so list
     /// filtering/truncation can be exercised without hitting the network.

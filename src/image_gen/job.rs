@@ -122,11 +122,6 @@ pub fn variant_output_path(
     in_parent_of(base, format!("{}-var-{marker}.{ext}", base_stem(base)))
 }
 
-/// Sidecar manifest path next to the outputs: `<stem>.manifest.json`.
-pub fn manifest_path(base: &Path) -> PathBuf {
-    in_parent_of(base, format!("{}.manifest.json", base_stem(base)))
-}
-
 /// One saved image in a job's lean summary.
 pub struct ImageSummary {
     pub path: PathBuf,
@@ -275,9 +270,9 @@ pub async fn run_job(
         input_images,
         variants: variant_metas,
     };
-    let mpath = manifest_path(base_output);
+    let mpath = manifest::path(base_output);
     // A manifest-write failure must not discard already-saved images / spend.
-    if let Err(e) = manifest::write(&mpath, &manifest) {
+    if let Err(e) = manifest::write(&mpath, &manifest).await {
         errors.push(format!("manifest write failed: {e}"));
     }
 
@@ -325,7 +320,7 @@ mod tests {
     #[test]
     fn manifest_path_is_stem_dot_manifest_json() {
         assert_eq!(
-            manifest_path(Path::new("out/hero.png")),
+            crate::manifest::path(Path::new("out/hero.png")),
             PathBuf::from("out/hero.manifest.json")
         );
     }

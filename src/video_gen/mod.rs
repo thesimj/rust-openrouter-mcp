@@ -6,9 +6,7 @@
 //! endpoint. Frame images (first/last) and reference images are reused from the
 //! image input pipeline (normalized to PNG data URLs).
 
-use std::path::{Path, PathBuf};
-
-use crate::image_gen;
+use std::path::PathBuf;
 
 mod job;
 
@@ -48,33 +46,22 @@ pub struct VideoGenRequest {
     pub poll_timeout_secs: u64,
 }
 
-/// Resolve a poll setting (seconds): explicit value, else `env_key`, else
+/// Parse a poll setting (seconds) from a raw env value, falling back to
 /// `default`; floored at 1 so a zero never busy-loops.
-fn resolve_secs(explicit: Option<u64>, env_key: &str, default: u64) -> u64 {
-    explicit
-        .or_else(|| std::env::var(env_key).ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(default)
-        .max(1)
+fn parse_secs(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(default).max(1)
 }
 
-/// Resolve the poll interval: explicit value, else `OPENROUTER_VIDEO_POLL_INTERVAL`,
-/// else [`DEFAULT_POLL_INTERVAL_SECS`].
-pub fn resolve_poll_interval(explicit: Option<u64>) -> u64 {
-    resolve_secs(
-        explicit,
-        "OPENROUTER_VIDEO_POLL_INTERVAL",
-        DEFAULT_POLL_INTERVAL_SECS,
-    )
+/// Poll interval: `OPENROUTER_VIDEO_POLL_INTERVAL`, else [`DEFAULT_POLL_INTERVAL_SECS`].
+pub fn resolve_poll_interval() -> u64 {
+    let raw = std::env::var("OPENROUTER_VIDEO_POLL_INTERVAL").ok();
+    parse_secs(raw.as_deref(), DEFAULT_POLL_INTERVAL_SECS)
 }
 
-/// Resolve the poll timeout: explicit value, else `OPENROUTER_VIDEO_POLL_TIMEOUT`,
-/// else [`DEFAULT_POLL_TIMEOUT_SECS`].
-pub fn resolve_poll_timeout(explicit: Option<u64>) -> u64 {
-    resolve_secs(
-        explicit,
-        "OPENROUTER_VIDEO_POLL_TIMEOUT",
-        DEFAULT_POLL_TIMEOUT_SECS,
-    )
+/// Poll timeout: `OPENROUTER_VIDEO_POLL_TIMEOUT`, else [`DEFAULT_POLL_TIMEOUT_SECS`].
+pub fn resolve_poll_timeout() -> u64 {
+    let raw = std::env::var("OPENROUTER_VIDEO_POLL_TIMEOUT").ok();
+    parse_secs(raw.as_deref(), DEFAULT_POLL_TIMEOUT_SECS)
 }
 
 /// One saved clip in a job's lean summary.
@@ -86,9 +73,6 @@ pub struct VideoSummary {
     pub has_audio: bool,
     pub mime: String,
     pub cost: Option<f64>,
-    /// OpenRouter generation id, recorded in the manifest.
-    #[allow(dead_code)]
-    pub generation_id: Option<String>,
 }
 
 /// Result of a full video job: the saved clips, the manifest path, plus warnings
@@ -101,20 +85,15 @@ pub struct VideoJobSummary {
     pub errors: Vec<String>,
 }
 
-/// Sidecar manifest path next to the outputs: `<stem>.manifest.json`.
-pub fn manifest_path(base: &Path) -> PathBuf {
-    image_gen::manifest_path(base)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn resolve_poll_interval_and_timeout_default_and_floor_at_one() {
-        assert_eq!(resolve_poll_interval(Some(9)), 9);
-        assert_eq!(resolve_poll_interval(Some(0)), 1, "floors at 1");
-        assert_eq!(resolve_poll_timeout(Some(120)), 120);
-        assert_eq!(resolve_poll_timeout(Some(0)), 1, "floors at 1");
+    fn parse_secs_defaults_and_floors_at_one() {
+        assert_eq!(parse_secs(None, 5), 5, "unset -> default");
+        assert_eq!(parse_secs(Some("9"), 5), 9);
+        assert_eq!(parse_secs(Some("0"), 5), 1, "floors at 1, never busy-loops");
+        assert_eq!(parse_secs(Some("nope"), 5), 5, "garbage -> default");
     }
 }

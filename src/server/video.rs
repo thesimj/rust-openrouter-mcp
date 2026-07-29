@@ -181,8 +181,8 @@ impl OpenRouterServer {
             frames,
             references: args.reference_images.iter().map(PathBuf::from).collect(),
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
-            poll_interval_secs: video_gen::resolve_poll_interval(None),
-            poll_timeout_secs: video_gen::resolve_poll_timeout(None),
+            poll_interval_secs: video_gen::resolve_poll_interval(),
+            poll_timeout_secs: video_gen::resolve_poll_timeout(),
         };
 
         let wait = args

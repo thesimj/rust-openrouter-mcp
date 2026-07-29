@@ -1,7 +1,7 @@
-//! Shared chat-completion (text in -> text out) used by both the
-//! `chat_completion` MCP tool and the `chat` CLI subcommand, so the request
-//! envelope and response extraction live in one place (mirrors
-//! [`crate::image_gen::describe_image`]).
+//! Shared chat-completion (text/vision in -> text out): the single place the
+//! `/chat/completions` request envelope is built and its response extracted.
+//! Used by the `chat_completion` MCP tool, the `chat` CLI subcommand, and
+//! [`crate::image_gen::describe_image`], which delegates here.
 
 use anyhow::{Context, Result};
 
@@ -44,19 +44,21 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
     let user_content = if inputs.images.is_empty() {
         Content::Text(inputs.prompt.to_string())
     } else {
-        // Multimodal user message: the prompt text verbatim, then each normalized
-        // input image. Built here rather than via image_gen::build_content so the
-        // chat prompt isn't wrapped in that path's image-editing "Reference
-        // images:" preamble, which doesn't belong in a Q&A chat.
+        // Multimodal user message: `prompt` verbatim, then each normalized input
+        // image. Callers wanting the labeled-reference preamble (image_gen's
+        // "Reference images:" block) apply `assemble_prompt` themselves - it does
+        // not belong in a plain Q&A chat.
         let prepared =
             image_gen::prepare_inputs_async(inputs.images, inputs.max_image_dimension).await?;
         let mut parts = vec![ContentPart::Text {
             text: inputs.prompt.to_string(),
         }];
-        for input in &prepared {
+        // `into_iter`: each data_url is a base64 PNG (hundreds of KB), so move it
+        // into the request rather than cloning every input image.
+        for input in prepared {
             parts.push(ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: input.data_url.clone(),
+                    url: input.data_url,
                 },
             });
         }
@@ -78,10 +80,9 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         stream: false,
     };
 
-    let resp = client.chat_completion(&req).await?;
-    let cost = resp.completion.usage.and_then(|u| u.cost);
-    let choice = resp
-        .completion
+    let completion = client.chat_completion(&req).await?;
+    let cost = completion.usage.and_then(|u| u.cost);
+    let choice = completion
         .choices
         .into_iter()
         .next()
@@ -95,7 +96,7 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
                 "model returned no text".to_string()
             } else {
                 "model returned no text (it may be an image-output-only model; \
-                 chat_completion needs a model with text output)"
+                 use one with text output)"
                     .to_string()
             }
         })?;

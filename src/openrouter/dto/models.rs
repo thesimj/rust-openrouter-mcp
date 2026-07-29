@@ -4,8 +4,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Server-side query parameters for `GET /api/v1/models`. Every field is
-/// optional; `None`/empty fields are omitted from the request.
-#[derive(Debug, Default)]
+/// optional; `None` fields are omitted from the query string by serde_urlencoded
+/// (which reqwest's `.query()` uses).
+#[derive(Debug, Default, Serialize)]
 pub struct ModelsQuery {
     /// Free-text search by model name or slug (`q`).
     pub q: Option<String>,
@@ -19,31 +20,6 @@ pub struct ModelsQuery {
     pub sort: Option<String>,
     /// Minimum context length in tokens.
     pub context: Option<u64>,
-}
-
-impl ModelsQuery {
-    pub(crate) fn to_pairs(&self) -> Vec<(&'static str, String)> {
-        let mut pairs = Vec::new();
-        if let Some(v) = &self.q {
-            pairs.push(("q", v.clone()));
-        }
-        if let Some(v) = &self.output_modalities {
-            pairs.push(("output_modalities", v.clone()));
-        }
-        if let Some(v) = &self.input_modalities {
-            pairs.push(("input_modalities", v.clone()));
-        }
-        if let Some(v) = &self.supported_parameters {
-            pairs.push(("supported_parameters", v.clone()));
-        }
-        if let Some(v) = &self.sort {
-            pairs.push(("sort", v.clone()));
-        }
-        if let Some(v) = &self.context {
-            pairs.push(("context", v.to_string()));
-        }
-        pairs
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,29 +116,6 @@ pub struct Pricing {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn query_pairs_omit_empty_fields_and_keep_expected_names() {
-        let query = ModelsQuery {
-            q: Some("openai".to_string()),
-            output_modalities: Some("image,text".to_string()),
-            input_modalities: None,
-            supported_parameters: Some("tools".to_string()),
-            sort: Some("newest".to_string()),
-            context: Some(128_000),
-        };
-
-        assert_eq!(
-            query.to_pairs(),
-            vec![
-                ("q", "openai".to_string()),
-                ("output_modalities", "image,text".to_string()),
-                ("supported_parameters", "tools".to_string()),
-                ("sort", "newest".to_string()),
-                ("context", "128000".to_string()),
-            ]
-        );
-    }
 
     #[test]
     fn matches_search_checks_id_name_and_description_case_insensitively() {

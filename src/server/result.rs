@@ -4,7 +4,7 @@
 use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
-    model::{CallToolResult, Content, RawResource},
+    model::{CallToolResult, ContentBlock, Resource},
     service::RequestContext,
 };
 use serde_json::json;
@@ -84,13 +84,13 @@ fn envelope_video_paths(env: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build a `ResourceLink` content block for each generated clip path. rmcp 1.7
-/// has no native video content block, so a sandboxed client gets a `file://`
+/// Build a `ResourceLink` content block for each generated clip path. rmcp has
+/// no native video content block, so a sandboxed client gets a `file://`
 /// ResourceLink (mime video/mp4, size from the file) rather than an embedded
 /// blob; the path is also in the JSON text block. Capped at [`MAX_INLINE_MEDIA`].
 ///
 /// Blocking: does a filesystem stat per path - run via `spawn_blocking`.
-fn video_resource_link_blocks(paths: &[String]) -> Vec<Content> {
+fn video_resource_link_blocks(paths: &[String]) -> Vec<ContentBlock> {
     paths
         .iter()
         .take(MAX_INLINE_MEDIA)
@@ -99,10 +99,12 @@ fn video_resource_link_blocks(paths: &[String]) -> Vec<Content> {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.clone());
-            let mut r = RawResource::new(format!("file://{path}"), name);
-            r.mime_type = Some("video/mp4".to_string());
-            r.size = std::fs::metadata(path).ok().map(|m| m.len() as u32);
-            Content::resource_link(r)
+            let mut resource =
+                Resource::new(format!("file://{path}"), name).with_mime_type("video/mp4");
+            if let Ok(meta) = std::fs::metadata(path) {
+                resource = resource.with_size(meta.len());
+            }
+            ContentBlock::resource_link(resource)
         })
         .collect()
 }
@@ -111,8 +113,7 @@ fn video_resource_link_blocks(paths: &[String]) -> Vec<Content> {
 /// can be sent inline verbatim without a decode/resize/re-encode round-trip.
 /// [`crate::image_io::decode_dimensions`] only reads the header, so this is cheap.
 fn is_png_within_bound(bytes: &[u8], max_side: u32) -> bool {
-    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    bytes.starts_with(&PNG_MAGIC)
+    crate::image_io::sniff_mime(bytes) == Some("image/png")
         && crate::image_io::decode_dimensions(bytes)
             .map(|(w, h)| w <= max_side && h <= max_side)
             .unwrap_or(false)
@@ -127,7 +128,7 @@ fn is_png_within_bound(bytes: &[u8], max_side: u32) -> bool {
 ///
 /// Blocking: does disk I/O and image decode/encode - run it via `spawn_blocking`,
 /// never directly on the async runtime.
-fn encode_preview_blocks(paths: &[String]) -> Vec<Content> {
+fn encode_preview_blocks(paths: &[String]) -> Vec<ContentBlock> {
     paths
         .iter()
         .take(MAX_INLINE_PREVIEWS)
@@ -139,7 +140,7 @@ fn encode_preview_blocks(paths: &[String]) -> Vec<Content> {
                 crate::image_io::normalize_to_png(&bytes, PREVIEW_MAX_SIDE).ok()?
             };
             let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-            Some(Content::image(b64, "image/png".to_string()))
+            Some(ContentBlock::image(b64, "image/png".to_string()))
         })
         .collect()
 }
@@ -183,7 +184,7 @@ pub(crate) async fn job_call_result(
 ) -> Result<CallToolResult, ErrorData> {
     let body = serde_json::to_string_pretty(env)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-    let mut blocks = vec![Content::text(body)];
+    let mut blocks = vec![ContentBlock::text(body)];
 
     if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
         match env.get("kind").and_then(|k| k.as_str()) {
@@ -208,7 +209,7 @@ pub(crate) async fn job_call_result(
                 let shown = previews.len();
                 blocks.extend(previews);
                 if total > MAX_INLINE_PREVIEWS {
-                    blocks.push(Content::text(format!(
+                    blocks.push(ContentBlock::text(format!(
                         "note: showing {shown} of {total} generated images inline (capped at \
                          {MAX_INLINE_PREVIEWS}); every image is saved to disk at the paths above."
                     )));
@@ -264,7 +265,13 @@ impl OpenRouterServer {
         F: FnOnce(OpenRouterClientCtx) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = JobOutcome> + Send + 'static,
     {
-        let task_id = uuid::Uuid::now_v7().to_string();
+        // Task ids never leave this process and are dropped on restart, so a
+        // monotonic counter is as unique as it needs to be.
+        static NEXT_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let task_id = format!(
+            "task-{}",
+            NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         self.tasks.insert_pending(&task_id, kind).await;
 
         let ctx = OpenRouterClientCtx {

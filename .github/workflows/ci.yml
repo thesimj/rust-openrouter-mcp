@@ -45,3 +45,31 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # The declared `rust-version` is a promise to anyone running `cargo install`:
+  # cargo refuses the build outright on an older toolchain. The `check` job above
+  # runs on stable and so can never catch the floor drifting upward, which is how
+  # a stale MSRV goes unnoticed until a user reports it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build tests too: a dev-dependency or test-only construct can raise the
+      # real floor just as easily as library code.
+      - name: Check at the declared MSRV
+        run: cargo check --all-targets --locked

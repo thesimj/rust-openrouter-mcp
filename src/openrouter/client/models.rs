@@ -32,21 +32,12 @@ impl OpenRouterClient {
     /// `query` carries OpenRouter's server-side filters (modalities, sort,
     /// free-text, price/context bounds, ...) so the API does the filtering.
     pub async fn list_models(&self, query: &ModelsQuery) -> Result<Vec<Model>> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/models", self.base_url))
             .bearer_auth(&self.api_key)
-            .query(&query.to_pairs())
-            .send()
-            .await
-            .context("request to OpenRouter /models failed")?
-            .error_for_status()
-            .context("OpenRouter /models returned an error status")?;
-
-        let parsed: ModelsResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /models response")?;
+            .query(query);
+        let parsed: ModelsResponse = self.send_json(rb, "/models").await?;
         Ok(parsed.data)
     }
 
@@ -57,20 +48,13 @@ impl OpenRouterClient {
     /// OpenRouter reports without a hand-maintained schema. `model_id` is the
     /// `author/slug` id (e.g. "anthropic/claude-opus-4.7").
     pub async fn describe_model(&self, model_id: &str) -> Result<Value> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/models/{}/endpoints", self.base_url, model_id))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request to OpenRouter /models/{id}/endpoints failed")?
-            .error_for_status()
-            .context("OpenRouter /models/{id}/endpoints returned an error status")?;
-
-        let mut body: Value = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter model-endpoints response")?;
+            .bearer_auth(&self.api_key);
+        let mut body: Value = self
+            .send_json(rb, &format!("/models/{model_id}/endpoints"))
+            .await?;
         // Unwrap the `data` envelope (model + endpoints) when present.
         Ok(body.get_mut("data").map(Value::take).unwrap_or(body))
     }
@@ -81,20 +65,11 @@ impl OpenRouterClient {
     /// supported resolutions/durations/sizes - none of which appears in the
     /// token-based `/models` pricing object (which is `0` for video).
     pub async fn video_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/videos/models", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request to OpenRouter /videos/models failed")?
-            .error_for_status()
-            .context("OpenRouter /videos/models returned an error status")?;
-
-        let body: Value = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /videos/models response")?;
+            .bearer_auth(&self.api_key);
+        let body: Value = self.send_json(rb, "/videos/models").await?;
         let found = body.get("data").and_then(Value::as_array).and_then(|arr| {
             arr.iter()
                 .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
@@ -107,7 +82,7 @@ impl OpenRouterClient {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{ModelsQuery, OpenRouterClient};
@@ -117,8 +92,15 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
+            // Every set field reaches the wire under its API name, with the
+            // integer rendered as a plain decimal...
             .and(query_param("q", "openai"))
             .and(query_param("sort", "newest"))
+            .and(query_param("output_modalities", "image,text"))
+            .and(query_param("supported_parameters", "tools"))
+            .and(query_param("context", "128000"))
+            // ...and `None` fields are omitted rather than sent empty.
+            .and(query_param_is_missing("input_modalities"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [
                     {"id": "openai/gpt", "name": "GPT", "context_length": 128000}
@@ -131,7 +113,10 @@ mod tests {
         let query = ModelsQuery {
             q: Some("openai".to_string()),
             sort: Some("newest".to_string()),
-            ..Default::default()
+            output_modalities: Some("image,text".to_string()),
+            supported_parameters: Some("tools".to_string()),
+            context: Some(128_000),
+            input_modalities: None,
         };
         let models = client.list_models(&query).await.unwrap();
         assert_eq!(models.len(), 1);
@@ -153,7 +138,7 @@ mod tests {
             .list_models(&ModelsQuery::default())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("error status"));
+        assert!(err.to_string().contains("401"), "got: {err}");
     }
 
     #[tokio::test]
@@ -234,6 +219,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let err = client.describe_model("foo/bar").await.unwrap_err();
-        assert!(err.to_string().contains("error status"));
+        assert!(err.to_string().contains("404"), "got: {err}");
     }
 }

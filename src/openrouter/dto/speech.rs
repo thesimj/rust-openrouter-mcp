@@ -1,6 +1,7 @@
-//! DTOs for `POST /api/v1/audio/speech` (synchronous text-to-speech).
+//! DTOs for the synchronous audio endpoints: `POST /api/v1/audio/speech`
+//! (text-to-speech) and `POST /api/v1/audio/transcriptions` (speech-to-text).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Request body for `POST /api/v1/audio/speech`. `response_format`/`speed` are
 /// omitted when unset.
@@ -21,4 +22,40 @@ pub struct SpeechResult {
     pub mime: String,
     pub bytes: Vec<u8>,
     pub generation_id: Option<String>,
+}
+
+/// Request body for `POST /api/v1/audio/transcriptions` in its JSON form.
+/// (The endpoint also accepts OpenAI-style multipart; JSON keeps one code path.)
+#[derive(Debug, Serialize)]
+pub struct TranscriptionBody {
+    pub model: String,
+    pub input_audio: InputAudio,
+    /// ISO-639-1 hint (e.g. "en", "ja"); improves accuracy when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Inline audio payload. `data` is **raw** base64 - a `data:` URL prefix is
+/// rejected upstream - and `format` is required so the model can decode it.
+#[derive(Debug, Serialize)]
+pub struct InputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+/// Response from `POST /api/v1/audio/transcriptions`.
+#[derive(Debug, Deserialize)]
+pub struct TranscriptionResponse {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub usage: Option<TranscriptionUsage>,
+}
+
+/// Transcription usage. Upstream also reports `seconds`/`tokens`; only the cost
+/// is surfaced (it feeds the usage stats), so the rest is ignored.
+#[derive(Debug, Deserialize)]
+pub struct TranscriptionUsage {
+    #[serde(default)]
+    pub cost: Option<f64>,
 }

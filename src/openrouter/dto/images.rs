@@ -33,10 +33,6 @@ pub struct ImagesRequest {
 /// Response from `POST /api/v1/images`.
 #[derive(Debug, Deserialize)]
 pub struct ImagesResponse {
-    // Unix timestamp; captured for completeness, not surfaced today.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub created: Option<i64>,
     #[serde(default)]
     pub data: Vec<ImageData>,
     #[serde(default)]

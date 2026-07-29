@@ -1,16 +1,120 @@
-//! Text-to-speech orchestration over the synchronous OpenRouter speech API.
+//! Audio orchestration over the synchronous OpenRouter audio APIs: text-to-speech
+//! (`POST /api/v1/audio/speech`) and transcription
+//! (`POST /api/v1/audio/transcriptions`).
 //!
-//! Unlike video generation (async job API), `POST /api/v1/audio/speech` returns
-//! the raw audio bytes in one fast call - so this mirrors the synchronous
-//! `describe_image` path (no task registry): one call, save the file, write a
-//! sidecar manifest, return a lean result.
+//! Unlike video generation (async job API), both return in one fast call - so
+//! these mirror the synchronous `describe_image` path (no task registry).
+//! Speech saves a file plus a sidecar manifest; transcription just returns text.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use base64::Engine;
 
 use crate::manifest::{self, AudioManifest, AudioOutputMeta};
-use crate::openrouter::{OpenRouterClient, SpeechBody};
+use crate::openrouter::{InputAudio, OpenRouterClient, SpeechBody, TranscriptionBody};
+
+/// Audio container formats the transcription endpoint accepts, as the
+/// `input_audio.format` values it expects. Keyed by file extension - which is
+/// the same string for every format we support.
+const TRANSCRIBE_FORMATS: [&str; 7] = ["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"];
+
+/// Largest audio payload the transcription endpoint accepts (25 MB). Checked
+/// before upload so an oversized file fails locally with a clear message rather
+/// than after a long transfer.
+const MAX_TRANSCRIBE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// The `input_audio.format` value for a file extension, if it is one the
+/// endpoint accepts. Case-insensitive.
+fn transcribe_format(ext: &str) -> Option<&'static str> {
+    let ext = ext.to_ascii_lowercase();
+    TRANSCRIBE_FORMATS.into_iter().find(|f| *f == ext)
+}
+
+/// Inputs for one transcription request.
+#[derive(Debug, Clone)]
+pub struct TranscribeRequest {
+    pub model: String,
+    /// Raw base64 audio bytes (no `data:` prefix - upstream rejects those).
+    pub data: String,
+    /// Container format: one of [`TRANSCRIBE_FORMATS`].
+    pub format: String,
+    /// Optional ISO-639-1 language hint (e.g. "en").
+    pub language: Option<String>,
+}
+
+/// A transcript plus the reported USD cost, when present.
+pub struct TranscribeResult {
+    pub text: String,
+    pub cost: Option<f64>,
+}
+
+/// Read a local audio file into `(base64, format)` for [`TranscribeRequest`],
+/// deriving the format from the file extension and enforcing the upstream size
+/// cap. `format_override` wins when the extension is absent or misleading.
+pub async fn read_audio_file(
+    path: &Path,
+    format_override: Option<&str>,
+) -> Result<(String, String)> {
+    let format = match format_override {
+        Some(f) => {
+            transcribe_format(f).with_context(|| format!("unsupported audio format {f:?}"))?
+        }
+        None => {
+            let ext = path.extension().unwrap_or_default().to_string_lossy();
+            transcribe_format(&ext).with_context(|| {
+                format!(
+                    "could not infer the audio format from {}; pass format explicitly (one of: {})",
+                    path.display(),
+                    TRANSCRIBE_FORMATS.join(", ")
+                )
+            })?
+        }
+    };
+
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("could not read audio file {}", path.display()))?
+        .len();
+    if size > MAX_TRANSCRIBE_BYTES {
+        bail!(
+            "audio file is {size} bytes; the transcription endpoint accepts at most \
+             {MAX_TRANSCRIBE_BYTES}"
+        );
+    }
+
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("could not read audio file {}", path.display()))?;
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        format.to_string(),
+    ))
+}
+
+/// Transcribe audio to text. Requires already-encoded base64 `data` (see
+/// [`read_audio_file`]) so the caller decides where the bytes came from.
+pub async fn transcribe(
+    client: &OpenRouterClient,
+    req: &TranscribeRequest,
+) -> Result<TranscribeResult> {
+    let body = TranscriptionBody {
+        model: req.model.clone(),
+        input_audio: InputAudio {
+            data: req.data.clone(),
+            format: req.format.clone(),
+        },
+        language: req.language.clone(),
+    };
+    let resp = client.transcribe(&body).await?;
+    if resp.text.trim().is_empty() {
+        bail!("model returned an empty transcript");
+    }
+    Ok(TranscribeResult {
+        text: resp.text,
+        cost: resp.usage.and_then(|u| u.cost),
+    })
+}
 
 /// Inputs for a single text-to-speech request (domain struct; the wire body is
 /// [`openrouter::SpeechBody`]).
@@ -30,12 +134,6 @@ pub struct AudioSummary {
     pub mime: String,
     pub voice: String,
     pub response_format: String,
-    /// `/audio/speech` does not return inline usage.cost, so this is always `None`.
-    #[allow(dead_code)]
-    pub cost: Option<f64>,
-    /// OpenRouter generation id, recorded in the manifest.
-    #[allow(dead_code)]
-    pub generation_id: Option<String>,
 }
 
 /// Result of a TTS job: the saved file plus any non-fatal warnings (e.g. a
@@ -63,11 +161,6 @@ fn extension_for(mime: &str, response_format: &str) -> &'static str {
             _ => "mp3",
         },
     }
-}
-
-/// Sidecar manifest path next to the output: `<stem>.manifest.json`.
-pub fn manifest_path(base: &Path) -> PathBuf {
-    crate::image_gen::manifest_path(base)
 }
 
 /// Run a TTS job: synthesize the speech, save the bytes (extension from the
@@ -113,12 +206,12 @@ pub async fn run_job(
         output: AudioOutputMeta {
             path: Some(path.to_string_lossy().into_owned()),
             mime_type: Some(result.mime.clone()),
-            generation_id: result.generation_id.clone(),
+            generation_id: result.generation_id,
             error: None,
         },
     };
-    let mpath = manifest_path(output);
-    if let Err(e) = manifest::write_audio(&mpath, &manifest) {
+    let mpath = manifest::path(output);
+    if let Err(e) = manifest::write(&mpath, &manifest).await {
         warnings.push(format!("manifest write failed: {e}"));
     }
 
@@ -130,8 +223,6 @@ pub async fn run_job(
             mime: result.mime,
             voice: req.voice.clone(),
             response_format,
-            cost: None,
-            generation_id: result.generation_id,
         },
         warnings,
     })

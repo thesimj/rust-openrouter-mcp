@@ -38,6 +38,8 @@ per-process usage - all behind one `openrouter-mcp` executable.
   **Asynchronous**: returns a `task_id`; poll `get_result` for the hosted clip.
 - **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
+- **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
+  model; audio by local `path` or inline `base64`, optional language hint.
 - **Image description** - `describe_image`: image -> detailed text via any
   vision-capable model (image input, text output).
 - **Chat completion** - `chat_completion`: send a prompt to any OpenRouter
@@ -201,6 +203,7 @@ block is optional.
 | `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
+| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB), optional ISO-639-1 `language`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
 | `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
 | `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
@@ -293,6 +296,13 @@ Generate speech (text-to-speech):
 openrouter-mcp audio \
   --model openai/gpt-4o-mini-tts --voice alloy \
   --input "Hello from OpenRouter." --output ./out/hello.mp3
+```
+
+Transcribe audio (speech-to-text):
+
+```bash
+openrouter-mcp transcribe \
+  --model openai/gpt-4o-mini-transcribe --file ./out/hello.mp3 --language en
 ```
 
 ## Development

@@ -4,7 +4,7 @@
 //! per-variant output details (including failures), so the lean tool response
 //! can stay minimal while the complete record lives on disk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -77,18 +77,24 @@ pub struct VariantMeta {
     pub error: Option<String>,
 }
 
-/// Serialize `value` as pretty JSON and write it to `path`. Shared by all
-/// manifest writers so the serialize+write+error wrapping stays in one place.
-fn write_value(path: &Path, value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_string_pretty(value).context("could not serialize manifest")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("could not write manifest {}", path.display()))?;
-    Ok(())
+/// Sidecar manifest path next to the outputs: `<stem>.manifest.json`. Shared by
+/// the image, video, and audio jobs.
+pub fn path(base: &Path) -> PathBuf {
+    crate::image_gen::in_parent_of(
+        base,
+        format!("{}.manifest.json", crate::image_gen::base_stem(base)),
+    )
 }
 
-/// Write the image manifest as pretty JSON to `path`.
-pub fn write(path: &Path, manifest: &Manifest) -> Result<()> {
-    write_value(path, manifest)
+/// Serialize a manifest ([`Manifest`], [`VideoManifest`], or [`AudioManifest`])
+/// as pretty JSON and write it to `path`. Async: this runs on job-completion
+/// paths that share a Tokio worker with concurrent `get_result` polls.
+pub async fn write(path: &Path, manifest: &impl Serialize) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest).context("could not serialize manifest")?;
+    tokio::fs::write(path, json)
+        .await
+        .with_context(|| format!("could not write manifest {}", path.display()))?;
+    Ok(())
 }
 
 /// The complete record for one video-generation job.
@@ -152,11 +158,6 @@ pub struct VideoClipMeta {
     pub error: Option<String>,
 }
 
-/// Write the video manifest as pretty JSON to `path`.
-pub fn write_video(path: &Path, manifest: &VideoManifest) -> Result<()> {
-    write_value(path, manifest)
-}
-
 /// The complete record for one text-to-speech job.
 #[derive(Debug, Serialize)]
 pub struct AudioManifest {
@@ -184,9 +185,4 @@ pub struct AudioOutputMeta {
     pub generation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Write the audio manifest as pretty JSON to `path`.
-pub fn write_audio(path: &Path, manifest: &AudioManifest) -> Result<()> {
-    write_value(path, manifest)
 }

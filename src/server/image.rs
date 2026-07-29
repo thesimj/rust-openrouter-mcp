@@ -7,7 +7,7 @@ use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     service::RequestContext,
     tool, tool_router,
 };
@@ -485,7 +485,9 @@ impl OpenRouterServer {
         match image_gen::describe_image(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                Ok(CallToolResult::success(vec![Content::text(result.text)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    result.text,
+                )]))
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;

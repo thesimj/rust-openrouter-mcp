@@ -17,22 +17,14 @@ impl OpenRouterClient {
         &self,
         req: &ImagesRequest,
     ) -> Result<(ImagesResponse, Option<String>)> {
-        let resp = self
+        let rb = self
             .http
             .post(format!("{}/images", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(req)
-            .send()
-            .await
-            .context("request to OpenRouter /images failed")?;
+            .json(req);
+        let resp = self.send_checked(rb, "/images").await?;
 
         let generation_id = generation_id(&resp);
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenRouter /images returned {status}: {body}");
-        }
 
         let parsed: ImagesResponse = resp
             .json()

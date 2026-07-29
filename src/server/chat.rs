@@ -3,7 +3,7 @@
 use rmcp::{
     ErrorData,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router,
 };
 use schemars::JsonSchema;
@@ -130,7 +130,9 @@ impl OpenRouterServer {
         {
             Ok(result) => {
                 self.stats.record_text(&args.model, true, result.cost).await;
-                Ok(CallToolResult::success(vec![Content::text(result.text)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    result.text,
+                )]))
             }
             Err(e) => {
                 self.stats.record_text(&args.model, false, None).await;

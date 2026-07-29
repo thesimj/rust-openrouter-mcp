@@ -1,8 +1,12 @@
-//! `POST /api/v1/audio/speech` endpoint (synchronous text-to-speech).
+//! Synchronous audio endpoints: `POST /api/v1/audio/speech` (text-to-speech)
+//! and `POST /api/v1/audio/transcriptions` (speech-to-text).
 
 use anyhow::{Context, Result};
 
-use crate::openrouter::{OpenRouterClient, SpeechBody, SpeechResult, content_type, generation_id};
+use crate::openrouter::{
+    OpenRouterClient, SpeechBody, SpeechResult, TranscriptionBody, TranscriptionResponse,
+    content_type, generation_id,
+};
 
 impl OpenRouterClient {
     /// `POST /api/v1/audio/speech` - synchronous text-to-speech. Returns the raw
@@ -10,22 +14,14 @@ impl OpenRouterClient {
     /// `X-Generation-Id` header when present. On a non-2xx status the upstream
     /// error body is surfaced verbatim.
     pub async fn speech(&self, req: &SpeechBody) -> Result<SpeechResult> {
-        let resp = self
+        let rb = self
             .http
             .post(format!("{}/audio/speech", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(req)
-            .send()
-            .await
-            .context("request to OpenRouter /audio/speech failed")?;
+            .json(req);
+        let resp = self.send_checked(rb, "/audio/speech").await?;
 
         let generation_id = generation_id(&resp);
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenRouter /audio/speech returned {status}: {body}");
-        }
         let mime = content_type(&resp, "audio/mpeg");
         let bytes = resp
             .bytes()
@@ -37,6 +33,17 @@ impl OpenRouterClient {
             bytes,
             generation_id,
         })
+    }
+
+    /// `POST /api/v1/audio/transcriptions` - synchronous speech-to-text.
+    /// Returns the transcript plus the reported usage.
+    pub async fn transcribe(&self, req: &TranscriptionBody) -> Result<TranscriptionResponse> {
+        let rb = self
+            .http
+            .post(format!("{}/audio/transcriptions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(req);
+        self.send_json(rb, "/audio/transcriptions").await
     }
 }
 

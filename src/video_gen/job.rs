@@ -9,7 +9,7 @@ use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
 use crate::openrouter::{FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoSubmitBody};
 
-use super::{VideoGenRequest, VideoJobSummary, VideoSummary, manifest_path};
+use super::{VideoGenRequest, VideoJobSummary, VideoSummary};
 
 /// File extension for a video/audio MIME type. Falls back to `mp4`.
 fn extension_for(mime: &str) -> &'static str {
@@ -203,7 +203,6 @@ pub async fn run_job(
                                 has_audio,
                                 mime,
                                 cost,
-                                generation_id: poll.generation_id.clone(),
                             });
                         }
                         Err(e) => {
@@ -245,8 +244,8 @@ pub async fn run_job(
         input_references: reference_meta,
         clips,
     };
-    let mpath = manifest_path(base_output);
-    if let Err(e) = manifest::write_video(&mpath, &manifest) {
+    let mpath = manifest::path(base_output);
+    if let Err(e) = manifest::write(&mpath, &manifest).await {
         errors.push(format!("manifest write failed: {e}"));
     }
 

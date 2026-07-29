@@ -1,6 +1,6 @@
 //! `GET /api/v1/key` endpoint.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::openrouter::{Credits, CreditsResponse, KeyInfo, KeyInfoResponse, OpenRouterClient};
 
@@ -10,20 +10,11 @@ impl OpenRouterClient {
     /// limit / remaining balance, tier/management flags, and the (deprecated)
     /// rate limit. This is key/account-level info, not the owner's name or email.
     pub async fn get_key_info(&self) -> Result<KeyInfo> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/key", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request to OpenRouter /key failed")?
-            .error_for_status()
-            .context("OpenRouter /key returned an error status")?;
-
-        let parsed: KeyInfoResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /key response")?;
+            .bearer_auth(&self.api_key);
+        let parsed: KeyInfoResponse = self.send_json(rb, "/key").await?;
         Ok(parsed.data)
     }
 
@@ -31,20 +22,11 @@ impl OpenRouterClient {
     /// across every key on the account, not just the one in use. The derived
     /// remaining balance is filled in before returning.
     pub async fn get_credits(&self) -> Result<Credits> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/credits", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request to OpenRouter /credits failed")?
-            .error_for_status()
-            .context("OpenRouter /credits returned an error status")?;
-
-        let parsed: CreditsResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /credits response")?;
+            .bearer_auth(&self.api_key);
+        let parsed: CreditsResponse = self.send_json(rb, "/credits").await?;
         Ok(parsed.data.with_remaining())
     }
 }
@@ -154,6 +136,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "bad-key");
         let err = client.get_key_info().await.unwrap_err();
-        assert!(err.to_string().contains("error status"));
+        assert!(err.to_string().contains("401"), "got: {err}");
     }
 }

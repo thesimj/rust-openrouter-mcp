@@ -11,20 +11,11 @@ impl OpenRouterClient {
     /// `GET /api/v1/videos/models` - video-generation models with `pricing_skus`
     /// (per video-second / per video-token), resolutions, durations, etc.
     pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}/videos/models", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request to OpenRouter /videos/models failed")?
-            .error_for_status()
-            .context("OpenRouter /videos/models returned an error status")?;
-
-        let parsed: VideoModelsResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /videos/models response")?;
+            .bearer_auth(&self.api_key);
+        let parsed: VideoModelsResponse = self.send_json(rb, "/videos/models").await?;
         Ok(parsed.data)
     }
 
@@ -37,12 +28,7 @@ impl OpenRouterClient {
             .post(format!("{}/videos", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let resp = self.send_checked(rb, "/videos", "/videos").await?;
-        let parsed: VideoSubmitResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /videos submit response")?;
-        Ok(parsed)
+        self.send_json(rb, "/videos").await
     }
 
     /// `GET /api/v1/videos/{id}` - poll a submitted video job for its status and,
@@ -52,14 +38,7 @@ impl OpenRouterClient {
             .http
             .get(format!("{}/videos/{job_id}", self.base_url))
             .bearer_auth(&self.api_key);
-        let resp = self
-            .send_checked(rb, "/videos/{id}", &format!("/videos/{job_id}"))
-            .await?;
-        let parsed: VideoPollResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /videos/{id} response")?;
-        Ok(parsed)
+        self.send_json(rb, &format!("/videos/{job_id}")).await
     }
 
     /// `GET /api/v1/videos/{id}/content?index=N` - download one generated clip.
@@ -72,11 +51,7 @@ impl OpenRouterClient {
             .query(&[("index", index.to_string())])
             .bearer_auth(&self.api_key);
         let resp = self
-            .send_checked(
-                rb,
-                "/videos/{id}/content",
-                &format!("/videos/{job_id}/content"),
-            )
+            .send_checked(rb, &format!("/videos/{job_id}/content"))
             .await?;
         let content_type = content_type(&resp, "video/mp4");
         let bytes = resp

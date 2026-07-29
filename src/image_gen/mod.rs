@@ -8,15 +8,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::chat_gen;
 use crate::image_io;
-use crate::openrouter::{
-    ChatRequest, Content, ContentPart, ImageUrl, ImagesRequest, InputReference, Message,
-    OpenRouterClient,
-};
+use crate::openrouter::{ImageUrl, ImagesRequest, InputReference, OpenRouterClient};
 
 pub(crate) mod job;
 
-pub(crate) use job::{JobSummary, base_stem, in_parent_of, manifest_path, run_job};
+pub(crate) use job::{JobSummary, base_stem, in_parent_of, run_job};
 
 /// Default and hard ceiling for the input-image longest-side cap (px). Larger
 /// explicit arguments or env overrides are clamped down to this, so input images
@@ -227,30 +225,6 @@ pub(crate) async fn prepare_inputs_async(
         .context("input image preparation task failed")?
 }
 
-/// Build the message content from already-prepared inputs: a plain string for
-/// text-to-image, or a text-first array of parts (text prompt, then each input
-/// image data URL) for editing / multi-image requests.
-pub(crate) fn build_content(
-    prompt: &str,
-    images: &[InputImage],
-    prepared: &[PreparedInput],
-) -> Content {
-    if prepared.is_empty() {
-        return Content::Text(prompt.to_string());
-    }
-    let mut parts = vec![ContentPart::Text {
-        text: assemble_prompt(prompt, images),
-    }];
-    for input in prepared {
-        parts.push(ContentPart::ImageUrl {
-            image_url: ImageUrl {
-                url: input.data_url.clone(),
-            },
-        });
-    }
-    Content::Parts(parts)
-}
-
 /// Pre-built inputs for one generation, computed once and shared across
 /// variants: the assembled prompt and the reference-image data URLs (sent as
 /// `input_references`). Mirrors the old pre-built `Content`, adapted to the
@@ -355,55 +329,31 @@ pub struct DescribeRequest {
     pub max_image_dimension: u32,
 }
 
-/// The text a vision model returned, plus its cost when reported.
-#[derive(Debug, Clone)]
-pub struct DescribeResult {
-    pub text: String,
-    pub cost: Option<f64>,
-}
-
 /// Describe (or answer a question about) one or more images: sends them with an
 /// instruction to a vision-capable model and returns its text. Requires at least
-/// one input image; this is a plain text-output call (no `modalities`).
+/// one input image; this is a plain text-output vision call over
+/// `/chat/completions`, distinct from the `/images` generation path - so it is
+/// [`chat_gen::complete`] with the labeled-reference preamble prepended.
 pub async fn describe_image(
     client: &OpenRouterClient,
     req: &DescribeRequest,
-) -> Result<DescribeResult> {
+) -> Result<chat_gen::ChatResult> {
     if req.images.is_empty() {
         anyhow::bail!("describe_image requires at least one input image");
     }
-    let prepared = prepare_inputs_async(&req.images, req.max_image_dimension).await?;
-    let content = build_content(&req.prompt, &req.images, &prepared);
-    // Description is a plain text-output vision call over /chat/completions (no
-    // `modalities`/`image_config`), distinct from the /images generation path.
-    let chat = ChatRequest {
-        model: req.model.clone(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content,
-        }],
-        modalities: None,
-        image_config: None,
-        seed: None,
-        temperature: None,
-        max_tokens: None,
-        stream: false,
-    };
-
-    let resp = client.chat_completion(&chat).await?;
-    let cost = resp.completion.usage.and_then(|u| u.cost);
-    let choice = resp
-        .completion
-        .choices
-        .into_iter()
-        .next()
-        .context("OpenRouter returned no choices")?;
-    let text = choice
-        .message
-        .content
-        .filter(|t| !t.is_empty())
-        .context("model returned no text (use a vision-capable model with text output)")?;
-    Ok(DescribeResult { text, cost })
+    chat_gen::complete(
+        client,
+        &chat_gen::ChatInputs {
+            model: &req.model,
+            system: None,
+            prompt: &assemble_prompt(&req.prompt, &req.images),
+            temperature: None,
+            max_tokens: None,
+            images: &req.images,
+            max_image_dimension: req.max_image_dimension,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

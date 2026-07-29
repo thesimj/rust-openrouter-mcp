@@ -3,7 +3,7 @@
 use rmcp::{
     ErrorData,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router,
 };
 use schemars::JsonSchema;
@@ -116,7 +116,7 @@ impl OpenRouterServer {
             );
         }
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -192,7 +192,7 @@ impl OpenRouterServer {
         let json = serde_json::to_string_pretty(&detail)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -323,6 +323,6 @@ mod tests {
             .list_models(Parameters(ListModelsArgs::default()))
             .await
             .unwrap_err();
-        assert!(err.message.contains("error status"));
+        assert!(err.message.contains("500"), "got: {}", err.message);
     }
 }

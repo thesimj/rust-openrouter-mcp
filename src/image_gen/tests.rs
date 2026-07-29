@@ -49,55 +49,24 @@ fn prepare_inputs_rasterizes_svg_to_png_data_url() {
 }
 
 #[test]
-fn build_content_is_plain_text_without_images() {
-    let content = build_content("just text", &[], &[]);
-    let v = serde_json::to_value(&content).unwrap();
-    assert_eq!(v, serde_json::json!("just text"));
+fn assemble_prompt_is_verbatim_without_labels() {
+    // Path-only: assemble_prompt reads labels and file names, never the file.
+    let images = vec![InputImage::from_path("content.png", None)];
+    assert_eq!(assemble_prompt("edit this", &[]), "edit this");
+    assert_eq!(assemble_prompt("edit this", &images), "edit this");
 }
 
 #[test]
-fn build_content_puts_text_first_then_images() {
-    let images = vec![InputImage::from_path(
-        temp_png("openrouter-mcp-test-content.png"),
-        None,
-    )];
-    let prepared = prepare_inputs(&images, 800).unwrap();
-    let content = build_content("edit this", &images, &prepared);
-    let v = serde_json::to_value(&content).unwrap();
-    assert!(v.is_array());
-    assert_eq!(v[0]["type"], "text");
-    assert_eq!(v[0]["text"], "edit this");
-    assert_eq!(v[1]["type"], "image_url");
-    assert!(
-        v[1]["image_url"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,")
-    );
-}
-
-#[test]
-fn build_content_prepends_label_block_when_labeled() {
+fn assemble_prompt_prepends_label_block_when_labeled() {
     let images = vec![
-        InputImage::from_path(
-            temp_png("openrouter-mcp-test-bg.png"),
-            Some("background".to_string()),
-        ),
-        InputImage::from_path(
-            temp_png("openrouter-mcp-test-fg.png"),
-            Some("product".to_string()),
-        ),
+        InputImage::from_path("bg.png", Some("background".to_string())),
+        InputImage::from_path("fg.png", Some("product".to_string())),
     ];
-    let prepared = prepare_inputs(&images, 800).unwrap();
-    let content = build_content("compose them", &images, &prepared);
-    let v = serde_json::to_value(&content).unwrap();
-    let text = v[0]["text"].as_str().unwrap();
+    let text = assemble_prompt("compose them", &images);
     assert!(text.contains("Reference images:"));
     assert!(text.contains("1. background:"));
     assert!(text.contains("2. product:"));
     assert!(text.contains("compose them"));
-    // text part, then two image parts.
-    assert_eq!(v.as_array().unwrap().len(), 3);
 }
 
 #[test]

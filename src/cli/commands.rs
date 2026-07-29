@@ -2,8 +2,8 @@
 
 use super::table::{primary_modality, render_sectioned_table};
 use super::{
-    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, VideoArgs, parse_image_arg,
-    resolve_base_output, resolve_prompt,
+    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, TranscribeArgs, VideoArgs,
+    parse_image_arg, resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
 use crate::openrouter::{ModelsQuery, OpenRouterClient};
@@ -192,8 +192,8 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
-        poll_interval_secs: video_gen::resolve_poll_interval(None),
-        poll_timeout_secs: video_gen::resolve_poll_timeout(None),
+        poll_interval_secs: video_gen::resolve_poll_interval(),
+        poll_timeout_secs: video_gen::resolve_poll_timeout(),
     };
 
     let summary = video_gen::run_job(&client, &req, &base, &prompt_source).await?;
@@ -240,6 +240,30 @@ pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Transcribe a local audio file and print the transcript to stdout (cost to
+/// stderr). Mirrors the `transcribe_audio` MCP tool.
+pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let (data, format) = audio_gen::read_audio_file(&args.file, args.format.as_deref()).await?;
+
+    let result = audio_gen::transcribe(
+        &client,
+        &audio_gen::TranscribeRequest {
+            model: args.model,
+            data,
+            format,
+            language: args.language,
+        },
+    )
+    .await?;
+
+    println!("{}", result.text);
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let query = ModelsQuery {
@@ -262,13 +286,7 @@ pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
             "{}",
             serde_json::to_string_pretty(&models_to_json(&models))?
         );
-        if !args.all && total > models.len() {
-            eprintln!(
-                "\nshowing {} of {} models; pass --all to see the rest",
-                models.len(),
-                total
-            );
-        }
+        print_model_count_footer(models.len(), total, args.all);
         return Ok(());
     }
 
