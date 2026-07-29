@@ -2,7 +2,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp#license)
 [![Release MCPB](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml/badge.svg)](https://github.com/thesimj/rust-openrouter-mcp/actions/workflows/release-mcpb.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp/blob/main/Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/thesimj/rust-openrouter-mcp/blob/main/Cargo.toml)
 
 <p align="center">
   <img src="assets/hero.jpg" alt="rust-openrouter-mcp - one Rust binary routing an AI assistant to OpenRouter's models" width="100%">
