@@ -48,12 +48,15 @@ pub(crate) struct TranscribeAudioArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct GenerateAudioArgs {
-    /// TTS model id, e.g. "openai/gpt-4o-mini-tts" or "hexgrad/kokoro-82m".
+    /// TTS model id, e.g. "hexgrad/kokoro-82m". Voice ids are model-specific, so
+    /// pair this with a voice the model actually declares - `list_models` with
+    /// output_modalities=speech reports each model's `supported_voices`.
     pub model: String,
     /// REQUIRED (no default): the text to synthesize.
     #[serde(default)]
     pub input: Option<String>,
-    /// REQUIRED (no default): voice id (varies by model, e.g. "alloy").
+    /// REQUIRED (no default): voice id, valid only for the chosen model
+    /// (e.g. "af_heart" for hexgrad/kokoro-82m).
     #[serde(default)]
     pub voice: Option<String>,
     /// Output audio format: "mp3" (default) or "pcm".
@@ -73,10 +76,11 @@ pub(crate) struct GenerateAudioArgs {
 impl OpenRouterServer {
     #[tool(
         description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
-        openai/gpt-4o-mini-tts or hexgrad/kokoro-82m) and save the audio to `output`. This is a \
+        hexgrad/kokoro-82m with voice af_heart) and save the audio to `output`. This is a \
         synchronous, fast call (not a background task). This tool has NO defaults: model, input \
         (the text), and voice must all be specified, or the call fails naming what is \
-        missing. `output` is optional - omit it for an auto-named file under \
+        missing. Voice ids are model-specific and are not interchangeable between models - \
+        call list_models with output_modalities=speech to see each model's supported_voices. `output` is optional - omit it for an auto-named file under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). Returns the saved file path in JSON; for sandboxed clients it also returns a \
         native inline audio content block when the file is small enough. response_format defaults \
         to mp3 so the extension is deterministic.",
@@ -121,7 +125,10 @@ impl OpenRouterServer {
             .unwrap_or("")
             .is_empty()
         {
-            missing.push("voice (voice id, varies by model e.g. \"alloy\")");
+            missing.push(
+                "voice (model-specific voice id, e.g. \"af_heart\" for hexgrad/kokoro-82m; \
+                 see supported_voices in list_models)",
+            );
         }
         require_all("generate_audio", "speech", &missing)?;
 

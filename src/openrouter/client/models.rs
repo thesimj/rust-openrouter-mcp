@@ -10,9 +10,15 @@ impl OpenRouterClient {
     /// `["text", "image"]`). Searches `/models?q=<id>` and returns the
     /// architecture of the entry whose id matches `model_id` exactly. Errors if
     /// no such model is found. Used to gate multimodal inputs before sending.
+    ///
+    /// `output_modalities=all` is required, not cosmetic: the endpoint defaults
+    /// that filter to `text`, which hides every image/audio/video/embeddings
+    /// model (135 of 546 as of 2026-08). Without it this lookup reports "not
+    /// found" for exactly the non-text models a modality gate exists to check.
     pub async fn model_input_modalities(&self, model_id: &str) -> Result<Vec<String>> {
         let query = ModelsQuery {
             q: Some(model_id.to_string()),
+            output_modalities: Some("all".to_string()),
             ..Default::default()
         };
         let model = self
@@ -124,6 +130,33 @@ mod tests {
         assert_eq!(models[0].context_length, Some(128_000));
     }
 
+    /// Pins that we ask for compression. OpenRouter serves gzip and the payloads
+    /// are large, highly compressible JSON - `/models` measures 672KB raw against
+    /// 71KB gzipped. The header only appears because `reqwest` is built with the
+    /// `gzip` feature, so this fails if that feature is ever trimmed from
+    /// `Cargo.toml` alongside the other `default-features = false` opt-ins.
+    /// Decompression itself is reqwest's job, not ours, so it isn't retested here.
+    #[tokio::test]
+    async fn requests_advertise_gzip_support() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        client.list_models(&ModelsQuery::default()).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let encodings = requests[0].headers.get("accept-encoding");
+        let sent = encodings
+            .expect("accept-encoding is sent")
+            .to_str()
+            .unwrap();
+        assert!(sent.contains("gzip"), "got: {sent}");
+    }
+
     #[tokio::test]
     async fn list_models_errors_on_non_success_status() {
         let server = MockServer::start().await;
@@ -171,6 +204,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(query_param("q", "google/gemini-2.5-flash"))
+            // Matching on this makes the test fail (mock misses -> 404) if the
+            // filter is ever dropped again. The endpoint defaults it to `text`,
+            // which hides every non-text-output model from this lookup.
+            .and(query_param("output_modalities", "all"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [
                     // A near-match that must be ignored (id differs).

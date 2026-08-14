@@ -87,6 +87,11 @@ pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
         "request" => format!("${}/request", trim_num(v)),
         "image" | "image_output" => format!("${}/image", trim_num(v)),
         "web_search" => format!("${}/call", trim_num(v)),
+        // TTL siblings of the cache-write rate (`_1h`, and whatever follows) are
+        // priced per token like the base key. Without this they fell to the `_`
+        // catch-all and rendered as "$0.00002/unit" beside "$12.5/M tokens" - the
+        // same unit shown two ways, 10^6 apart.
+        k if k.starts_with("input_cache_write") => per_m(v, "tokens"),
         // Video SKUs: match the conventions in `video_price`.
         k if k.contains("duration_seconds") => format!("${}/s", trim_num(v)),
         k if k.contains("second") => format!("${}/s", trim_num(v / 100.0)), // cents -> dollars
@@ -200,6 +205,14 @@ mod tests {
         assert_eq!(
             humanize_price("input_cache_read", "0.0000005").as_deref(),
             Some("$0.5/M tokens")
+        );
+        assert_eq!(
+            humanize_price("input_cache_write", "0.0000125").as_deref(),
+            Some("$12.5/M tokens")
+        );
+        assert_eq!(
+            humanize_price("input_cache_write_1h", "0.00002").as_deref(),
+            Some("$20/M tokens")
         );
         // Video SKUs use their real units (matching video_price).
         assert_eq!(

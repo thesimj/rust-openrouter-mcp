@@ -61,6 +61,10 @@
       "description": "Generate speech (text-to-speech) from text with an OpenRouter TTS model and save it to disk."
     },
     {
+      "name": "transcribe_audio",
+      "description": "Transcribe speech to text (speech-to-text) from a local audio file with an OpenRouter STT model."
+    },
+    {
       "name": "chat_completion",
       "description": "Send a prompt to any OpenRouter chat/text model and return its text reply; useful to route a sub-task to a different model. Optionally attach images for a vision-capable model (best-effort gated on the model's declared image-input support)."
     },

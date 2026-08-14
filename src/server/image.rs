@@ -30,6 +30,10 @@ use super::OpenRouterServer;
 /// source bodies only increases memory pressure without improving output.
 const MAX_REMOTE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Total deadline for one remote-image fetch, sized against the ceiling above:
+/// 20 MB inside 30s is ~5 Mbit/s, slower than any host worth waiting for.
+const REMOTE_IMAGE_TIMEOUT_SECS: u64 = 30;
+
 /// An input image for editing / image-to-image / vision. Exactly one of
 /// `path`, `url`, or `base64` must be set. Order is preserved.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -133,9 +137,22 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
 
     // Pin to the validated IP (no second DNS lookup -> no rebinding) and forbid
     // redirects (a 30x could otherwise bounce to an internal host).
+    //
+    // A total deadline is right here, unlike the shared OpenRouter client: this
+    // fetches a URL the *model* supplied, and the body is capped at
+    // MAX_REMOTE_IMAGE_BYTES, so there is no legitimate slow-but-large transfer
+    // to protect. Without it, a host that accepts and then dribbles bytes hangs
+    // the tool call forever - the size cap never trips on a drip.
+    //
+    // `no_gzip` because enabling reqwest's `gzip` feature turns auto-decompression
+    // on for every client in the process. Decoded responses lose Content-Length,
+    // which would silently kill the early size check below; image bytes are
+    // already compressed, so there is nothing to win here anyway.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, addrs[0])
+        .timeout(std::time::Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS))
+        .no_gzip()
         .build()
         .map_err(|e| ErrorData::internal_error(format!("http client build failed: {e}"), None))?;
 

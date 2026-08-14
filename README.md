@@ -294,7 +294,7 @@ Generate speech (text-to-speech):
 
 ```bash
 openrouter-mcp audio \
-  --model openai/gpt-4o-mini-tts --voice alloy \
+  --model hexgrad/kokoro-82m --voice af_heart \
   --input "Hello from OpenRouter." --output ./out/hello.mp3
 ```
 

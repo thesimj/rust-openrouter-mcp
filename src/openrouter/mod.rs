@@ -19,6 +19,16 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const APP_REFERER: &str = "https://github.com/thesimj/rust-openrouter-mcp";
 const APP_TITLE: &str = "rust-openrouter-mcp";
 
+/// Stall detection, not a deadline. `read_timeout` resets after every successful
+/// read, so a slow-but-progressing transfer is never cut off - which matters
+/// because `download_video` and `transcribe_audio` move tens of megabytes and
+/// have no size bound we control. A total `timeout()` would cap those by wall
+/// clock and fail a video generation that already succeeded and was paid for.
+const READ_TIMEOUT_SECS: u64 = 60;
+/// Separate, because a peer that never completes the TCP/TLS handshake never
+/// produces a read for `READ_TIMEOUT_SECS` to bound.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Build the shared `reqwest::Client`, attaching the OpenRouter app-attribution
 /// headers (`HTTP-Referer` / `X-Title`) as defaults so every endpoint inherits
 /// them. Falls back to a bare client if header construction fails.
@@ -35,8 +45,16 @@ fn build_http_client() -> reqwest::Client {
     if let Ok(v) = HeaderValue::from_str(&title) {
         headers.insert(HeaderName::from_static("x-title"), v);
     }
+    // reqwest applies no timeout of any kind by default. Without one, a provider
+    // that accepts the connection and then stalls hangs the MCP tool call
+    // forever, and a stalled background job parks a `Pending` entry that
+    // `TaskRegistry::prune_terminal` never evicts - so the registry's cap stops
+    // holding. Note this client is not the only one: `server::image::fetch_url`
+    // builds its own (pinned to a validated IP) and sets its own bounds.
     reqwest::Client::builder()
         .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

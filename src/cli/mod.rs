@@ -166,7 +166,7 @@ pub(crate) struct VideoArgs {
 /// CLI flags for `audio`, mirroring the `generate_audio` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct AudioArgs {
-    /// Model id, e.g. openai/gpt-4o-mini-tts or hexgrad/kokoro-82m.
+    /// Model id, e.g. hexgrad/kokoro-82m.
     #[arg(short, long)]
     model: String,
     /// Text to synthesize. Use --input-file to read from a file/stdin instead.
@@ -175,7 +175,7 @@ pub(crate) struct AudioArgs {
     /// Read the input text from a file (use '-' for stdin).
     #[arg(long)]
     input_file: Option<PathBuf>,
-    /// Voice id (varies by model, e.g. alloy).
+    /// Voice id, valid only for the chosen model (e.g. af_heart for kokoro).
     #[arg(long)]
     voice: String,
     /// Output audio format: mp3 (default) or pcm.

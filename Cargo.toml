@@ -1,6 +1,6 @@
 [package]
 name = "openrouter-mcp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # Verified, not guessed: `cargo +1.88 check --all-targets` passes. The floor is
 # set by rmcp 3.0 (rust-version 1.88) and by our own use of let-chains, which
@@ -40,7 +40,13 @@ serde_json = "1"
 # behavior - so a user behind a corporate TLS-inspecting proxy whose custom root
 # CA lives in the OS store still connects. `charset` + `http2` are default
 # reqwest features re-added after `default-features = false`.
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "rustls"] }
+# `gzip` makes reqwest send `Accept-Encoding: gzip` and decompress transparently.
+# OpenRouter honors it and serves nothing else (br/zstd/deflate all come back
+# uncompressed), and the payloads are highly compressible JSON: `/models` measured
+# 672,715 -> 71,498 bytes on the wire, an 89% saving on the tool we call most.
+# Costs one new crate, `async-compression`; flate2/miniz_oxide are already in the
+# tree via `png`, so the size delta is just the async wrapper.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "rustls", "gzip"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"

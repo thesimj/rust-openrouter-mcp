@@ -100,11 +100,15 @@ impl TaskRegistry {
     }
 
     /// Snapshot a task's current state, or `None` if the id is unknown.
+    ///
+    /// Reads before pruning, deliberately: the cap loop evicts the oldest
+    /// *terminal* entry, which a long-running job that just completed satisfies.
+    /// Pruning first meant a caller could evict the very result it was asking
+    /// for - so a finished job answered "unknown task_id" while its output sat
+    /// on disk. The prune still runs on every call, just one step later.
     pub async fn snapshot(&self, id: &str) -> Option<TaskSnapshot> {
         let mut guard = self.inner.lock().await;
-        prune_terminal(&mut guard, Instant::now());
-        let entry = guard.get(id)?;
-        Some(match &entry.status {
+        let snap = guard.get(id).map(|entry| match &entry.status {
             Status::Pending => TaskSnapshot {
                 kind: entry.kind.as_str(),
                 status: "pending",
@@ -123,7 +127,21 @@ impl TaskRegistry {
                 result: None,
                 error: Some(err.clone()),
             },
-        })
+        });
+        prune_terminal(&mut guard, Instant::now());
+        snap
+    }
+}
+
+impl TaskSnapshot {
+    /// A "still running" snapshot for a task the registry can no longer show.
+    pub(crate) fn pending(kind: TaskKind) -> Self {
+        Self {
+            kind: kind.as_str(),
+            status: "pending",
+            result: None,
+            error: None,
+        }
     }
 }
 
@@ -195,5 +213,38 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    /// A poll must not evict the entry it is polling for. `snapshot` prunes on
+    /// every call and the cap loop evicts the oldest *terminal* entry - so
+    /// pruning before the lookup meant asking about a just-finished job was what
+    /// destroyed it, and the caller got `unknown task_id` while the generated
+    /// file sat on disk. Reads first, prunes second.
+    ///
+    /// Getting over the bound takes pending jobs: `insert_pending` prunes too,
+    /// but pending entries are never evicted, so a burst of in-flight jobs is
+    /// what holds the registry above `MAX_RETAINED_TASKS`. That is precisely the
+    /// state a long-running generation completes into.
+    #[tokio::test]
+    async fn polling_a_just_finished_task_does_not_evict_it() {
+        let reg = TaskRegistry::new();
+        for i in 0..=MAX_RETAINED_TASKS {
+            reg.insert_pending(&format!("task-{i}"), TaskKind::Video)
+                .await;
+        }
+        // Nothing is terminal yet, so the registry sits one over the bound.
+        reg.complete("task-0", json!({"i": 0})).await;
+
+        let snap = reg.snapshot("task-0").await;
+        assert!(
+            snap.is_some(),
+            "polling task-0 evicted it before answering the question"
+        );
+        let snap = snap.unwrap();
+        assert_eq!(snap.status, "completed");
+        assert_eq!(snap.result.unwrap()["i"], 0);
+        // The prune still runs, just after the read: now that task-0 is terminal
+        // and the registry is over its bound, the next call reclaims it.
+        assert!(reg.snapshot("task-0").await.is_none());
     }
 }

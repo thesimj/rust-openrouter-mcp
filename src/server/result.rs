@@ -290,11 +290,17 @@ impl OpenRouterServer {
         // Fast-return window: wait up to `wait` seconds, then report whatever
         // state the task is in (dropping the handle leaves it running).
         let _ = tokio::time::timeout(std::time::Duration::from_secs(wait), handle).await;
+        // Not guaranteed present despite the insert above: a concurrent call's
+        // prune can evict this entry once it is terminal. Release builds set
+        // `panic = "abort"`, so an `expect` here would take down the whole server
+        // rather than failing one call. Reporting "pending" is the least-wrong
+        // answer available - the caller's follow-up `get_result` will say
+        // `unknown task_id`, but the generated file is still on disk.
         let snap = self
             .tasks
             .snapshot(&task_id)
             .await
-            .expect("task was just inserted");
+            .unwrap_or_else(|| TaskSnapshot::pending(kind));
         let env = snapshot_to_envelope(&task_id, &snap);
         job_call_result(&env, inline_previews).await
     }
