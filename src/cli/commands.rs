@@ -77,6 +77,7 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| "Describe this image in detail.".to_string()),
         images: args.images.iter().map(|v| parse_image_arg(v)).collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+        reasoning_effort: args.reasoning_effort,
     };
     let result = image_gen::describe_image(&client, &req).await?;
     println!("{}", result.text);
@@ -103,6 +104,7 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             // The CLI `chat` subcommand is text-only; no input images (cap unused).
             images: &[],
             max_image_dimension: 0,
+            reasoning_effort: args.reasoning_effort.as_deref(),
         },
     )
     .await?;

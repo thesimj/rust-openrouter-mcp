@@ -42,6 +42,13 @@ pub struct Model {
     pub architecture: Option<Architecture>,
     #[serde(default)]
     pub pricing: Option<Pricing>,
+    /// Reasoning capabilities: `supported_efforts`, `default_effort`,
+    /// `default_enabled`, `mandatory`. Passed through untyped because the shape
+    /// varies per provider and gains fields. Absent for non-reasoning models.
+    /// The `reasoning_effort` tool arg points callers here, so it has to survive
+    /// the round-trip through this struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
 }
 
 impl Model {
@@ -126,6 +133,7 @@ mod tests {
             context_length: None,
             architecture: None,
             pricing: None,
+            reasoning: None,
         };
 
         assert!(model.matches_search("OPENAI"));
@@ -193,5 +201,38 @@ mod tests {
         assert_eq!(pricing.web_search.as_deref(), Some("0.01"));
         assert_eq!(pricing.discount, Some(0.5));
         assert!(pricing.image.is_none());
+    }
+
+    /// The `reasoning_effort` tool arg tells callers to read
+    /// `reasoning.supported_efforts` from list_models, so the block must survive
+    /// deserialize -> serialize. A typed struct would drop fields OpenRouter adds.
+    #[test]
+    fn models_response_round_trips_the_reasoning_block() {
+        let json = r#"{
+          "data": [
+            {
+              "id": "openai/gpt-5.6-sol",
+              "reasoning": {
+                "mandatory": false,
+                "default_enabled": true,
+                "supported_efforts": ["max", "high", "low", "none"],
+                "default_effort": "medium"
+              }
+            },
+            { "id": "provider/no-reasoning" }
+          ]
+        }"#;
+
+        let parsed: ModelsResponse = serde_json::from_str(json).unwrap();
+        let reasoning = parsed.data[0].reasoning.as_ref().unwrap();
+        assert_eq!(reasoning["default_effort"], "medium");
+        assert_eq!(reasoning["supported_efforts"][3], "none");
+
+        // Serialized back out, the block is intact and non-reasoning models do
+        // not sprout a null field.
+        let out = serde_json::to_value(&parsed.data[0]).unwrap();
+        assert_eq!(out["reasoning"]["supported_efforts"][0], "max");
+        let bare = serde_json::to_value(&parsed.data[1]).unwrap();
+        assert!(bare.get("reasoning").is_none());
     }
 }

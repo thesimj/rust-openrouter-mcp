@@ -6,7 +6,9 @@
 use anyhow::{Context, Result};
 
 use crate::image_gen::{self, InputImage};
-use crate::openrouter::{ChatRequest, Content, ContentPart, ImageUrl, Message, OpenRouterClient};
+use crate::openrouter::{
+    ChatRequest, Content, ContentPart, ImageUrl, Message, OpenRouterClient, Reasoning,
+};
 
 /// A chat reply: the assistant text plus the reported USD cost (when present).
 pub struct ChatResult {
@@ -28,6 +30,9 @@ pub struct ChatInputs<'a> {
     pub max_tokens: Option<u64>,
     pub images: &'a [InputImage],
     pub max_image_dimension: u32,
+    /// Reasoning effort (max, xhigh, high, medium, low, minimal, none). `None`
+    /// sends no `reasoning` object, so the model keeps its catalog default.
+    pub reasoning_effort: Option<&'a str>,
 }
 
 /// Build a chat request (optional system message, then the user message) and
@@ -77,6 +82,13 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         seed: None,
         temperature: inputs.temperature,
         max_tokens: inputs.max_tokens,
+        reasoning: inputs
+            .reasoning_effort
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|effort| Reasoning {
+                effort: effort.to_string(),
+            }),
         stream: false,
     };
 

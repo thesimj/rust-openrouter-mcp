@@ -16,11 +16,14 @@ pub(crate) mod job;
 
 pub(crate) use job::{JobSummary, base_stem, in_parent_of, run_job};
 
-/// Default and hard ceiling for the input-image longest-side cap (px). Larger
-/// explicit arguments or env overrides are clamped down to this, so input images
-/// are never sent with a longest side above it (keeps request payloads bounded;
-/// providers gain nothing from larger inputs here).
-const DEFAULT_MAX_DIMENSION: u32 = 800;
+/// Default input-image longest-side cap (px). Small enough to keep payloads and
+/// image-token cost bounded, large enough to keep dense text legible.
+const DEFAULT_MAX_DIMENSION: u32 = 1536;
+
+/// Hard ceiling for the input-image longest-side cap (px). OpenRouter documents
+/// no pixel limit of its own, so this is only a payload guard against an
+/// absurd override. Callers may raise the cap up to here.
+const MAX_DIMENSION_CEILING: u32 = 4096;
 
 /// Where an input image's bytes come from. URL inputs are fetched and `base64`/
 /// data-URL inputs are decoded at the tool boundary, so by the time bytes are
@@ -98,8 +101,8 @@ pub struct GenerateRequest {
 
 /// Resolve the input-image dimension cap: explicit value, else the
 /// `OPENROUTER_IMAGE_MAX_DIMENSION` env var, else [`DEFAULT_MAX_DIMENSION`]. The
-/// result is clamped to `1..=`[`DEFAULT_MAX_DIMENSION`] so an oversized argument
-/// or env override can never push input images above the ceiling.
+/// result is clamped to `1..=`[`MAX_DIMENSION_CEILING`], so an argument or env
+/// override can raise the cap above the default but not past the ceiling.
 pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
     explicit
         .or_else(|| {
@@ -108,7 +111,7 @@ pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(DEFAULT_MAX_DIMENSION)
-        .clamp(1, DEFAULT_MAX_DIMENSION)
+        .clamp(1, MAX_DIMENSION_CEILING)
 }
 
 /// A generated image plus the metadata worth recording.
@@ -147,8 +150,11 @@ fn assemble_prompt(prompt: &str, images: &[InputImage]) -> String {
 /// A normalized input image, computed once and reused across all variant
 /// requests and the manifest (avoids re-reading/re-encoding per variant).
 pub(crate) struct PreparedInput {
-    /// `data:image/png;base64,...` URL sent to the model.
+    /// `data:<mime>;base64,...` URL sent to the model. JPEG for opaque raster
+    /// input, PNG when the image has transparency or came from an SVG.
     pub data_url: String,
+    /// MIME type the image was re-encoded to, recorded in the manifest.
+    pub normalized_mime: &'static str,
     pub original_width: u32,
     pub original_height: u32,
     pub normalized_width: u32,
@@ -160,7 +166,7 @@ pub(crate) struct PreparedInput {
     pub warnings: Vec<String>,
 }
 
-/// Read each input image **once** and produce the PNG data URL plus original /
+/// Read each input image **once** and produce the data URL plus original /
 /// normalized dimensions. Raster inputs (png/jpeg/webp/gif) are decoded and
 /// downscaled to `max_dim`; SVG inputs are rasterized to PNG at the cap (see
 /// [`image_io::svg_to_png`]), with the SVG's intrinsic viewBox size recorded as
@@ -186,7 +192,8 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
                     );
                 }
                 Ok(PreparedInput {
-                    data_url: image_io::png_data_url(&svg.png),
+                    data_url: image_io::data_url(&svg.png, "image/png"),
+                    normalized_mime: "image/png",
                     original_width: svg.intrinsic_width,
                     original_height: svg.intrinsic_height,
                     normalized_width,
@@ -196,10 +203,11 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
                 })
             } else {
                 let (original_width, original_height) = image_io::decode_dimensions(&bytes)?;
-                let png = image_io::normalize_to_png(&bytes, max_dim)?;
-                let (normalized_width, normalized_height) = image_io::decode_dimensions(&png)?;
+                let (encoded, mime) = image_io::normalize_for_send(&bytes, max_dim)?;
+                let (normalized_width, normalized_height) = image_io::decode_dimensions(&encoded)?;
                 Ok(PreparedInput {
-                    data_url: image_io::png_data_url(&png),
+                    data_url: image_io::data_url(&encoded, mime),
+                    normalized_mime: mime,
                     original_width,
                     original_height,
                     normalized_width,
@@ -327,6 +335,8 @@ pub struct DescribeRequest {
     pub prompt: String,
     pub images: Vec<InputImage>,
     pub max_image_dimension: u32,
+    /// Reasoning effort passed straight through; `None` keeps the model default.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Describe (or answer a question about) one or more images: sends them with an
@@ -351,6 +361,7 @@ pub async fn describe_image(
             max_tokens: None,
             images: &req.images,
             max_image_dimension: req.max_image_dimension,
+            reasoning_effort: req.reasoning_effort.as_deref(),
         },
     )
     .await

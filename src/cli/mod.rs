@@ -60,9 +60,13 @@ pub(crate) struct DescribeArgs {
     /// Instruction/question about the image(s) (default: a detailed description).
     #[arg(short, long)]
     prompt: Option<String>,
-    /// Longest-side cap (px) for input images before sending (default 800, capped at 800).
+    /// Longest-side cap (px) for input images before sending (default 1536, max 4096).
     #[arg(long)]
     max_image_dimension: Option<u32>,
+    /// Reasoning effort: max, xhigh, high, medium, low, minimal, none.
+    /// Omit to keep the model's own default.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
 }
 
 /// CLI flags for `image`, mirroring the `generate_image` MCP tool.
@@ -90,8 +94,8 @@ pub(crate) struct ImageArgs {
     /// Use `label=path` to label a reference, e.g. --image product=./p.jpg.
     #[arg(long = "image")]
     images: Vec<String>,
-    /// Longest-side cap (px) for input images before sending (default 800,
-    /// capped at 800; env OPENROUTER_IMAGE_MAX_DIMENSION).
+    /// Longest-side cap (px) for input images before sending (default 1536,
+    /// max 4096; env OPENROUTER_IMAGE_MAX_DIMENSION).
     #[arg(long)]
     max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped).
@@ -149,7 +153,7 @@ pub(crate) struct VideoArgs {
     /// warning, when a first/last frame is given (frames win).
     #[arg(long = "reference-image")]
     reference_images: Vec<String>,
-    /// Longest-side cap (px) for input frame/reference images (default 800, capped at 800).
+    /// Longest-side cap (px) for input frame/reference images (default 1536, max 4096).
     #[arg(long)]
     max_image_dimension: Option<u32>,
     /// Output path (extension corrected to the returned format, e.g. .mp4).
@@ -227,6 +231,10 @@ pub(crate) struct ChatArgs {
     /// Maximum number of tokens to generate.
     #[arg(long)]
     max_tokens: Option<u64>,
+    /// Reasoning effort: max, xhigh, high, medium, low, minimal, none.
+    /// Omit to keep the model's own default.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
 }
 
 /// CLI flags for `models`, mirroring the `list_models` MCP tool.

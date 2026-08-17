@@ -37,8 +37,8 @@ pub(crate) struct ChatCompletionArgs {
     /// be determined the request is sent anyway. Omit for a plain text prompt.
     #[serde(default)]
     pub images: Vec<ImageInput>,
-    /// Longest-side cap (px) for input images before sending (default 800,
-    /// capped at 800). Ignored when no images are provided.
+    /// Longest-side cap (px) for input images before sending (default 1536,
+    /// max 4096). Ignored when no images are provided.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
     /// Optional sampling temperature.
@@ -47,6 +47,13 @@ pub(crate) struct ChatCompletionArgs {
     /// Optional maximum number of tokens to generate.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_tokens: Option<u64>,
+    /// Optional reasoning effort: "max", "xhigh", "high", "medium", "low",
+    /// "minimal" or "none". Omit to keep the model's own default. Accepted
+    /// values differ per model - check `reasoning.supported_efforts` from
+    /// list_models/describe_model. Reasoning tokens bill as output tokens, so
+    /// lower effort is cheaper and faster.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[tool_router(router = chat_router, vis = "pub(crate)")]
@@ -124,6 +131,7 @@ impl OpenRouterServer {
                 max_tokens: args.max_tokens,
                 images: &images,
                 max_image_dimension: max_dim,
+                reasoning_effort: args.reasoning_effort.as_deref(),
             },
         )
         .await
@@ -245,6 +253,7 @@ mod tests {
             system: Some("be terse".to_string()),
             images: Vec::new(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: Some(0.5),
             max_tokens: Some(64),
         };
@@ -257,6 +266,47 @@ mod tests {
         assert_eq!(stats["text_generations"], 1);
     }
 
+    /// The `reasoning` object is sent only when the caller asks for an effort.
+    /// Omitting it is what the official OpenRouter SDK does: the model then
+    /// applies its own catalog `default_effort`, which is NOT the same as off.
+    ///
+    /// The request body is captured and inspected rather than matched with
+    /// `body_partial_json`, because a partial match cannot prove a key is
+    /// *absent* - the default case is exactly the absence of `reasoning`.
+    #[tokio::test]
+    async fn reasoning_effort_is_forwarded_and_omitted_by_default() {
+        for effort in [None, Some("none"), Some("high")] {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })))
+                .mount(&mock)
+                .await;
+
+            let server = server_for(mock.uri());
+            let args = ChatCompletionArgs {
+                model: "openai/gpt-5.6-sol".to_string(),
+                prompt: Some("hi".to_string()),
+                system: None,
+                images: Vec::new(),
+                max_image_dimension: None,
+                reasoning_effort: effort.map(str::to_string),
+                temperature: None,
+                max_tokens: None,
+            };
+            server.run_chat_completion(args).await.unwrap();
+
+            let requests = mock.received_requests().await.unwrap();
+            let body: serde_json::Value = requests[0].body_json().unwrap();
+            match effort {
+                None => assert!(body.get("reasoning").is_none(), "sent: {body}"),
+                Some(e) => assert_eq!(body["reasoning"]["effort"], e),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn chat_completion_requires_prompt() {
         // Validation runs before any HTTP call.
@@ -267,6 +317,7 @@ mod tests {
             system: None,
             images: Vec::new(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: None,
             max_tokens: None,
         };
@@ -306,6 +357,7 @@ mod tests {
             system: None,
             images: one_image(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: None,
             max_tokens: None,
         };
@@ -328,6 +380,7 @@ mod tests {
             system: None,
             images: one_image(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: None,
             max_tokens: None,
         };
@@ -365,6 +418,7 @@ mod tests {
             system: None,
             images: one_image(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: None,
             max_tokens: None,
         };
@@ -401,6 +455,7 @@ mod tests {
             system: None,
             images: one_image(),
             max_image_dimension: None,
+            reasoning_effort: None,
             temperature: None,
             max_tokens: None,
         };

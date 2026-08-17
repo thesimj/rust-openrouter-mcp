@@ -24,7 +24,22 @@ pub struct ChatRequest {
     /// Max tokens to generate; omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Reasoning controls; omitted when `None` so the model keeps its own
+    /// `default_effort` from the models catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
     pub stream: bool,
+}
+
+/// The `reasoning` request object. OpenRouter normalizes `effort` per provider
+/// (Anthropic `budget_tokens`, Gemini `thinkingLevel`, OpenAI `reasoning_effort`).
+/// Only `effort` is exposed: the per-provider token budgets it derives are the
+/// documented behavior, and a raw `max_tokens` needs different bounds per family.
+#[derive(Debug, Serialize)]
+pub struct Reasoning {
+    /// One of: max, xhigh, high, medium, low, minimal, none. Accepted values
+    /// vary per model - see `reasoning.supported_efforts` in list_models.
+    pub effort: String,
 }
 
 #[derive(Debug, Serialize)]

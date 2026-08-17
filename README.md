@@ -47,6 +47,13 @@ per-process usage - all behind one `openrouter-mcp` executable.
   (optional `system`, `temperature`, `max_tokens`). Optionally attach `images`
   (path/url/base64) for a vision-capable model; the call is rejected only when the
   model is known not to accept image input (otherwise it is sent as-is).
+- **Reasoning effort** - `chat_completion` and `describe_image` take an optional
+  `reasoning_effort`: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or
+  `none`. It is omitted from the request unless you set it, so each model keeps
+  its catalog `default_effort` (see `reasoning.supported_efforts` in
+  `list_models`). Reasoning tokens bill as output tokens, so `none` is the
+  cheapest and fastest setting on models that allow it. Some models make
+  reasoning mandatory and reject `none` with a 400.
 - **Account info** - `get_account`: basic info about the API key in use (label,
   owning user id, credit usage with daily/weekly/monthly breakdown, spending
   limit / remaining balance, and tier / key-type flags).
@@ -143,7 +150,7 @@ All environment variables read by the server/CLI:
 | `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
 | `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image` / `get_result` embed inline base64 image previews: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
 | `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
-| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `800`; larger values are reduced to `800`. | `800` |
+| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `4096`; larger values are reduced to `4096`. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
 | `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
 | `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |

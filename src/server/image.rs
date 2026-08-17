@@ -26,8 +26,8 @@ use crate::tasks::TaskKind;
 use super::OpenRouterServer;
 
 /// Hard ceiling for images fetched from third-party URLs. Input images are
-/// normalized to at most 800px before use, so accepting arbitrarily large
-/// source bodies only increases memory pressure without improving output.
+/// downscaled to the resolved dimension cap before use, so accepting
+/// arbitrarily large source bodies only increases memory pressure.
 const MAX_REMOTE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Total deadline for one remote-image fetch, sized against the ceiling above:
@@ -269,8 +269,8 @@ pub(crate) struct GenerateImageArgs {
     /// base64 (a data: URL or raw base64). Omit for plain text-to-image.
     #[serde(default)]
     pub images: Vec<ImageInput>,
-    /// Longest-side cap (px) for input images before sending (default 800,
-    /// capped at 800; env OPENROUTER_IMAGE_MAX_DIMENSION).
+    /// Longest-side cap (px) for input images before sending (default 1536,
+    /// max 4096; env OPENROUTER_IMAGE_MAX_DIMENSION).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
@@ -304,9 +304,16 @@ pub(crate) struct DescribeImageArgs {
     /// Instruction or question about the image(s). Defaults to a detailed description.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Longest-side cap (px) for input images before sending (default 800, capped at 800).
+    /// Longest-side cap (px) for input images before sending (default 1536, max 4096).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_image_dimension: Option<u32>,
+    /// Optional reasoning effort: "max", "xhigh", "high", "medium", "low",
+    /// "minimal" or "none". Omit to keep the model's own default. Accepted
+    /// values differ per model - check `reasoning.supported_efforts` from
+    /// list_models/describe_model. Plain description needs little thinking;
+    /// charts, diagrams and dense text benefit from "high".
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Build the lean per-job result object for an image job (paths, dims, requested
@@ -498,6 +505,7 @@ impl OpenRouterServer {
                 .unwrap_or_else(|| "Describe this image in detail.".to_string()),
             images: resolve_image_inputs(args.images).await?,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+            reasoning_effort: args.reasoning_effort,
         };
         match image_gen::describe_image(&self.client, &req).await {
             Ok(result) => {

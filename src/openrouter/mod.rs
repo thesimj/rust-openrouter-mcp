@@ -226,6 +226,7 @@ mod tests {
                 context_length: None,
                 architecture: None,
                 pricing: None,
+                reasoning: None,
             })
             .collect()
     }

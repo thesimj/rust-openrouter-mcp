@@ -170,7 +170,7 @@ pub async fn run_job(
             source_mime_type: p.source_mime,
             original_width: p.original_width,
             original_height: p.original_height,
-            normalized_mime_type: "image/png",
+            normalized_mime_type: p.normalized_mime,
             normalized_width: p.normalized_width,
             normalized_height: p.normalized_height,
             normalization_max_side: req.max_image_dimension,

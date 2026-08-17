@@ -32,17 +32,53 @@ pub fn parse_data_url(url: &str) -> Result<(String, Vec<u8>)> {
 /// request size, cost, and context pressure. This is our default, not an
 /// OpenRouter requirement.
 pub fn normalize_to_png(bytes: &[u8], max_side: u32) -> Result<Vec<u8>> {
-    let img = image::load_from_memory(bytes).context("could not decode input image")?;
-    let resized = if img.width() > max_side || img.height() > max_side {
-        img.resize(max_side, max_side, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
     let mut out = std::io::Cursor::new(Vec::new());
-    resized
+    decode_and_fit(bytes, max_side)?
         .write_to(&mut out, image::ImageFormat::Png)
         .context("could not encode normalized PNG")?;
     Ok(out.into_inner())
+}
+
+/// JPEG quality for the re-encode. 85 is the usual "no visible loss" point and
+/// keeps small text legible. Raise it if OCR on dense scans ever suffers.
+const JPEG_QUALITY: u8 = 85;
+
+/// Decode and downscale like [`normalize_to_png`], but re-encode as JPEG and
+/// return the bytes with their MIME type. Images with an alpha channel stay PNG,
+/// because JPEG has no transparency.
+///
+/// JPEG is roughly 4x smaller than PNG for photographic input at the same pixel
+/// count. Providers bill image input per pixel, not per byte, so this cuts
+/// upload time and memory without changing cost or resolution.
+pub fn normalize_for_send(bytes: &[u8], max_side: u32) -> Result<(Vec<u8>, &'static str)> {
+    let img = decode_and_fit(bytes, max_side)?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    if img.color().has_alpha() {
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .context("could not encode normalized PNG")?;
+        return Ok((out.into_inner(), "image/png"));
+    }
+    img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+        &mut out,
+        JPEG_QUALITY,
+    ))
+    .context("could not encode normalized JPEG")?;
+    Ok((out.into_inner(), "image/jpeg"))
+}
+
+/// Decode an image and downscale it to fit `max_side` on its longest side.
+/// Images already within the cap are returned untouched - never upscaled.
+///
+/// A decompression bomb (a small file that decodes to an enormous pixel buffer)
+/// is already refused here: `load_from_memory` applies `image::Limits::default()`,
+/// which caps decode allocation at 512 MB. Do not re-add that limit by hand.
+fn decode_and_fit(bytes: &[u8], max_side: u32) -> Result<image::DynamicImage> {
+    let img = image::load_from_memory(bytes).context("could not decode input image")?;
+    Ok(if img.width() > max_side || img.height() > max_side {
+        img.resize(max_side, max_side, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    })
 }
 
 /// Heuristically detect an SVG document from its leading bytes (the `image`
@@ -107,11 +143,12 @@ pub fn svg_to_png(bytes: &[u8], max_side: u32) -> Result<RasterizedSvg> {
     })
 }
 
-/// Build a `data:image/png;base64,...` URL from PNG bytes (for sending inputs).
-pub fn png_data_url(png: &[u8]) -> String {
+/// Build a `data:<mime>;base64,...` URL from encoded image bytes (for sending
+/// inputs).
+pub fn data_url(bytes: &[u8], mime: &str) -> String {
     format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(png)
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     )
 }
 
@@ -380,8 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn png_data_url_has_png_prefix() {
-        assert!(png_data_url(&[1, 2, 3]).starts_with("data:image/png;base64,"));
+    fn data_url_has_mime_prefix() {
+        assert!(data_url(&[1, 2, 3], "image/png").starts_with("data:image/png;base64,"));
+        assert!(data_url(&[1, 2, 3], "image/jpeg").starts_with("data:image/jpeg;base64,"));
     }
 
     #[test]

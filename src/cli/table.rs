@@ -212,6 +212,7 @@ mod tests {
                 tokenizer: None,
             }),
             pricing: None,
+            reasoning: None,
         }
     }
 
@@ -310,6 +311,7 @@ mod tests {
             context_length: None,
             architecture: None,
             pricing: None,
+            reasoning: None,
         };
         assert_eq!(primary_modality(&no_arch), "text");
     }
