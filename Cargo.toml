@@ -1,6 +1,6 @@
 [package]
 name = "openrouter-mcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # Verified, not guessed: `cargo +1.88 check --all-targets` passes. The floor is
 # set by rmcp 3.0 (rust-version 1.88) and by our own use of let-chains, which
