@@ -1,0 +1,23 @@
+version: 2
+
+# Nothing was watching for updates before this file existed, which is how the
+# Node 20 action deprecation and ten stale crates went unnoticed until someone
+# looked. Weekly, grouped, so it is one PR per ecosystem rather than a dozen.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor bumps land as one PR; a major gets its own, because that
+      # is the one worth reading (resvg 0.47 -> 0.48 needed a manifest edit).
+      compatible:
+        update-types: ["minor", "patch"]

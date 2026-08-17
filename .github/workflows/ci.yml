@@ -24,18 +24,30 @@ env:
   # Fail the build on any warning, matching the clippy gate below.
   RUSTFLAGS: -D warnings
 
+# Third-party actions are pinned to a full commit SHA, not a tag: a tag can be
+# moved to point at different code, and these run in the same job as our build.
+# actions/* are first-party and keep a floating major tag.
+#   dtolnay/rust-toolchain@master  -> 6c977a6 (2026-08)
+#   Swatinem/rust-cache@v2.9.2     -> 63fed3e
+# The `master` branch of rust-toolchain makes `toolchain` a required input, so
+# each job states the toolchain it wants instead of encoding it in the ref.
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
 
       - name: Format
         run: cargo fmt --check
@@ -52,8 +64,11 @@ jobs:
   # a stale MSRV goes unnoticed until a user reports it.
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Read rust-version from Cargo.toml
         id: msrv
@@ -63,11 +78,11 @@ jobs:
           echo "Declared MSRV: $version"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
 
       # Build tests too: a dev-dependency or test-only construct can raise the
       # real floor just as easily as library code.

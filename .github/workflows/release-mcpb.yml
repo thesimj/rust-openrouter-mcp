@@ -10,8 +10,23 @@ on:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write
+# Re-pushing a tag (or a dispatch during a tag run) should not race two builds
+# uploading the same asset names to the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# No workflow-wide write. The one job that needs it declares it below, so a
+# future job added here starts from nothing.
+permissions: {}
+
+# Third-party actions are pinned to a full commit SHA, not a tag. This job holds
+# `contents: write` and produces the binary users install, so a moved tag on any
+# of these would be a direct path into a shipped artifact. actions/* are
+# first-party and keep a floating major tag.
+#   dtolnay/rust-toolchain@master      -> 6c977a6 (2026-08)
+#   Swatinem/rust-cache@v2.9.2         -> 63fed3e
+#   softprops/action-gh-release@v3.0.2 -> fe965f7
 
 jobs:
   build-mcpb:
@@ -29,8 +44,15 @@ jobs:
             slug: windows
             targets: ""
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write # attach the .mcpb to the release
+      id-token: write # sign the provenance attestation
+      attestations: write # record it against the repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # The static musl Linux build links ring's C crypto through a musl-targeted
       # C compiler; `musl-tools` provides musl-gcc. No-op on macOS/Windows.
@@ -39,27 +61,39 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: stable
           targets: ${{ matrix.targets }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
       - name: Build and pack .mcpb
         run: node scripts/build-mcpb.mjs
 
+      # Signed proof that this exact .mcpb came from this workflow at this
+      # commit. Users verify with:
+      #   gh attestation verify openrouter-mcp-macos.mcpb -R thesimj/rust-openrouter-mcp
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/openrouter-mcp-${{ matrix.slug }}.mcpb
+
+      # Redundant on a tag run (the release gets the same file below), but it is
+      # the only output of a workflow_dispatch run, which has no release to
+      # attach to.
       - name: Upload .mcpb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openrouter-mcp-${{ matrix.slug }}
           path: dist/openrouter-mcp-${{ matrix.slug }}.mcpb
 
       - name: Attach .mcpb to the release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0
         with:
           files: dist/openrouter-mcp-${{ matrix.slug }}.mcpb
