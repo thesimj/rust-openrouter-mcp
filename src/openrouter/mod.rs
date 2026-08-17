@@ -24,7 +24,16 @@ const APP_TITLE: &str = "rust-openrouter-mcp";
 /// because `download_video` and `transcribe_audio` move tens of megabytes and
 /// have no size bound we control. A total `timeout()` would cap those by wall
 /// clock and fail a video generation that already succeeded and was paid for.
-const READ_TIMEOUT_SECS: u64 = 60;
+///
+/// The caveat that sets the value: `/images` is synchronous and buffered. It
+/// sends no bytes at all until the image is finished, so there is nothing for
+/// the timer to reset on and it becomes a generation deadline in practice. At
+/// 60s that killed real work - bytedance-seed/seedream-5-0-pro took a measured
+/// 154s for one 1K image, and the tool reported "operation timed out" for a
+/// request the provider went on to complete and bill. 300s covers the slow
+/// image models with headroom; a truly dead connection still dies, just later,
+/// and generation runs as a background task so nobody is blocked waiting.
+const READ_TIMEOUT_SECS: u64 = 300;
 /// Separate, because a peer that never completes the TCP/TLS handshake never
 /// produces a read for `READ_TIMEOUT_SECS` to bound.
 const CONNECT_TIMEOUT_SECS: u64 = 10;
