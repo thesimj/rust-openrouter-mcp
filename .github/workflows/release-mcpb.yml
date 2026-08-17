@@ -66,7 +66,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.targets }}
 
-      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - uses: actions/setup-node@v7
         with:
@@ -94,6 +94,6 @@ jobs:
 
       - name: Attach .mcpb to the release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           files: dist/openrouter-mcp-${{ matrix.slug }}.mcpb
