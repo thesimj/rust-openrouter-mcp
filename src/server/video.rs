@@ -112,8 +112,10 @@ impl OpenRouterServer {
         save it to `output`. For text-to-video, pass a prompt. For image-to-video, also pass \
         first_frame (and optionally last_frame) as local image paths; for reference-to-video pass \
         reference_images (ignored, with a warning, if a frame is given - frames win). This tool \
-        has NO defaults: model, prompt, duration, generate_audio, and an aspect_ratio \
-        OR size must all be specified, or the call fails naming what is missing. `output` is \
+        has NO defaults: model, prompt, duration and generate_audio must all be specified, or the \
+        call fails naming what is missing. For text-to-video an aspect_ratio OR size is required \
+        too; with first_frame/last_frame it is not, because the output ratio follows the frame \
+        image and some models reject a ratio outright in that mode. `output` is \
         optional - omit it for an auto-named file under OPENROUTER_MCP_OUTPUT_DIR \
         (default $HOME/Downloads/openrouter-mcp). Video generation \
         is slow (30s to several minutes): it runs asynchronously and almost always returns status \
@@ -148,7 +150,15 @@ impl OpenRouterServer {
         if args.duration.is_none() {
             missing.push("duration (seconds)");
         }
-        if args.aspect_ratio.is_none() && args.size.is_none() {
+        // Only demanded for text-to-video. With a first/last frame the output
+        // ratio comes from the frame image, and some models reject any ratio at
+        // all in that mode: bytedance/seedance-2.5 answers a first_frame call
+        // carrying aspect_ratio *or* size with
+        // 400 InvalidParameter.TaskTypeConstraint. Requiring one here made
+        // image-to-video impossible on that model - every allowed call was
+        // rejected by one side or the other.
+        let has_frame = args.first_frame.is_some() || args.last_frame.is_some();
+        if !has_frame && args.aspect_ratio.is_none() && args.size.is_none() {
             missing.push("aspect_ratio (e.g. \"16:9\", \"9:16\") or size (\"WIDTHxHEIGHT\")");
         }
         if args.generate_audio.is_none() {
@@ -275,6 +285,51 @@ mod tests {
         assert!(err.message.contains("aspect_ratio"));
         assert!(err.message.contains("generate_audio"));
         assert!(err.message.contains("no defaults"));
+    }
+
+    /// With a frame image the output ratio follows that image, and
+    /// bytedance/seedance-2.5 rejects a request carrying aspect_ratio OR size
+    /// with 400 InvalidParameter.TaskTypeConstraint. Demanding one here left no
+    /// valid call: ratio -> upstream 400, no ratio -> our own error.
+    #[tokio::test]
+    async fn generate_video_does_not_require_a_ratio_when_a_frame_is_given() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let base = |first_frame: Option<String>| GenerateVideoArgs {
+            model: "bytedance/seedance-2.5".to_string(),
+            prompt: "a slow zoom".to_string(),
+            duration: Some(8),
+            resolution: Some("720p".to_string()),
+            aspect_ratio: None,
+            size: None,
+            generate_audio: Some(true),
+            seed: None,
+            first_frame,
+            last_frame: None,
+            reference_images: vec![],
+            max_image_dimension: None,
+            wait_seconds: None,
+            output: Some("out.mp4".to_string()),
+        };
+
+        // No frame: still required, so validation stops the call before any HTTP.
+        let err = server
+            .run_generate_video(base(None), false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("aspect_ratio"), "{}", err.message);
+
+        // With a frame: validation passes, so the call is accepted and the job
+        // runs. It then fails reading the missing frame file, which is proof it
+        // got past the argument check rather than being rejected by it.
+        let res = server
+            .run_generate_video(base(Some("/nonexistent.png".to_string())), false)
+            .await
+            .expect("a frame call must not be rejected for a missing ratio");
+        let v = tool_result_json(&res);
+        let text = v.to_string();
+        assert!(!text.contains("aspect_ratio"), "{text}");
+        assert!(!text.contains("no defaults"), "{text}");
+        assert!(text.contains("/nonexistent.png"), "{text}");
     }
 
     #[tokio::test]

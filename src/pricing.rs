@@ -83,9 +83,18 @@ pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
     Some(match key {
         "prompt" | "completion" | "input_cache_read" | "input_cache_write"
         | "internal_reasoning" | "image_token" => per_m(v, "tokens"),
+        // Per *output token*, despite the name - verified against two providers.
+        // x-ai/grok-imagine-image-quality reports image_output == image_token
+        // (1.198e-5), and 8 images at 2K billed $0.64, i.e. ~6.7k tokens each.
+        // google/gemini-3.1-flash-image reports 6e-5 with no image_token, and
+        // its documented 1K price ($0.067) is ~1.1k tokens at that rate.
+        // Rendered as "$/image" this read as $0.00006 per image.
+        "image_output" => per_m(v, "output tokens"),
         "audio" | "audio_output" | "input_audio_cache" => per_m(v, "audio tokens"),
         "request" => format!("${}/request", trim_num(v)),
-        "image" | "image_output" => format!("${}/image", trim_num(v)),
+        // A flat per-image SKU that is not always what bills: grok-imagine
+        // advertises $0.01/image here while charging ~$0.08 through image_token.
+        "image" => format!("${}/image", trim_num(v)),
         "web_search" => format!("${}/call", trim_num(v)),
         // TTL siblings of the cache-write rate (`_1h`, and whatever follows) are
         // priced per token like the base key. Without this they fell to the `_`
@@ -213,6 +222,23 @@ mod tests {
         assert_eq!(
             humanize_price("input_cache_write_1h", "0.00002").as_deref(),
             Some("$20/M tokens")
+        );
+        // `image` is a flat per-image SKU; `image_output` is per output token
+        // despite the name, so it must not render in the same unit. The two
+        // values below are the real ones from grok-imagine-image-quality, where
+        // reading image_output as per-image understated the cost ~8x.
+        assert_eq!(
+            humanize_price("image", "0.01").as_deref(),
+            Some("$0.01/image")
+        );
+        assert_eq!(
+            humanize_price("image_output", "0.0000119760479041916").as_deref(),
+            Some("$11.9760479/M output tokens")
+        );
+        // gemini-3.1-flash-image quotes image_output with no image_token beside it.
+        assert_eq!(
+            humanize_price("image_output", "0.00006").as_deref(),
+            Some("$60/M output tokens")
         );
         // Video SKUs use their real units (matching video_price).
         assert_eq!(

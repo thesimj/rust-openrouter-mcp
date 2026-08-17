@@ -22,6 +22,33 @@ fn extension_for(mime: &str) -> &'static str {
     }
 }
 
+/// Whether an ISO base media file (mp4/mov) actually carries an audio track,
+/// or `None` when the bytes are not that container and we cannot tell.
+///
+/// Reports what is in the file rather than what was requested. `generate_audio:
+/// false` is not honored by every provider - x-ai/grok-imagine-video-1.5 returns
+/// a near-silent AAC track anyway - and echoing the request made the manifest
+/// disagree with the file on disk.
+///
+/// Reads the `hdlr` box, whose handler type sits 12 bytes past the box name:
+/// `[size:4][\"hdlr\":4][version+flags:4][pre_defined:4][handler_type:4]`. A
+/// `soun` handler means an audio track. Scanning for the box beats a full box
+/// walk here - the alternative is an mp4 parsing dependency for one boolean.
+fn has_audio_track(bytes: &[u8]) -> Option<bool> {
+    // ISO-BMFF starts with a `ftyp` box: [size:4]["ftyp":4]. Anything else
+    // (webm, for one) is not something this function can answer for.
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    Some(
+        bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"hdlr")
+            .any(|(p, _)| bytes.get(p + 12..p + 16) == Some(&b"soun"[..])),
+    )
+}
+
 /// Output path for one clip. A single clip uses `base` with the given extension;
 /// multiple clips get a `-clip-NNN` suffix.
 fn clip_output_path(base: &Path, index_zero_based: usize, total: usize, ext: &str) -> PathBuf {
@@ -191,7 +218,10 @@ pub async fn run_job(
                     let path = clip_output_path(base_output, index, total, ext);
                     match crate::output::write_bytes(&path, &bytes).await {
                         Ok(()) => {
-                            let has_audio = req.generate_audio.unwrap_or(false);
+                            // Probe the bytes; fall back to the request only for
+                            // a container we cannot read.
+                            let has_audio = has_audio_track(&bytes)
+                                .unwrap_or_else(|| req.generate_audio.unwrap_or(false));
                             meta.path = Some(path.to_string_lossy().into_owned());
                             meta.mime_type = Some(mime.clone());
                             meta.has_audio = Some(has_audio);
@@ -284,6 +314,38 @@ mod tests {
             poll_interval_secs: 1,
             poll_timeout_secs: 30,
         }
+    }
+
+    /// Build a minimal ISO-BMFF byte string with the given `hdlr` handler types.
+    fn fake_mp4(handlers: &[&[u8; 4]]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 0];
+        v.extend_from_slice(b"ftypisom");
+        for h in handlers {
+            v.extend_from_slice(b"hdlr");
+            v.extend_from_slice(&[0; 8]); // version+flags, pre_defined
+            v.extend_from_slice(*h);
+        }
+        v
+    }
+
+    /// `has_audio` must describe the file, not the request: grok-imagine-video
+    /// returns an AAC track even when generate_audio is false.
+    #[test]
+    fn has_audio_track_reads_the_container() {
+        assert_eq!(has_audio_track(&fake_mp4(&[b"vide", b"soun"])), Some(true));
+        assert_eq!(has_audio_track(&fake_mp4(&[b"soun"])), Some(true));
+        assert_eq!(has_audio_track(&fake_mp4(&[b"vide"])), Some(false));
+        assert_eq!(has_audio_track(&fake_mp4(&[])), Some(false));
+        // Not ISO-BMFF (webm here) -> no answer, so the caller keeps its fallback.
+        assert_eq!(
+            has_audio_track(&[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
+        assert_eq!(has_audio_track(b"short"), None);
+        // A bare "soun" outside an hdlr box must not count.
+        let mut stray = fake_mp4(&[b"vide"]);
+        stray.extend_from_slice(b"soun");
+        assert_eq!(has_audio_track(&stray), Some(false));
     }
 
     #[test]
