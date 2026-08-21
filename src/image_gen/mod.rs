@@ -257,10 +257,12 @@ pub(crate) struct GenContent {
 /// Canonicalize a provider-declared MIME to the form [`image_io::sniff_mime`]
 /// emits, so a real-world alias (`image/jpg`) doesn't false-positive as a
 /// mismatch against the sniffed `image/jpeg` in [`generate_core`].
-fn canonical_mime(mime: &str) -> &str {
-    match mime {
-        "image/jpg" => "image/jpeg",
-        other => other,
+fn canonical_mime(mime: &str) -> String {
+    let m = mime.trim().to_ascii_lowercase();
+    match m.as_str() {
+        "image/jpg" => "image/jpeg".to_string(),
+        "image/svg" => "image/svg+xml".to_string(),
+        _ => m,
     }
 }
 
@@ -334,8 +336,9 @@ pub(crate) async fn generate_core(
     // warning rather than silently saving the file under the wrong extension.
     let mut warnings = Vec::new();
     let sniffed = image_io::sniff_mime(&bytes).map(str::to_string);
-    let mime = if item.media_type.as_deref() == Some("image/svg+xml") {
-        item.media_type.unwrap()
+    let declared_canonical = item.media_type.as_deref().map(canonical_mime);
+    let mime = if declared_canonical.as_deref() == Some("image/svg+xml") {
+        "image/svg+xml".to_string()
     } else if let Some(sniffed) = sniffed {
         if let Some(declared) = &item.media_type
             && canonical_mime(declared) != sniffed
@@ -347,7 +350,7 @@ pub(crate) async fn generate_core(
         }
         sniffed
     } else {
-        item.media_type.unwrap_or_else(|| "image/png".to_string())
+        declared_canonical.unwrap_or_else(|| "image/png".to_string())
     };
     let (width, height) = if mime == "image/svg+xml" {
         image_io::svg_dimensions(&bytes).unwrap_or((0, 0))

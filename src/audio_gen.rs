@@ -222,7 +222,7 @@ pub async fn run_job(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "mp3".to_string());
 
     let body = SpeechBody {

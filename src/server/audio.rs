@@ -153,7 +153,16 @@ impl OpenRouterServer {
             response_format: args.response_format,
             speed: args.speed,
         };
-        let fmt = req.response_format.as_deref().unwrap_or("mp3");
+        // Same normalization run_job applies to the wire value, so the
+        // auto-filename token never diverges from what is actually sent.
+        let fmt = req
+            .response_format
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "mp3".to_string());
+        let fmt = fmt.as_str();
         let output = naming::resolve_output_base(
             args.output,
             naming::MediaKind::Audio,

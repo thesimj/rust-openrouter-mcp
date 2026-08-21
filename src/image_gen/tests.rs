@@ -455,3 +455,12 @@ async fn generate_image_passes_through_quality_format_background_compression() {
     };
     assert!(generate_image(&client, &req).await.is_ok());
 }
+
+#[test]
+fn canonical_mime_normalizes_case_and_aliases() {
+    assert_eq!(super::canonical_mime("image/jpg"), "image/jpeg");
+    assert_eq!(super::canonical_mime(" image/JPG "), "image/jpeg");
+    assert_eq!(super::canonical_mime("IMAGE/JPEG"), "image/jpeg");
+    assert_eq!(super::canonical_mime("image/svg"), "image/svg+xml");
+    assert_eq!(super::canonical_mime("image/png"), "image/png");
+}

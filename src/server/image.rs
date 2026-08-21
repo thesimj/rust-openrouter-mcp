@@ -421,6 +421,17 @@ impl OpenRouterServer {
         args: GenerateImageArgs,
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
+        // Blank/whitespace-only strings count as absent: better a clear
+        // "missing parameter" error here than a confusing provider 400.
+        let non_blank = |o: Option<String>| o.filter(|s| !s.trim().is_empty());
+        let args = GenerateImageArgs {
+            aspect_ratio: non_blank(args.aspect_ratio),
+            image_size: non_blank(args.image_size),
+            quality: non_blank(args.quality),
+            output_format: non_blank(args.output_format),
+            background: non_blank(args.background),
+            ..args
+        };
         // No defaults: the agent must choose these explicitly.
         let mut missing: Vec<&str> = Vec::new();
         if args.aspect_ratio.is_none() {
@@ -445,7 +456,9 @@ impl OpenRouterServer {
             quality: args.quality,
             output_format: args.output_format,
             background: args.background,
-            output_compression: args.output_compression,
+            // The schema range is advisory only (rmcp does not validate), so
+            // clamp here the way variants/wait_seconds already do.
+            output_compression: args.output_compression.map(|c| c.min(100)),
         };
 
         let variants = args.variants.unwrap_or(1).clamp(1, 16);
@@ -751,6 +764,30 @@ mod tests {
         assert!(err.message.contains("aspect_ratio"));
         assert!(err.message.contains("image_size"));
         assert!(err.message.contains("no defaults"));
+    }
+
+    #[tokio::test]
+    async fn generate_image_treats_blank_strings_as_missing() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args = GenerateImageArgs {
+            model: "m".to_string(),
+            prompt: "p".to_string(),
+            aspect_ratio: Some("  ".to_string()),
+            image_size: Some("".to_string()),
+            seed: None,
+            images: vec![],
+            max_image_dimension: None,
+            variants: None,
+            wait_seconds: None,
+            output: Some("out.png".to_string()),
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
+        };
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
+        assert!(err.message.contains("image_size"), "got: {}", err.message);
     }
 
     #[tokio::test]
