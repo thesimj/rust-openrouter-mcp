@@ -195,7 +195,19 @@ impl OpenRouterServer {
             .is_some_and(|m| m.iter().any(|v| v == "image"));
         if outputs_image {
             match self.client.image_model_detail(model).await {
-                Ok(Some(image)) => {
+                Ok(Some(mut image)) => {
+                    // Same human rendering the video block gets: image pricing
+                    // lines carry numeric cost_usd, unreadable at 4e-05.
+                    if let Some(endpoints) =
+                        image.get_mut("endpoints").and_then(Value::as_array_mut)
+                    {
+                        for ep in endpoints {
+                            crate::pricing::attach_image_pricing_human(ep);
+                            // Fallback: if the shape ever turns string-priced
+                            // (like flat pricing objects), humanize that too.
+                            attach_pricing_human(ep);
+                        }
+                    }
                     detail["image"] = image;
                 }
                 Ok(None) => {}
@@ -371,7 +383,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
                     "id": "openai/gpt-image-2",
-                    "endpoints": [{"supported_parameters": ["quality", "output_format"]}]
+                    "endpoints": [{
+                        "supported_parameters": ["quality", "output_format"],
+                        "pricing": [{"billable": "output_image", "cost_usd": 0.00004}]
+                    }]
                 }
             })))
             .mount(&mock)
@@ -389,6 +404,12 @@ mod tests {
         assert_eq!(
             v["image"]["endpoints"][0]["supported_parameters"][0],
             "quality"
+        );
+        // The wiring, not just the helper: the merged endpoint carries the
+        // human rendering of its numeric cost_usd pricing lines (F11).
+        assert_eq!(
+            v["image"]["endpoints"][0]["pricing_human"][0],
+            "output_image: $0.00004/image"
         );
     }
 

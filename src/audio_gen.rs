@@ -148,7 +148,33 @@ pub async fn transcribe(
         .get("usage")
         .and_then(|u| u.get("cost"))
         .and_then(serde_json::Value::as_f64);
-    let verbose = (response_format.as_deref() == Some("verbose_json")).then_some(raw);
+    let mut verbose = (response_format.as_deref() == Some("verbose_json")).then_some(raw);
+    // A provider that silently ignores verbose_json returns the bare json
+    // shape; say so instead of handing back an object missing the promised
+    // fields with no signal.
+    if let Some(v) = verbose.as_mut()
+        && v.get("segments").is_none()
+        && v.get("words").is_none()
+        && v.get("duration").is_none()
+        && v.get("language").is_none()
+        && let Some(map) = v.as_object_mut()
+    {
+        let msg = serde_json::Value::String(
+            "verbose_json was requested but the response carries none of \
+             segments/words/duration/language - the provider likely ignored it \
+             (verbose_json needs an OpenAI-compatible provider)"
+                .to_string(),
+        );
+        // The repo-wide warnings shape is a JSON array; append rather than
+        // clobber in case a provider ever emits its own warnings field.
+        match map.get_mut("warnings") {
+            Some(serde_json::Value::Array(a)) => a.push(msg),
+            Some(_) => {} // foreign non-array field: leave it untouched
+            None => {
+                map.insert("warnings".to_string(), serde_json::Value::Array(vec![msg]));
+            }
+        }
+    }
     Ok(TranscribeResult {
         text,
         cost,
@@ -481,5 +507,29 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A provider that silently ignores verbose_json returns the bare json
+    /// shape; the verbose object must then carry an explicit warning.
+    #[tokio::test]
+    async fn transcribe_warns_when_the_provider_ignores_verbose_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "text": "hi", "usage": { "cost": 0.001 }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let result = transcribe(&client, &transcribe_req(Some("verbose_json"), &[]))
+            .await
+            .unwrap();
+        let v = result.verbose.expect("verbose object still returned");
+        let w = v["warnings"][0].as_str().expect("warnings array injected");
+        assert!(w.contains("verbose_json"), "got: {w}");
+        assert!(w.contains("ignored"), "got: {w}");
+        assert!(w.contains("language"), "got: {w}");
     }
 }

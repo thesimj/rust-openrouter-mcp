@@ -175,6 +175,40 @@ pub(crate) fn attach_pricing_human(obj: &mut Value) {
     }
 }
 
+/// Attach a `pricing_human` sibling to one merged image-endpoint object. Its
+/// `pricing` is an array of `{billable, cost_usd}` lines with NUMERIC costs
+/// (unlike the string-priced flat pricing objects), rendered as "billable: $X".
+pub(crate) fn attach_image_pricing_human(endpoint: &mut Value) {
+    let Some(lines) = endpoint.get("pricing").and_then(Value::as_array) else {
+        return;
+    };
+    let human: Vec<Value> = lines
+        .iter()
+        .filter_map(|l| {
+            let billable = l.get("billable")?.as_str()?;
+            let cost = l.get("cost_usd")?.as_f64()?;
+            if !(cost > 0.0 && cost.is_finite()) {
+                return None;
+            }
+            // Same unit conventions as humanize_price: per-token rates scale
+            // to $/M, per-image rates read per image, the rest say /unit.
+            let rendered = if billable.contains("token") {
+                format!("${}/M tokens", trim_num(cost * 1_000_000.0))
+            } else if billable.contains("image") {
+                format!("${}/image", trim_num(cost))
+            } else {
+                format!("${}/unit", trim_num(cost))
+            };
+            Some(Value::String(format!("{billable}: {rendered}")))
+        })
+        .collect();
+    if !human.is_empty()
+        && let Some(map) = endpoint.as_object_mut()
+    {
+        map.insert("pricing_human".to_string(), Value::Array(human));
+    }
+}
+
 /// Serialize a model list to JSON, attaching a `pricing_human` sibling to each
 /// model. Shared by the CLI `models` JSON output and the `list_models` MCP tool
 /// so both render pricing identically.
@@ -355,5 +389,32 @@ mod tests {
 
         let junk_only = serde_json::json!({"overrides": [{"condition": "peak_hours"}]});
         assert!(humanize_pricing(&junk_only).is_none());
+    }
+
+    /// F11: merged image endpoints carry numeric cost_usd lines; the human
+    /// sibling renders them readably and skips zero/negative lines.
+    #[test]
+    fn attach_image_pricing_human_renders_numeric_cost_lines() {
+        let mut ep = serde_json::json!({
+            "provider_name": "OpenAI",
+            "pricing": [
+                {"billable": "output_image", "cost_usd": 0.00004},
+                {"billable": "input_text_tokens", "cost_usd": 0.000005},
+                {"billable": "zeroed_tokens", "cost_usd": 0.0},
+                {"billable": "weird", "cost_usd": -1.0}
+            ]
+        });
+        attach_image_pricing_human(&mut ep);
+        assert_eq!(
+            ep["pricing_human"],
+            serde_json::json!([
+                "output_image: $0.00004/image",
+                "input_text_tokens: $5/M tokens"
+            ])
+        );
+
+        let mut no_pricing = serde_json::json!({"provider_name": "X"});
+        attach_image_pricing_human(&mut no_pricing);
+        assert!(no_pricing.get("pricing_human").is_none());
     }
 }

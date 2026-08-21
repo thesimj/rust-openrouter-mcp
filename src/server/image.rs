@@ -20,7 +20,9 @@ use crate::server::naming;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
-use crate::server::schema::{RequireFields, de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{
+    AtLeastOneOf, RequireFields, de_opt_uint, require_all, scalarize_nullable,
+};
 use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
@@ -38,6 +40,7 @@ const REMOTE_IMAGE_TIMEOUT_SECS: u64 = 30;
 /// `path`, `url`, or `base64` must be set. Order is preserved.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
+#[schemars(transform = AtLeastOneOf(&["path", "url", "base64"]))]
 pub(crate) struct ImageInput {
     /// Local file path (png/jpeg/webp/gif/svg). One of path/url/base64.
     #[serde(default)]

@@ -51,17 +51,22 @@ pub(crate) fn scalarize_nullable(schema: &mut schemars::Schema) {
 /// `#[schemars(transform = RequireFields(&[...]))]` alongside `scalarize_nullable`.
 pub(crate) struct RequireFields(pub(crate) &'static [&'static str]);
 
+/// Catch a typo'd/renamed field name at test time, before it silently
+/// no-ops (RequireFields) or invalidates every call (AtLeastOneOf).
+fn assert_props(obj: &serde_json::Map<String, serde_json::Value>, names: &[&str], ctx: &str) {
+    for name in names {
+        debug_assert!(
+            obj.get("properties").and_then(|p| p.get(*name)).is_some(),
+            "{ctx}: {name:?} is not a property of this schema"
+        );
+    }
+    let _ = (obj, names, ctx); // silence release-build unused warnings
+}
+
 impl schemars::transform::Transform for RequireFields {
     fn transform(&mut self, schema: &mut schemars::Schema) {
         if let Some(obj) = schema.as_object_mut() {
-            // Catch a typo'd/renamed field name at test time (F13), before it
-            // silently no-ops in the generated schema.
-            for name in self.0 {
-                debug_assert!(
-                    obj.get("properties").and_then(|p| p.get(*name)).is_some(),
-                    "RequireFields: {name:?} is not a property of this schema"
-                );
-            }
+            assert_props(obj, self.0, "RequireFields");
             let required = obj
                 .entry("required")
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -73,6 +78,26 @@ impl schemars::transform::Transform for RequireFields {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Advertise "at least one of these fields" as an `anyOf` of single-`required`
+/// branches. Deliberately NOT `oneOf`: JSON Schema counts `""` as present, so
+/// `oneOf` would reject placeholder-filling clients the runtime accepts - the
+/// runtime "exactly one of" check owns strictness and the friendly error.
+pub(crate) struct AtLeastOneOf(pub(crate) &'static [&'static str]);
+
+impl schemars::transform::Transform for AtLeastOneOf {
+    fn transform(&mut self, schema: &mut schemars::Schema) {
+        if let Some(obj) = schema.as_object_mut() {
+            assert_props(obj, self.0, "AtLeastOneOf");
+            let branches: Vec<serde_json::Value> = self
+                .0
+                .iter()
+                .map(|name| serde_json::json!({ "required": [name] }))
+                .collect();
+            obj.insert("anyOf".to_string(), serde_json::Value::Array(branches));
         }
     }
 }
@@ -339,5 +364,45 @@ mod tests {
             seed.get("default").is_none(),
             "expected no `default` on seed, got {seed}"
         );
+    }
+
+    /// S16: "needs one of these sources" is schema-encoded as anyOf
+    /// single-required branches on ImageInput (path/url/base64) and transcribe
+    /// (path/base64). anyOf, not oneOf: "" counts as present in JSON Schema,
+    /// so oneOf would reject placeholder-filling clients the runtime accepts.
+    #[test]
+    fn at_least_one_of_is_encoded_as_anyof_required_branches() {
+        let img = schema_for_type::<ImageInput>();
+        assert_eq!(
+            img.get("anyOf").cloned(),
+            Some(json!([
+                { "required": ["path"] },
+                { "required": ["url"] },
+                { "required": ["base64"] }
+            ]))
+        );
+        let tr = schema_for_type::<crate::server::audio::TranscribeAudioArgs>();
+        assert_eq!(
+            tr.get("anyOf").cloned(),
+            Some(json!([
+                { "required": ["path"] },
+                { "required": ["base64"] }
+            ]))
+        );
+    }
+
+    /// A typo'd field name in AtLeastOneOf must panic in debug builds instead
+    /// of emitting a branch nothing can satisfy (same guard as RequireFields).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "AtLeastOneOf")]
+    fn at_least_one_of_catches_an_unknown_property_name() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        #[schemars(transform = crate::server::schema::AtLeastOneOf(&["nope"]))]
+        struct Bogus {
+            #[allow(dead_code)]
+            real: Option<String>,
+        }
+        schema_for_type::<Bogus>();
     }
 }
