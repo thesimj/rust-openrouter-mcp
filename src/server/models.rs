@@ -25,7 +25,10 @@ pub(crate) struct ListModelsArgs {
     #[serde(default)]
     pub query: Option<String>,
     /// Local case-insensitive filter across id, name, and description
-    /// (e.g. "openai"). Applied after the server-side query.
+    /// (e.g. "openai"). Order of operations: the server-side query/
+    /// output_modalities/input_modalities/supported_parameters/sort/min_context
+    /// filters run first (one API call); this local filter narrows that result
+    /// next; the default 20-result cap (unless all=true) is applied last.
     #[serde(default)]
     pub search: Option<String>,
     /// Filter by output modalities. Comma-separated list of: text, image, audio,
@@ -128,8 +131,11 @@ impl OpenRouterServer {
         quantization, max tokens, and supported parameters - richer and more current than the \
         list_models entry (which is a compact subset). For video models, also merges the real \
         pricing under a \"video\" key (pricing_skus, supported resolutions/durations/sizes from \
-        /videos/models), since the token-based pricing is 0 and misleading for video. Fails if \
-        the id is unknown.",
+        /videos/models), since the token-based pricing is 0 and misleading for video. For image \
+        models, also merges per-endpoint image capabilities under an \"image\" key \
+        (supported_parameters, allowed_passthrough_parameters, pricing, supports_streaming from \
+        /images/models/{author}/{slug}/endpoints) - best-effort, omitted if that model has no \
+        image endpoint. Fails if the id is unknown.",
         annotations(
             title = "Describe OpenRouter Model",
             read_only_hint = true,
@@ -180,6 +186,26 @@ impl OpenRouterServer {
             }
         }
 
+        // Image models: merge the per-endpoint detail (definitive
+        // supported_parameters, allowed_passthrough_parameters, pricing,
+        // supports_streaming) from the dedicated image-models endpoint, the
+        // same best-effort way the video block above is merged.
+        let outputs_image = detail["architecture"]["output_modalities"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|v| v == "image"));
+        if outputs_image {
+            match self.client.image_model_detail(model).await {
+                Ok(Some(image)) => {
+                    detail["image"] = image;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    detail["image_pricing_error"] =
+                        Value::String(format!("could not fetch /images/models: {e:#}"));
+                }
+            }
+        }
+
         // Normalize every pricing block to human "$X/M tokens" form alongside
         // the raw decimals: the top-level record and each per-provider endpoint.
         attach_pricing_human(&mut detail);
@@ -199,7 +225,7 @@ impl OpenRouterServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::test_support::server_for;
+    use crate::server::test_support::{server_for, tool_result_json};
     use rmcp::handler::server::wrapper::Parameters;
     use serde_json::json;
     use wiremock::matchers::{method, path};
@@ -225,6 +251,35 @@ mod tests {
         // The tool returns the model list as pretty JSON text content.
         let body = serde_json::to_string(&result).unwrap();
         assert!(body.contains("openai/gpt"));
+    }
+
+    /// F2: `Model` must not silently drop `supported_voices` - it is what
+    /// generate_audio points callers at, and OpenRouter's speech models carry
+    /// it on `GET /models?output_modalities=speech` (live-confirmed).
+    #[tokio::test]
+    async fn list_models_tool_carries_supported_voices_through() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "hexgrad/kokoro-82m",
+                    "name": "Kokoro 82M",
+                    "supported_voices": ["af_heart", "af_bella"]
+                }]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .list_models(Parameters(ListModelsArgs::default()))
+            .await
+            .unwrap();
+
+        let v = tool_result_json(&result);
+        assert_eq!(v[0]["supported_voices"][0], "af_heart");
+        assert_eq!(v[0]["supported_voices"][1], "af_bella");
     }
 
     #[tokio::test]
@@ -295,6 +350,111 @@ mod tests {
         assert!(body.contains("0.000007"));
         // ...and not some other model's SKU.
         assert!(!body.contains("\"generate\""));
+    }
+
+    #[tokio::test]
+    async fn describe_model_tool_merges_image_endpoint_detail() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/openai/gpt-image-2/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "openai/gpt-image-2",
+                    "architecture": {"output_modalities": ["image"]},
+                    "endpoints": [{"provider_name": "OpenAI"}]
+                }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/openai/gpt-image-2/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "openai/gpt-image-2",
+                    "endpoints": [{"supported_parameters": ["quality", "output_format"]}]
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "openai/gpt-image-2".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let v = tool_result_json(&result);
+        assert_eq!(
+            v["image"]["endpoints"][0]["supported_parameters"][0],
+            "quality"
+        );
+    }
+
+    /// A model with no image endpoint (404) is silently omitted, not a failure.
+    #[tokio::test]
+    async fn describe_model_tool_omits_image_block_on_404() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/some/image-model/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "some/image-model",
+                    "architecture": {"output_modalities": ["image"]}
+                }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/some/image-model/endpoints"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "some/image-model".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let body = serde_json::to_string(&result).unwrap();
+        assert!(!body.contains("\"image\":"));
+        assert!(!body.contains("image_pricing_error"));
+    }
+
+    /// A non-404 failure is surfaced inline rather than failing the whole tool.
+    #[tokio::test]
+    async fn describe_model_tool_surfaces_image_fetch_error_without_failing() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models/some/image-model/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "some/image-model",
+                    "architecture": {"output_modalities": ["image"]}
+                }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/some/image-model/endpoints"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "some/image-model".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let body = serde_json::to_string(&result).unwrap();
+        assert!(body.contains("image_pricing_error"));
     }
 
     #[tokio::test]

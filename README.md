@@ -25,8 +25,11 @@ per-process usage - all behind one `openrouter-mcp` executable.
     rasterized to PNG (longest side scaled to the dimension cap; transparency
     preserved). Text in SVGs is not rendered (no fonts are loaded) and is flagged
     as a warning.
-  - The output format (PNG/JPEG) is **chosen by the provider** - it is sniffed
-    from the response and the file extension is set to match.
+  - The output format is **chosen by the provider**: PNG/JPEG/WebP/GIF are
+    sniffed from the response bytes; SVG is taken from the provider's declared
+    media type instead (sniffing can't detect it). Either way the file
+    extension is set to match what actually came back. An `output_format`
+    request hint is passed through, but support varies by model.
   - Requested `aspect_ratio` / `image_size` are **verified** against the actual
     decoded pixels; mismatches are surfaced as warnings.
   - Every job writes a `*.manifest.json` sidecar (full settings, per-input and
@@ -35,7 +38,11 @@ per-process usage - all behind one `openrouter-mcp` executable.
     tool returns a `task_id`; poll `get_result` for completion.
 - **Video generation** - `generate_video`: text-to-video and image-to-video
   (first/last frame and reference images) with an OpenRouter video model.
-  **Asynchronous**: returns a `task_id`; poll `get_result` for the hosted clip.
+  **Asynchronous**: if the job runs longer than `wait_seconds` (default 20, video
+  usually needs it) the tool returns a `task_id`; poll `get_result` for
+  completion. Once done, the clip is downloaded and saved to disk (a local
+  path, plus a `file://` resource link when inline previews are enabled for
+  sandboxed clients), not just the hosted URL.
 - **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
 - **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
@@ -115,7 +122,7 @@ From a local checkout:
 cargo install --path . --locked --force
 ```
 
-From crates.io (once published):
+From crates.io:
 
 ```bash
 cargo install openrouter-mcp
@@ -148,20 +155,21 @@ All environment variables read by the server/CLI:
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
-| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image` / `get_result` embed inline base64 image previews: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
+| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image`/`generate_video`/`generate_audio` (and `get_result`) embed inline previews - base64 image previews, video `file://` resource links, and inline audio blocks: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
 | `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
 | `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `4096`; larger values are reduced to `4096`. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
 | `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
 | `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |
 | `OPENROUTER_X_TITLE` | Overrides the `X-Title` app-attribution header. | `rust-openrouter-mcp` |
-| `HOME` | OS variable; only used to derive the default output directory when `OPENROUTER_MCP_OUTPUT_DIR` is unset. | (OS-provided) |
+| `HOME` | OS variable; only used to derive the default output directory when `OPENROUTER_MCP_OUTPUT_DIR` is unset. Only `HOME` is checked, not `USERPROFILE` - a stock Windows install without `HOME` set falls straight to the system temp dir. | (OS-provided) |
 
 A few of these warrant extra detail.
 
-`OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image` /
-`get_result` embed the generated image **inline** (base64) in the tool result, in
-addition to saving it to disk:
+`OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image`,
+`generate_video`, `generate_audio`, and `get_result` embed the generated
+media **inline** in the tool result (base64 images, video `file://` resource
+links, or inline audio blocks), in addition to saving it to disk:
 
 - `auto` (default) - inline previews for every client **except** the local
   `claude-code` CLI, which shares the filesystem and can open the saved file
@@ -172,7 +180,10 @@ addition to saving it to disk:
 - `never` - paths only, never inline bytes.
 
 Inline previews are downscaled to a 1568px longest side; the full-resolution
-image is always the file saved on disk.
+image is always the file saved on disk. At most 4 inline previews are embedded
+per job (remaining images are reported by path only in the JSON), and inline
+audio previews are capped at 4 MB (larger clips are saved to disk with the
+path returned instead).
 
 ## MCP usage
 
@@ -205,12 +216,12 @@ block is optional.
 
 | Tool | Kind | Description |
 | --- | --- | --- |
-| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing). |
-| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, and (for video models) real `pricing_skus`. |
-| `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size`; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
+| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing; tiered/time-window `overrides` are passed through raw when a model has them). |
+| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, and (for image models) per-endpoint image capabilities merged under an `image` key. |
+| `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. Optional `quality` (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) pass through to the provider. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size` - all four are required by the schema, not just prose; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
-| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB), optional ISO-639-1 `language`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
+| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), and `temperature`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
 | `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
 | `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
@@ -225,7 +236,7 @@ the full per-variant detail lives in the manifest on disk.
 ## CLI usage
 
 The same binary is a CLI. Subcommands: `models`, `image`, `video`, `audio`,
-`describe`, `chat`, `key`, `mcp`.
+`transcribe`, `describe`, `chat`, `key`, `mcp`.
 
 Show info about the API key in use:
 
@@ -272,11 +283,14 @@ openrouter-mcp image \
 Four parallel variants (files named `*-var-<seed>.<ext>` plus a manifest):
 
 ```bash
-openrouter-mcp image -m bytedance-seed/seedream-4.5 --image-only \
+openrouter-mcp image -m bytedance-seed/seedream-4.5 \
   --prompt "a cute pixar-style baby dragon" \
   --aspect-ratio 1:1 --image-size 1K --seed 1490 --variants 4 \
   --output ./out/dragon.png
 ```
+
+Also accepts `--quality`, `--output-format`, `--background`, and
+`--output-compression` (provider support varies; see `--help`).
 
 Describe an image:
 
@@ -312,6 +326,10 @@ openrouter-mcp transcribe \
   --model openai/gpt-4o-mini-transcribe --file ./out/hello.mp3 --language en
 ```
 
+Also accepts `--response-format verbose_json` (segment/word timestamps, duration,
+detected language - OpenAI-compatible providers only), `--timestamp-granularities
+segment,word`, and `--temperature`.
+
 ## Development
 
 ```bash
@@ -322,8 +340,10 @@ cargo llvm-cov --summary-only        # coverage (cargo install cargo-llvm-cov)
 ```
 
 CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, and the
-test suite on every push and pull request; the release workflow only fires on a
-version tag, so this is the gate that runs before anything ships.
+test suite on every push to `main` and every pull request, plus a separate
+`msrv` job that runs `cargo check --all-targets` at the declared
+`rust-version` floor; the release workflow only fires on a version tag, so
+this is the gate that runs before anything ships.
 
 Live smoke tests (require `OPENROUTER_API_KEY`):
 
@@ -334,14 +354,12 @@ cargo run -- describe -m google/gemini-2.5-flash-lite --image ./some.png
 
 ## Privacy Policy
 
-`openrouter-mcp` runs entirely on your machine and collects no telemetry. The
-only third party it contacts is [OpenRouter](https://openrouter.ai), and only to
-fulfill the requests you make (model discovery, image/video/speech generation,
-image description, and chat completion). Your API key is sent solely to
-OpenRouter to authenticate those calls. Generated files are written only to
-paths you specify (or an auto-named path under `OPENROUTER_MCP_OUTPUT_DIR`);
-usage stats live in memory and are lost on exit. Full details:
-[PRIVACY.md](PRIVACY.md).
+`openrouter-mcp` runs entirely on your machine and collects no telemetry. Full
+details, including the one third-party-URL-fetch exception (image `url`
+inputs are fetched directly, not via OpenRouter) and where generated files
+land (the path you specify, or an auto-named one under
+`OPENROUTER_MCP_OUTPUT_DIR` / `$HOME/Downloads/openrouter-mcp` / the system
+temp dir): [PRIVACY.md](PRIVACY.md).
 
 ## License
 

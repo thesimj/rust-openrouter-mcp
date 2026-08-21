@@ -15,37 +15,53 @@ use crate::server::naming;
 use crate::server::result::{
     DEFAULT_VIDEO_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
-use crate::server::schema::{de_opt_bool, de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{
+    RequireFields, de_opt_bool, de_opt_uint, require_all, scalarize_nullable,
+};
 use crate::tasks::TaskKind;
 use crate::video_gen::{self, VideoGenRequest, VideoInput};
 
 use super::OpenRouterServer;
 
 /// Arguments for the `generate_video` tool.
+///
+/// `aspect_ratio` is deliberately NOT in the schema's required list: it is only
+/// required for text-to-video (no frame image); see `run_generate_video`'s own
+/// runtime check for the conditional rule.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
+#[schemars(transform = RequireFields(&["duration", "generate_audio"]))]
 pub(crate) struct GenerateVideoArgs {
     /// Video model id, e.g. "google/veo-3.1". Use list_models with
     /// output_modalities="video" to discover them.
     pub model: String,
     /// Prompt text describing the video to generate.
     pub prompt: String,
-    /// REQUIRED (no default): clip duration in seconds.
+    /// REQUIRED (no default): clip length in seconds - NOT how long generation
+    /// takes (that's 30s to several minutes; see the tool description). Accepted
+    /// values are model-specific discrete seconds; check describe_model for what
+    /// a given model supports.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub duration: Option<u32>,
-    /// Resolution, e.g. "480p", "720p", "1080p", "1K", "2K", "4K"
-    /// (interchangeable with `size`).
+    /// Named resolution tier: "480p", "720p", "1080p", "1K", "2K", or "4K".
+    /// For text-to-video, pair with aspect_ratio - or use `size` instead of
+    /// resolution+aspect_ratio.
     #[serde(default)]
     pub resolution: Option<String>,
-    /// REQUIRED (no default unless `size` is given): aspect ratio,
-    /// e.g. "16:9", "9:16", "1:1".
+    /// REQUIRED (no default) for text-to-video only: aspect ratio, e.g. "16:9",
+    /// "9:16", "1:1". Provide aspect_ratio+resolution OR size for text-to-video;
+    /// with first_frame/last_frame provide neither (the output ratio follows
+    /// the frame image).
     #[serde(default)]
     pub aspect_ratio: Option<String>,
-    /// "WIDTHxHEIGHT" (interchangeable with resolution + aspect_ratio).
+    /// Explicit pixel dimensions as "WIDTHxHEIGHT" (e.g. "1280x720") - a
+    /// text-to-video alternative to resolution+aspect_ratio. This is pixels, not
+    /// a tier name (unlike `resolution` or generate_image's `image_size`).
     #[serde(default)]
     pub size: Option<String>,
     /// REQUIRED (no default): true to generate an audio track (for
-    /// audio-capable models), false for silent video.
+    /// audio-capable models), false for silent video. This is the audio track
+    /// baked into the clip - unrelated to the generate_audio TTS tool.
     #[serde(default, deserialize_with = "de_opt_bool")]
     pub generate_audio: Option<bool>,
     /// Seed for reproducible-ish generation (provider support varies).
@@ -59,11 +75,12 @@ pub(crate) struct GenerateVideoArgs {
     #[serde(default)]
     pub last_frame: Option<String>,
     /// Local image paths used as references (reference-to-video). Ignored, with a
-    /// warning, when first_frame/last_frame are given (frame_images wins).
+    /// warning, when first_frame/last_frame are given (first_frame/last_frame win).
     #[serde(default)]
     pub reference_images: Vec<String>,
     /// Longest-side cap (px) for input frame/reference images (default 1536, max 4096).
     #[serde(default, deserialize_with = "de_opt_uint")]
+    #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Seconds to wait inline before returning a task_id (1-60, default 20).
     /// Video is slow, so the normal path returns "pending"; poll get_result.
@@ -109,13 +126,20 @@ fn video_job_result_json(summary: &video_gen::VideoJobSummary) -> serde_json::Va
 impl OpenRouterServer {
     #[tool(
         description = "Generate a video with an OpenRouter video model (e.g. google/veo-3.1) and \
-        save it to `output`. For text-to-video, pass a prompt. For image-to-video, also pass \
-        first_frame (and optionally last_frame) as local image paths; for reference-to-video pass \
-        reference_images (ignored, with a warning, if a frame is given - frames win). This tool \
-        has NO defaults: model, prompt, duration and generate_audio must all be specified, or the \
-        call fails naming what is missing. For text-to-video an aspect_ratio OR size is required \
-        too; with first_frame/last_frame it is not, because the output ratio follows the frame \
-        image and some models reject a ratio outright in that mode. `output` is \
+        save it to `output`. For text-to-video, pass a prompt plus (aspect_ratio and/or \
+        resolution) OR size. `resolution` is a named tier (480p/720p/1080p/1K/2K/4K); `size` is \
+        explicit pixels as \"WIDTHxHEIGHT\" (e.g. \"1280x720\") - an alternative to \
+        resolution+aspect_ratio, not interchangeable with the tier vocabulary. For image-to-video, \
+        pass first_frame (and optionally last_frame) as local image paths and provide neither \
+        aspect_ratio nor size - the output ratio follows the frame image, and some models reject \
+        a ratio outright in that mode; for reference-to-video pass reference_images (ignored, with \
+        a warning, if a frame is given - first_frame/last_frame win). No defaults for the required \
+        fields: model, prompt, duration and generate_audio must all be specified, or the call \
+        fails naming what is missing (resolution/size, seed, frames, references, \
+        max_image_dimension, wait_seconds, and output are all optional). `duration` is the clip's \
+        length in seconds (model-specific discrete values - see describe_model), not how long \
+        generation takes. `generate_audio` controls the audio track baked into the clip, unrelated \
+        to the generate_audio TTS tool. `output` is \
         optional - omit it for an auto-named file under OPENROUTER_MCP_OUTPUT_DIR \
         (default $HOME/Downloads/openrouter-mcp). Video generation \
         is slow (30s to several minutes): it runs asynchronously and almost always returns status \

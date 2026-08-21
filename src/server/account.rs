@@ -19,7 +19,7 @@ use super::OpenRouterServer;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct GetResultArgs {
-    /// The task_id returned by generate_image (or a future generate_video).
+    /// The task_id returned by generate_image or generate_video.
     pub task_id: String,
 }
 
@@ -36,7 +36,8 @@ pub(crate) struct ResetUsageStatsArgs {
 impl OpenRouterServer {
     #[tool(
         description = "Fetch the status and result of a generation job by task_id (returned \
-        by generate_image when a job is still running after its fast-return window). Returns \
+        by generate_image or generate_video when a job is still running after its fast-return \
+        window). Returns \
         status pending|completed|failed; when completed, the same lean result (image paths, \
         dimensions, manifest) generate_image would have returned. Tasks are in-memory per \
         server process and are lost if the server restarts.",
@@ -124,8 +125,9 @@ impl OpenRouterServer {
         description = "Return in-memory usage statistics for this server process: version (the \
         server build version), started_at, \
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
-        text_generations (describe_image and chat_completion calls), actual_cost_usd \
-        (summed from usage.cost), \
+        video_generations, videos_generated, audio_generations, audio_files, \
+        text_generations (describe_image, chat_completion, and transcribe_audio calls), \
+        actual_cost_usd (summed from usage.cost), \
         unknown_cost_count, and a by_model breakdown. Counters reset when the server restarts.",
         annotations(
             title = "Get Usage Stats",

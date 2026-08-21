@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
 use crate::server::result::{MAX_INLINE_AUDIO_BYTES, client_wants_inline_previews};
-use crate::server::schema::{de_opt_f64, require_all, scalarize_nullable};
+use crate::server::schema::{RequireFields, de_opt_f64, require_all, scalarize_nullable};
 
 use super::OpenRouterServer;
 
@@ -42,11 +42,23 @@ pub(crate) struct TranscribeAudioArgs {
     /// Optional ISO-639-1 language hint (e.g. "en", "ja"); improves accuracy.
     #[serde(default)]
     pub language: Option<String>,
+    /// "json" (default) or "verbose_json" (adds language/duration/segments/words -
+    /// OpenAI-compatible providers only; others reject it with a 400).
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// "segment" and/or "word": per-segment/word timestamps. Only honored with
+    /// response_format="verbose_json" on an OpenAI-compatible provider.
+    #[serde(default)]
+    pub timestamp_granularities: Vec<String>,
+    /// Sampling temperature (select providers only).
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub temperature: Option<f64>,
 }
 
 /// Arguments for the `generate_audio` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
+#[schemars(transform = RequireFields(&["input", "voice"]))]
 pub(crate) struct GenerateAudioArgs {
     /// TTS model id, e.g. "hexgrad/kokoro-82m". Voice ids are model-specific, so
     /// pair this with a voice the model actually declares - `list_models` with
@@ -77,10 +89,11 @@ impl OpenRouterServer {
     #[tool(
         description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
         hexgrad/kokoro-82m with voice af_heart) and save the audio to `output`. This is a \
-        synchronous, fast call (not a background task). This tool has NO defaults: model, input \
-        (the text), and voice must all be specified, or the call fails naming what is \
+        synchronous, fast call (not a background task). No defaults for the required fields: \
+        model, input (the text), and voice must all be specified, or the call fails naming what is \
         missing. Voice ids are model-specific and are not interchangeable between models - \
-        call list_models with output_modalities=speech to see each model's supported_voices. `output` is optional - omit it for an auto-named file under \
+        call list_models with output_modalities=speech to see each model's supported_voices. \
+        `output` is optional - omit it for an auto-named file under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). Returns the saved file path in JSON; for sandboxed clients it also returns a \
         native inline audio content block when the file is small enough. response_format defaults \
         to mp3 so the extension is deterministic.",
@@ -203,7 +216,12 @@ impl OpenRouterServer {
         synchronous, fast call (not a background task). Pass the audio as `path` (a local file, \
         format inferred from its extension) or `base64` (inline data, with `format`); accepted \
         formats are wav, mp3, flac, m4a, ogg, webm, aac, up to 25 MB. An optional `language` \
-        hint (ISO-639-1, e.g. \"en\") improves accuracy. Returns the transcript text. Discover \
+        hint (ISO-639-1, e.g. \"en\") improves accuracy. Returns the transcript text by default \
+        (response_format=\"json\"). Set response_format=\"verbose_json\" to get the full \
+        response object (language, duration, segments, words, ...) instead - this needs an \
+        OpenAI-compatible provider; other providers reject it with a 400. \
+        timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
+        an OpenAI-compatible provider. Discover \
         STT models with list_models using output_modalities=\"transcription\" - they are not in \
         the default model list. To create speech from text instead, use generate_audio.",
         annotations(
@@ -225,9 +243,13 @@ impl OpenRouterServer {
         match audio_gen::transcribe(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    result.text,
-                )]))
+                let body = match result.verbose {
+                    // verbose_json: return the full response object, not just text.
+                    Some(v) => serde_json::to_string_pretty(&v)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                    None => result.text,
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;
@@ -275,6 +297,9 @@ async fn resolve_transcribe_request(
         data,
         format,
         language: args.language.filter(|s| !s.trim().is_empty()),
+        response_format: args.response_format,
+        timestamp_granularities: args.timestamp_granularities,
+        temperature: args.temperature,
     })
 }
 
@@ -387,6 +412,9 @@ mod tests {
                 base64: Some("data:audio/mp3;base64,QUJD".to_string()),
                 format: None,
                 language: Some("en".to_string()),
+                response_format: None,
+                timestamp_granularities: vec![],
+                temperature: None,
             }))
             .await
             .unwrap();
@@ -409,6 +437,9 @@ mod tests {
                 base64: b64.map(str::to_string),
                 format: format.map(str::to_string),
                 language: None,
+                response_format: None,
+                timestamp_granularities: vec![],
+                temperature: None,
             })
         };
 
@@ -452,6 +483,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcribe_audio_verbose_json_returns_the_full_response_object() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "openai/whisper-1",
+                "input_audio": { "data": "QUJD", "format": "mp3" },
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word", "segment"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello there",
+                "language": "english",
+                "duration": 1.5,
+                "segments": [{"id": 0, "text": "hello there"}],
+                "words": [{"word": "hello", "start": 0.0, "end": 0.4}],
+                "usage": { "cost": 0.0004 }
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let res = server
+            .transcribe_audio(Parameters(TranscribeAudioArgs {
+                model: "openai/whisper-1".to_string(),
+                path: None,
+                base64: Some("data:audio/mp3;base64,QUJD".to_string()),
+                format: None,
+                language: None,
+                response_format: Some("verbose_json".to_string()),
+                timestamp_granularities: vec!["word".to_string(), "segment".to_string()],
+                temperature: None,
+            }))
+            .await
+            .unwrap();
+        let v = tool_result_json(&res);
+        // The full verbose object reaches the caller, not just bare text.
+        assert_eq!(v["text"], "hello there");
+        assert_eq!(v["language"], "english");
+        assert_eq!(v["duration"], 1.5);
+        assert!(v["segments"].is_array());
+        assert!(v["words"].is_array());
+
+        let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
+        assert_eq!(stats["actual_cost_usd"], 0.0004);
+    }
+
+    #[tokio::test]
     async fn transcribe_audio_reads_a_local_file_and_infers_its_format() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
@@ -478,6 +557,9 @@ mod tests {
                 base64: None,
                 format: None,
                 language: None,
+                response_format: None,
+                timestamp_granularities: vec![],
+                temperature: None,
             }))
             .await
             .unwrap();

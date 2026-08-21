@@ -273,4 +273,18 @@ mod tests {
         assert!(human.get("completion").is_none());
         assert!(human.get("discount").is_none());
     }
+
+    /// `overrides` is a non-string (array) value like `discount`'s sibling
+    /// fields: humanize_pricing must ignore it rather than crash, since only
+    /// string price fields are humanized.
+    #[test]
+    fn humanize_pricing_tolerates_non_string_overrides() {
+        let p = serde_json::json!({
+            "prompt": "0.000005",
+            "overrides": [{"condition": "peak_hours", "prompt": "0.00001"}]
+        });
+        let human = humanize_pricing(&p).unwrap();
+        assert_eq!(human["prompt"], "$5/M tokens");
+        assert!(human.get("overrides").is_none());
+    }
 }

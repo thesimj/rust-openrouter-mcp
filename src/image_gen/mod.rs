@@ -97,6 +97,14 @@ pub struct GenerateRequest {
     pub images: Vec<InputImage>,
     /// Longest-side cap (px) for normalized input images.
     pub max_image_dimension: u32,
+    /// "auto" | "low" | "medium" | "high". Provider support varies.
+    pub quality: Option<String>,
+    /// "png" | "jpeg" | "webp" | "svg". Provider support varies.
+    pub output_format: Option<String>,
+    /// "auto" | "transparent" | "opaque". Provider support varies.
+    pub background: Option<String>,
+    /// 0-100, webp/jpeg only. Provider support varies.
+    pub output_compression: Option<u32>,
 }
 
 /// Resolve the input-image dimension cap: explicit value, else the
@@ -130,6 +138,9 @@ pub struct GeneratedImage {
     pub generation_id: Option<String>,
     /// Provider that served the request (e.g. "Google"), recorded in the manifest.
     pub provider: Option<String>,
+    /// Non-fatal notes about this generation (e.g. a declared `media_type` that
+    /// disagreed with the actual sniffed bytes).
+    pub warnings: Vec<String>,
 }
 
 /// Prepend a labeled reference-image block when any input image has a label, so
@@ -243,6 +254,16 @@ pub(crate) struct GenContent {
     reference_urls: Vec<String>,
 }
 
+/// Canonicalize a provider-declared MIME to the form [`image_io::sniff_mime`]
+/// emits, so a real-world alias (`image/jpg`) doesn't false-positive as a
+/// mismatch against the sniffed `image/jpeg` in [`generate_core`].
+fn canonical_mime(mime: &str) -> &str {
+    match mime {
+        "image/jpg" => "image/jpeg",
+        other => other,
+    }
+}
+
 /// Assemble the prompt (with any labeled-reference preamble) and collect the
 /// prepared input-image data URLs into a [`GenContent`], once per job.
 pub(crate) fn build_gen_content(
@@ -290,6 +311,10 @@ pub(crate) async fn generate_core(
         seed,
         n: None,
         input_references,
+        quality: req.quality.clone(),
+        output_format: req.output_format.clone(),
+        background: req.background.clone(),
+        output_compression: req.output_compression,
     };
 
     let (resp, generation_id) = client.generate_images(&request).await?;
@@ -301,12 +326,29 @@ pub(crate) async fn generate_core(
         .context("model returned no image (it may have refused)")?;
 
     let bytes = image_io::decode_base64(&item.b64_json)?;
-    // Prefer the response-declared MIME (only sent for vector output), else sniff
-    // the raster magic bytes, else default to PNG.
-    let mime = item
-        .media_type
-        .or_else(|| image_io::sniff_mime(&bytes).map(str::to_string))
-        .unwrap_or_else(|| "image/png".to_string());
+    // Sniff the raster magic bytes first - they are ground truth. A declared
+    // `image/svg+xml` is trusted as-is (sniffing never recognizes SVG text as a
+    // raster format, so there is nothing to cross-check it against). Otherwise,
+    // when the response also declared a `media_type` that disagrees with the
+    // sniffed bytes, the sniffed one wins and the mismatch is recorded as a
+    // warning rather than silently saving the file under the wrong extension.
+    let mut warnings = Vec::new();
+    let sniffed = image_io::sniff_mime(&bytes).map(str::to_string);
+    let mime = if item.media_type.as_deref() == Some("image/svg+xml") {
+        item.media_type.unwrap()
+    } else if let Some(sniffed) = sniffed {
+        if let Some(declared) = &item.media_type
+            && canonical_mime(declared) != sniffed
+        {
+            warnings.push(format!(
+                "provider declared media_type {declared:?} but the image bytes are \
+                 actually {sniffed}; saved using the sniffed type"
+            ));
+        }
+        sniffed
+    } else {
+        item.media_type.unwrap_or_else(|| "image/png".to_string())
+    };
     let (width, height) = if mime == "image/svg+xml" {
         image_io::svg_dimensions(&bytes).unwrap_or((0, 0))
     } else {
@@ -324,6 +366,7 @@ pub(crate) async fn generate_core(
         generation_id,
         // The Images API response body carries no provider attribution.
         provider: None,
+        warnings,
     })
 }
 

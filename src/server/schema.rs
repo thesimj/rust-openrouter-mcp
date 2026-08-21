@@ -41,6 +41,42 @@ pub(crate) fn scalarize_nullable(schema: &mut schemars::Schema) {
     transform_subschemas(&mut scalarize_nullable, schema);
 }
 
+/// Force the container's JSON-Schema `required` array to also list `self.0`,
+/// on top of whatever schemars inferred from non-`Option` fields.
+///
+/// Fields the tool prose calls "REQUIRED (no default)" are kept `Option<T>` so
+/// `require_all` can report a friendly per-field error instead of a raw schema
+/// rejection - but that makes schemars mark them optional in the schema too, so
+/// a schema-trusting client omits them and only fails at runtime. Applied via
+/// `#[schemars(transform = RequireFields(&[...]))]` alongside `scalarize_nullable`.
+pub(crate) struct RequireFields(pub(crate) &'static [&'static str]);
+
+impl schemars::transform::Transform for RequireFields {
+    fn transform(&mut self, schema: &mut schemars::Schema) {
+        if let Some(obj) = schema.as_object_mut() {
+            // Catch a typo'd/renamed field name at test time (F13), before it
+            // silently no-ops in the generated schema.
+            for name in self.0 {
+                debug_assert!(
+                    obj.get("properties").and_then(|p| p.get(*name)).is_some(),
+                    "RequireFields: {name:?} is not a property of this schema"
+                );
+            }
+            let required = obj
+                .entry("required")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let serde_json::Value::Array(arr) = required {
+                for name in self.0 {
+                    let v = serde_json::Value::String((*name).to_string());
+                    if !arr.contains(&v) {
+                        arr.push(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Coerce a JSON value that is either a real boolean or a stringified one
 /// (`"true"`/`"false"`, case- and whitespace-insensitive) into a `bool`. This is
 /// the deserialization-side counterpart to [`scalarize_nullable`]: it absorbs the
@@ -154,6 +190,7 @@ pub(crate) fn require_all(tool: &str, modality: &str, missing: &[&str]) -> Resul
 #[cfg(test)]
 mod tests {
     use crate::server::audio::GenerateAudioArgs;
+    use crate::server::chat::ChatCompletionArgs;
     use crate::server::image::{DescribeImageArgs, GenerateImageArgs, ImageInput};
     use crate::server::models::ListModelsArgs;
     use crate::server::video::GenerateVideoArgs;
@@ -170,6 +207,96 @@ mod tests {
             .and_then(|p| p.get("type"))
             .cloned()
             .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Fetch a property's raw schema object for a tool-argument struct.
+    fn prop<T: JsonSchema + std::any::Any>(name: &str) -> serde_json::Value {
+        schema_for_type::<T>()
+            .get("properties")
+            .and_then(|p| p.get(name))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// F13: a `RequireFields` name that doesn't match any property (a typo, or
+    /// a rename that forgot to update the transform) must fail loudly in a
+    /// debug build rather than silently no-op in the generated schema.
+    /// `debug_assert!` compiles out under `--release`, so this test would
+    /// simply not panic there (N1) - gate it on the same cfg the assert itself
+    /// depends on rather than failing spuriously in a release run.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "is not a property of this schema")]
+    fn require_fields_catches_an_unknown_property_name() {
+        use serde::Deserialize;
+        #[derive(Deserialize, JsonSchema)]
+        #[schemars(transform = super::RequireFields(&["does_not_exist"]))]
+        struct Bogus {
+            #[allow(dead_code)]
+            #[serde(default)]
+            real_field: Option<String>,
+        }
+        schema_for_type::<Bogus>();
+    }
+
+    /// The `required` array of a tool-argument struct's schema.
+    fn required_fields<T: JsonSchema + std::any::Any>() -> Vec<String> {
+        schema_for_type::<T>()
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The tools/list schema for each "REQUIRED (no default)" field must actually
+    /// list it in `required`, not just say so in prose - otherwise a
+    /// schema-trusting client omits it and only fails at runtime (S1).
+    #[test]
+    fn required_no_default_fields_are_in_the_schema_required_array() {
+        let chat = required_fields::<ChatCompletionArgs>();
+        assert!(chat.contains(&"prompt".to_string()), "{chat:?}");
+
+        let audio = required_fields::<GenerateAudioArgs>();
+        assert!(audio.contains(&"input".to_string()), "{audio:?}");
+        assert!(audio.contains(&"voice".to_string()), "{audio:?}");
+
+        let image = required_fields::<GenerateImageArgs>();
+        assert!(image.contains(&"aspect_ratio".to_string()), "{image:?}");
+        assert!(image.contains(&"image_size".to_string()), "{image:?}");
+
+        let video = required_fields::<GenerateVideoArgs>();
+        assert!(video.contains(&"duration".to_string()), "{video:?}");
+        assert!(video.contains(&"generate_audio".to_string()), "{video:?}");
+        // aspect_ratio is conditional (only required for text-to-video without a
+        // frame), so it must stay OUT of the unconditional schema required list.
+        assert!(!video.contains(&"aspect_ratio".to_string()), "{video:?}");
+    }
+
+    /// `describe_image.images` must declare `minItems: 1` - the prose already
+    /// says at least one image is required (S13).
+    #[test]
+    fn describe_image_images_has_min_items_one() {
+        let images = prop::<DescribeImageArgs>("images");
+        assert_eq!(images["minItems"], json!(1), "got: {images}");
+    }
+
+    /// `max_image_dimension` must cap at 4096 in the schema, matching the prose
+    /// cap, on every tool that carries it (S14/F6): chat_completion,
+    /// generate_image, describe_image, and generate_video.
+    #[test]
+    fn max_image_dimension_caps_at_4096_in_schema() {
+        for max in [
+            prop::<ChatCompletionArgs>("max_image_dimension")["maximum"].clone(),
+            prop::<GenerateImageArgs>("max_image_dimension")["maximum"].clone(),
+            prop::<DescribeImageArgs>("max_image_dimension")["maximum"].clone(),
+            prop::<GenerateVideoArgs>("max_image_dimension")["maximum"].clone(),
+        ] {
+            assert_eq!(max, json!(4096));
+        }
     }
 
     /// schemars renders `Option<bool>` as the union `["boolean","null"]`, which

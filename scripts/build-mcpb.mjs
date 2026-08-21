@@ -9,8 +9,9 @@
 //
 // The manifest's version is read from Cargo.toml (single source of truth, so it
 // can never drift from the crate), and entry_point / command / platforms are
-// set for the target. On macOS a universal (arm64 + x86_64) binary is produced
-// via lipo when both targets are installed; otherwise the native arch is used.
+// set for the target. On macOS a universal (arm64 + x86_64) binary is always
+// produced via lipo - both targets are added with `rustup target add` and
+// built unconditionally, then combined.
 //
 // Usage:  node scripts/build-mcpb.mjs
 // Requires: cargo, node/npx. macOS universal builds also need lipo (Xcode CLT).
@@ -57,7 +58,8 @@ function crateVersion() {
   return m[1];
 }
 
-// Build the release binary for the host. On macOS, attempt a universal binary.
+// Build the release binary for the host. On macOS, always build a universal
+// (arm64 + x86_64) binary via lipo.
 function buildBinary(stageBinDir) {
   const out = join(stageBinDir, `${BIN_NAME}${platform.exe}`);
   if (process.platform === "darwin") {

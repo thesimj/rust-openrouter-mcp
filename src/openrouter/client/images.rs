@@ -51,6 +51,10 @@ mod tests {
             seed: None,
             n: None,
             input_references: vec![],
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
         }
     }
 

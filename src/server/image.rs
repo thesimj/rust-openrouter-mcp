@@ -20,7 +20,7 @@ use crate::server::naming;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
-use crate::server::schema::{de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{RequireFields, de_opt_uint, require_all, scalarize_nullable};
 use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
@@ -248,6 +248,7 @@ pub(crate) async fn resolve_image_inputs(
 /// Arguments for the `generate_image` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
+#[schemars(transform = RequireFields(&["aspect_ratio", "image_size"]))]
 pub(crate) struct GenerateImageArgs {
     /// Image model id, e.g. "google/gemini-3.1-flash-image-preview".
     pub model: String,
@@ -257,8 +258,8 @@ pub(crate) struct GenerateImageArgs {
     /// (maps to image_config.aspect_ratio).
     #[serde(default)]
     pub aspect_ratio: Option<String>,
-    /// REQUIRED (no default): resolution tier, e.g. "1K", "2K", "4K"
-    /// (maps to image_config.image_size).
+    /// REQUIRED (no default): resolution TIER (not pixel dimensions), e.g.
+    /// "1K", "2K", "4K" (maps to image_config.image_size).
     #[serde(default)]
     pub image_size: Option<String>,
     /// Seed for reproducible-ish generation (provider support varies).
@@ -272,9 +273,11 @@ pub(crate) struct GenerateImageArgs {
     /// Longest-side cap (px) for input images before sending (default 1536,
     /// max 4096; env OPENROUTER_IMAGE_MAX_DIMENSION).
     #[serde(default, deserialize_with = "de_opt_uint")]
+    #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
-    /// With >1, files are named <output>-var-001, -002, ... and one manifest covers all.
+    /// With >1, files are named <output>-var-<seed> (zero-padded to 4 digits), or
+    /// -var-<index> when no seed is set; one manifest covers all variants.
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 1, max = 16))]
     pub variants: Option<usize>,
@@ -289,6 +292,21 @@ pub(crate) struct GenerateImageArgs {
     /// (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
+    /// Output quality: "auto", "low", "medium", or "high". Provider support varies.
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Output file format: "png", "jpeg", "webp", or "svg". Provider support
+    /// varies; the saved file's extension always matches what the provider
+    /// actually returns, not this request.
+    #[serde(default)]
+    pub output_format: Option<String>,
+    /// Background: "auto", "transparent", or "opaque". Provider support varies.
+    #[serde(default)]
+    pub background: Option<String>,
+    /// Output compression 0-100 (webp/jpeg only). Provider support varies.
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    #[schemars(range(min = 0, max = 100))]
+    pub output_compression: Option<u32>,
 }
 
 /// Arguments for the `describe_image` tool.
@@ -300,12 +318,14 @@ pub(crate) struct DescribeImageArgs {
     pub model: String,
     /// Image(s) to describe (at least one required). Each takes exactly one of:
     /// path (local file), url (http/https), or base64 (data: URL or raw base64).
+    #[schemars(length(min = 1))]
     pub images: Vec<ImageInput>,
     /// Instruction or question about the image(s). Defaults to a detailed description.
     #[serde(default)]
     pub prompt: Option<String>,
     /// Longest-side cap (px) for input images before sending (default 1536, max 4096).
     #[serde(default, deserialize_with = "de_opt_uint")]
+    #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Optional reasoning effort: "max", "xhigh", "high", "medium", "low",
     /// "minimal" or "none". Omit to keep the model's own default. Accepted
@@ -359,14 +379,20 @@ impl OpenRouterServer {
         pass a prompt. For editing / image-to-image, also pass `images` - each given as a \
         local path, an http(s) url, or base64/data-URL (order preserved; optional per-image \
         label) - the prompt becomes the edit instruction. \
-        Set variants>1 to generate several in parallel (seed-stepped). Returns a compact \
+        Set variants>1 to generate several in parallel (seed-stepped). Optional `quality` \
+        (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` \
+        (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) are passed \
+        straight through to the provider - support for each varies by model, and whatever \
+        format actually comes back is what gets saved (the extension always matches the real \
+        result, not the request). Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
-        warnings. The output format (PNG, JPEG, or SVG) is chosen by the provider and the \
-        extension is set to match. Works with any OpenRouter image model (Nano Banana, Grok, \
-        Seedream, FLUX, GPT Image, Recraft, ...) via the dedicated image endpoint. This tool \
-        has NO defaults: model, prompt, aspect_ratio and image_size must all be specified, or \
-        the call fails with an error naming what is missing (output is optional, see above). \
+        warnings. Works with any OpenRouter image model (Nano Banana, Grok, \
+        Seedream, FLUX, GPT Image, Recraft, ...) via the dedicated image endpoint. No defaults \
+        for the required fields: model, prompt, aspect_ratio and image_size must all be \
+        specified, or the call fails with an error naming what is missing (every other \
+        param - seed, images, max_image_dimension, variants, wait_seconds, output, quality, \
+        output_format, background, output_compression - is optional). \
         Runs asynchronously: if the job is still going after \
         wait_seconds (default 10), it returns status \"pending\" with a task_id to poll via \
         get_result; otherwise it returns the completed result inline. To analyze or caption \
@@ -416,6 +442,10 @@ impl OpenRouterServer {
             seed: args.seed,
             images,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+            quality: args.quality,
+            output_format: args.output_format,
+            background: args.background,
+            output_compression: args.output_compression,
         };
 
         let variants = args.variants.unwrap_or(1).clamp(1, 16);
@@ -474,7 +504,7 @@ impl OpenRouterServer {
     }
 
     #[tool(
-        description = "Describe or answer a question about local image(s) using a vision-capable \
+        description = "Describe or answer a question about image(s) using a vision-capable \
         model (image input, text output, e.g. google/gemini-2.5-flash, anthropic/claude-sonnet-4.6, \
         or openai/gpt-5.4). Pass one or more images (each a local path, an http(s) url, or \
         base64/data-URL) and an optional prompt/question (defaults to a detailed description); \
@@ -643,6 +673,10 @@ mod tests {
             variants: None,
             wait_seconds: Some(30),
             output: Some(out.to_string_lossy().into_owned()),
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
         };
         // Fast mock completes within the wait window -> inline completed result.
         // inline_previews=true mirrors a Claude Desktop client.
@@ -708,11 +742,70 @@ mod tests {
             variants: None,
             wait_seconds: None,
             output: Some("out.png".to_string()),
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));
         assert!(err.message.contains("image_size"));
         assert!(err.message.contains("no defaults"));
+    }
+
+    #[tokio::test]
+    async fn generate_image_forwards_quality_format_background_compression() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "quality": "medium",
+                "output_format": "webp",
+                "background": "opaque",
+                "output_compression": 50
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "b64_json": valid_png_b64(), "media_type": "image/webp" }]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-quality-test.png");
+        let args = GenerateImageArgs {
+            model: "m".to_string(),
+            prompt: "p".to_string(),
+            aspect_ratio: Some("1:1".to_string()),
+            image_size: Some("1K".to_string()),
+            seed: None,
+            images: vec![],
+            max_image_dimension: None,
+            variants: None,
+            wait_seconds: Some(30),
+            output: Some(out.to_string_lossy().into_owned()),
+            quality: Some("medium".to_string()),
+            output_format: Some("webp".to_string()),
+            background: Some("opaque".to_string()),
+            output_compression: Some(50),
+        };
+        let res = server.run_generate(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["status"], "completed");
+        // The bytes are actually PNG (valid_png_b64) despite the provider
+        // declaring "image/webp": sniffing wins, so the file is saved as .png,
+        // and the mismatch is surfaced as a warning rather than silently trusted.
+        assert!(
+            v["images"][0]["path"].as_str().unwrap().ends_with(".png"),
+            "got: {v}"
+        );
+        let warnings = v["warnings"].as_array().expect("a warning is present");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("image/webp")
+                    && w.as_str().unwrap().contains("image/png")),
+            "got: {warnings:?}"
+        );
     }
 
     /// Defense in depth: even with a scalar schema, clients that stringify all

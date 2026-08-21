@@ -41,12 +41,20 @@ pub struct TranscribeRequest {
     pub format: String,
     /// Optional ISO-639-1 language hint (e.g. "en").
     pub language: Option<String>,
+    /// "json" (default, when `None`) or "verbose_json".
+    pub response_format: Option<String>,
+    /// "segment"/"word"; verbose_json + OpenAI-compatible providers only.
+    pub timestamp_granularities: Vec<String>,
+    pub temperature: Option<f64>,
 }
 
-/// A transcript plus the reported USD cost, when present.
+/// A transcript plus the reported USD cost, when present. `verbose` carries the
+/// full response object (language/duration/segments/words/...) only when
+/// `response_format` was "verbose_json"; the default path leaves it `None`.
 pub struct TranscribeResult {
     pub text: String,
     pub cost: Option<f64>,
+    pub verbose: Option<serde_json::Value>,
 }
 
 /// Read a local audio file into `(base64, format)` for [`TranscribeRequest`],
@@ -98,6 +106,24 @@ pub async fn transcribe(
     client: &OpenRouterClient,
     req: &TranscribeRequest,
 ) -> Result<TranscribeResult> {
+    // Normalized once here, so every caller (MCP tool, CLI) gets the same
+    // blank-filtering and case-insensitive gating without duplicating it:
+    // trim+lowercase response_format so "Verbose_json"/" json " both work, and
+    // trim+lowercase+drop-blank timestamp_granularities entries the same way
+    // before they reach the wire ("Word"/" segment " both work too).
+    let response_format = req
+        .response_format
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let timestamp_granularities: Vec<String> = req
+        .timestamp_granularities
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let body = TranscriptionBody {
         model: req.model.clone(),
         input_audio: InputAudio {
@@ -105,14 +131,28 @@ pub async fn transcribe(
             format: req.format.clone(),
         },
         language: req.language.clone(),
+        response_format: response_format.clone(),
+        timestamp_granularities,
+        temperature: req.temperature,
     };
-    let resp = client.transcribe(&body).await?;
-    if resp.text.trim().is_empty() {
+    let raw = client.transcribe(&body).await?;
+    let text = raw
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if text.trim().is_empty() {
         bail!("model returned an empty transcript");
     }
+    let cost = raw
+        .get("usage")
+        .and_then(|u| u.get("cost"))
+        .and_then(serde_json::Value::as_f64);
+    let verbose = (response_format.as_deref() == Some("verbose_json")).then_some(raw);
     Ok(TranscribeResult {
-        text: resp.text,
-        cost: resp.usage.and_then(|u| u.cost),
+        text,
+        cost,
+        verbose,
     })
 }
 
@@ -172,10 +212,17 @@ pub async fn run_job(
     output: &Path,
     input_source: &str,
 ) -> Result<AudioJobResult> {
-    // Default response_format to mp3 so the extension is deterministic.
+    // Default response_format to mp3 so the extension is deterministic. Fixed
+    // here (not in each caller) because both the MCP tool and the CLI route
+    // through this one function: a blank/whitespace-only value must behave as
+    // absent, not reach the wire as a literal "  " (same class of bug as the
+    // transcribe_audio response_format/timestamp_granularities blank-filter).
     let response_format = req
         .response_format
-        .clone()
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| "mp3".to_string());
 
     let body = SpeechBody {
@@ -287,6 +334,36 @@ mod tests {
         assert_eq!(std::fs::read(&result.audio.path).unwrap(), b"ID3-FAKE-MP3");
     }
 
+    /// N5 (B10 sibling of F9): a blank/whitespace-only response_format must
+    /// behave exactly like `None` - the mp3 default - not reach the wire as a
+    /// literal "  ".
+    #[tokio::test]
+    async fn run_job_treats_blank_response_format_as_omitted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(body_partial_json(json!({ "response_format": "mp3" })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE-MP3".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let req = SpeechGenRequest {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: "hello world".to_string(),
+            voice: "alloy".to_string(),
+            response_format: Some("   ".to_string()),
+            speed: None,
+        };
+        let base = std::env::temp_dir().join("openrouter-mcp-audio-blank-format/speech.mp3");
+        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        assert_eq!(result.audio.response_format, "mp3");
+    }
+
     #[tokio::test]
     async fn run_job_surfaces_a_provider_error() {
         let server = MockServer::start().await;
@@ -312,5 +389,97 @@ mod tests {
             Ok(_) => panic!("provider error should propagate"),
         };
         assert!(err.to_string().contains("unknown voice"));
+    }
+
+    fn transcribe_req(response_format: Option<&str>, granularities: &[&str]) -> TranscribeRequest {
+        TranscribeRequest {
+            model: "openai/whisper-1".to_string(),
+            data: "QUJD".to_string(),
+            format: "mp3".to_string(),
+            language: None,
+            response_format: response_format.map(str::to_string),
+            timestamp_granularities: granularities.iter().map(|s| s.to_string()).collect(),
+            temperature: None,
+        }
+    }
+
+    /// F10: response_format gating and the wire value are case/whitespace
+    /// insensitive - "Verbose_json" (and " verbose_json ") behave exactly like
+    /// "verbose_json".
+    #[tokio::test]
+    async fn transcribe_normalizes_response_format_case_and_whitespace() {
+        for input in [" Verbose_JSON ", "verbose_json", "VERBOSE_JSON"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/audio/transcriptions"))
+                .and(body_partial_json(
+                    json!({ "response_format": "verbose_json" }),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "text": "hi", "language": "english"
+                })))
+                .mount(&server)
+                .await;
+
+            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+            let result = transcribe(&client, &transcribe_req(Some(input), &[]))
+                .await
+                .unwrap();
+            // The gate reads the same normalized value, so verbose output is
+            // returned regardless of how the caller spelled/cased it.
+            assert!(
+                result.verbose.is_some(),
+                "input {input:?} got: {:?}",
+                result.verbose
+            );
+            assert_eq!(result.verbose.unwrap()["language"], "english");
+        }
+    }
+
+    /// F9: a blank/whitespace-only response_format is treated as absent (the
+    /// default "json" path), not sent to the wire as an empty string.
+    #[tokio::test]
+    async fn transcribe_drops_blank_response_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "hi" })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let result = transcribe(&client, &transcribe_req(Some("   "), &[]))
+            .await
+            .unwrap();
+        assert!(result.verbose.is_none());
+
+        let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(sent.get("response_format").is_none(), "sent: {sent}");
+    }
+
+    /// F9: blank entries in timestamp_granularities are dropped before the wire.
+    #[tokio::test]
+    async fn transcribe_drops_blank_timestamp_granularities_entries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            // N4: "Word" is lowercased to "word", like response_format, and the
+            // blank/whitespace-only entries are dropped entirely.
+            .and(body_partial_json(
+                json!({ "timestamp_granularities": ["word", "segment"] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "hi" })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        transcribe(
+            &client,
+            &transcribe_req(None, &["  ", "Word", "", " Segment "]),
+        )
+        .await
+        .unwrap();
     }
 }

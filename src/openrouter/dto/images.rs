@@ -28,6 +28,18 @@ pub struct ImagesRequest {
     pub n: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_references: Vec<InputReference>,
+    /// "auto" | "low" | "medium" | "high". Provider support varies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    /// "png" | "jpeg" | "webp" | "svg". Provider support varies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    /// "auto" | "transparent" | "opaque". Provider support varies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// 0-100, webp/jpeg only. Provider support varies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_compression: Option<u32>,
 }
 
 /// Response from `POST /api/v1/images`.
@@ -69,6 +81,10 @@ mod tests {
             input_references: vec![InputReference::new(ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
             })],
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -80,6 +96,36 @@ mod tests {
                 "input_references": [
                     { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
                 ]
+            })
+        );
+    }
+
+    /// The new pass-through knobs (quality/output_format/background/
+    /// output_compression) reach the wire only when set.
+    #[test]
+    fn images_request_serializes_new_optional_knobs() {
+        let req = ImagesRequest {
+            model: "openai/gpt-image-2".to_string(),
+            prompt: "an owl".to_string(),
+            resolution: None,
+            aspect_ratio: None,
+            seed: None,
+            n: None,
+            input_references: vec![],
+            quality: Some("high".to_string()),
+            output_format: Some("webp".to_string()),
+            background: Some("transparent".to_string()),
+            output_compression: Some(80),
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "model": "openai/gpt-image-2",
+                "prompt": "an owl",
+                "quality": "high",
+                "output_format": "webp",
+                "background": "transparent",
+                "output_compression": 80
             })
         );
     }

@@ -217,7 +217,7 @@ pub async fn run_job(
                             req.aspect_ratio.as_deref(),
                             req.image_size.as_deref(),
                         );
-                        for w in &check.warnings {
+                        for w in check.warnings.iter().chain(&img.warnings) {
                             warnings.push(format!("variant {}: {w}", outcome.index + 1));
                         }
                         meta.path = Some(path.to_string_lossy().into_owned());
@@ -266,6 +266,10 @@ pub async fn run_job(
         base_seed: req.seed,
         variants_requested: variants,
         max_image_dimension: req.max_image_dimension,
+        quality: req.quality.clone(),
+        output_format: req.output_format.clone(),
+        background: req.background.clone(),
+        output_compression: req.output_compression,
         created_at: chrono::Utc::now().to_rfc3339(),
         input_images,
         variants: variant_metas,
@@ -323,5 +327,50 @@ mod tests {
             crate::manifest::path(Path::new("out/hero.png")),
             PathBuf::from("out/hero.manifest.json")
         );
+    }
+
+    /// F5: the manifest doc says it holds "the full request settings" - the
+    /// four new image knobs (quality/output_format/background/
+    /// output_compression) must actually round-trip onto disk, not just live in
+    /// the request struct.
+    #[tokio::test]
+    async fn run_job_records_the_new_image_knobs_in_the_manifest() {
+        use wiremock::matchers::{method, path as wpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wpath("/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "b64_json": PNG_1X1_B64 }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let req = GenerateRequest {
+            model: "openai/gpt-image-2".to_string(),
+            prompt: "an owl".to_string(),
+            aspect_ratio: Some("1:1".to_string()),
+            image_size: Some("1K".to_string()),
+            seed: None,
+            images: vec![],
+            max_image_dimension: 800,
+            quality: Some("high".to_string()),
+            output_format: Some("webp".to_string()),
+            background: Some("transparent".to_string()),
+            output_compression: Some(80),
+        };
+        let base = std::env::temp_dir().join("openrouter-mcp-manifest-knobs-test/hero.png");
+        let summary = run_job(&client, &req, 1, &base, "inline").await.unwrap();
+
+        let manifest_json = std::fs::read_to_string(&summary.manifest_path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+        assert_eq!(manifest["quality"], "high");
+        assert_eq!(manifest["output_format"], "webp");
+        assert_eq!(manifest["background"], "transparent");
+        assert_eq!(manifest["output_compression"], 80);
     }
 }

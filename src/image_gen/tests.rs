@@ -126,6 +126,10 @@ async fn generate_image_sends_request_and_decodes_response() {
         seed: Some(1200),
         images: vec![],
         max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!((img.width, img.height), (1, 1));
@@ -157,6 +161,10 @@ async fn generate_image_maps_half_k_resolution() {
         seed: None,
         images: vec![],
         max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
     };
     assert!(generate_image(&client, &req).await.is_ok());
 }
@@ -181,6 +189,10 @@ async fn generate_image_surfaces_provider_error() {
         seed: None,
         images: vec![],
         max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
     };
     let err = generate_image(&client, &req).await.unwrap_err();
     assert!(err.to_string().contains("Internal Server Error"));
@@ -361,9 +373,85 @@ async fn generate_image_honors_declared_media_type_for_vector() {
         seed: None,
         images: vec![],
         max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
     };
     let img = generate_image(&client, &req).await.unwrap();
     // media_type is trusted over sniffing, and SVG dimensions come from the viewBox.
     assert_eq!(img.mime, "image/svg+xml");
     assert_eq!((img.width, img.height), (120, 60));
+}
+
+/// N3: `image/jpg` is a real-world alias for `image/jpeg`, which is what
+/// `sniff_mime` always reports for JPEG bytes - a declared `image/jpg` must not
+/// false-positive as a mismatch against the sniffed type.
+#[tokio::test]
+async fn generate_image_treats_image_jpg_as_an_alias_of_image_jpeg_no_warning() {
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+    let jpeg_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "b64_json": jpeg_b64, "media_type": "image/jpg" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let req = GenerateRequest {
+        model: "m".to_string(),
+        prompt: "p".to_string(),
+        aspect_ratio: None,
+        image_size: None,
+        seed: None,
+        images: vec![],
+        max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
+    };
+    let img = generate_image(&client, &req).await.unwrap();
+    assert_eq!(img.mime, "image/jpeg");
+    assert!(img.warnings.is_empty(), "got: {:?}", img.warnings);
+}
+
+#[tokio::test]
+async fn generate_image_passes_through_quality_format_background_compression() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images"))
+        .and(body_partial_json(json!({
+            "quality": "high",
+            "output_format": "webp",
+            "background": "transparent",
+            "output_compression": 80
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "b64_json": PNG_1X1_B64 }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let req = GenerateRequest {
+        model: "openai/gpt-image-2".to_string(),
+        prompt: "p".to_string(),
+        aspect_ratio: None,
+        image_size: None,
+        seed: None,
+        images: vec![],
+        max_image_dimension: 800,
+        quality: Some("high".to_string()),
+        output_format: Some("webp".to_string()),
+        background: Some("transparent".to_string()),
+        output_compression: Some(80),
+    };
+    assert!(generate_image(&client, &req).await.is_ok());
 }

@@ -111,6 +111,18 @@ pub(crate) struct ImageArgs {
     /// Output base name (used with --output-dir).
     #[arg(long)]
     output_name: Option<String>,
+    /// Output quality: auto, low, medium, or high. Provider support varies.
+    #[arg(long)]
+    quality: Option<String>,
+    /// Output file format: png, jpeg, webp, or svg. Provider support varies.
+    #[arg(long)]
+    output_format: Option<String>,
+    /// Background: auto, transparent, or opaque. Provider support varies.
+    #[arg(long)]
+    background: Option<String>,
+    /// Output compression 0-100 (webp/jpeg only). Provider support varies.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
+    output_compression: Option<u32>,
 }
 
 /// CLI flags for `video`, mirroring the `generate_video` MCP tool.
@@ -208,6 +220,17 @@ pub(crate) struct TranscribeArgs {
     /// ISO-639-1 language hint (e.g. en, ja) to improve accuracy.
     #[arg(short, long)]
     language: Option<String>,
+    /// "json" (default) or "verbose_json" (adds language/duration/segments/
+    /// words). Needs an OpenAI-compatible provider; others reject it with a 400.
+    #[arg(long)]
+    response_format: Option<String>,
+    /// Comma-separated: segment and/or word. Only honored with
+    /// --response-format verbose_json on an OpenAI-compatible provider.
+    #[arg(long, value_delimiter = ',')]
+    timestamp_granularities: Vec<String>,
+    /// Sampling temperature (select providers only).
+    #[arg(long)]
+    temperature: Option<f64>,
 }
 
 /// CLI flags for `chat`, mirroring the `chat_completion` MCP tool.

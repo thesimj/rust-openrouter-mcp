@@ -213,6 +213,7 @@ mod tests {
             }),
             pricing: None,
             reasoning: None,
+            supported_voices: None,
         }
     }
 
@@ -312,6 +313,7 @@ mod tests {
             architecture: None,
             pricing: None,
             reasoning: None,
+            supported_voices: None,
         };
         assert_eq!(primary_modality(&no_arch), "text");
     }

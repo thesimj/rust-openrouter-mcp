@@ -152,7 +152,7 @@ extensions:
 ```
 Easiest: run `goose configure` -> Add Extension -> Command-line Extension (stdio) ->
 command `openrouter-mcp mcp` -> add `OPENROUTER_API_KEY`.
-Docs: <https://block.github.io/goose/docs/getting-started/using-extensions>
+Docs: <https://goose-docs.ai/docs/getting-started/using-extensions>
 
 ### Amp (Sourcegraph)
 `~/.config/amp/settings.json`, key `amp.mcpServers`:
@@ -280,18 +280,19 @@ in the server's `env`. See [Configuration](README.md#configuration).
 
 ## Verify the connection
 
-Most clients list discovered tools after connecting. You should see:
+Most clients list discovered tools after connecting. You should see all 12:
 `list_models`, `describe_model`, `generate_image`, `generate_video`,
-`generate_audio`, `chat_completion`, `get_result`, `describe_image`,
-`get_account`, `get_usage_stats`, `reset_usage_stats`. Ask the agent to *"list OpenRouter image
-models"* to confirm `list_models` runs.
+`generate_audio`, `transcribe_audio`, `chat_completion`, `describe_image`,
+`get_result`, `get_account`, `get_usage_stats`, `reset_usage_stats`. Ask the
+agent to *"list OpenRouter image models"* to confirm `list_models` runs.
 
 You can also sanity-check the binary by hand:
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
   | OPENROUTER_API_KEY=sk-or-... openrouter-mcp mcp
 ```
-A JSON line naming the `rmcp` server back means stdio is healthy.
+A JSON line containing `"serverInfo":{"name":"openrouter-mcp"` back means
+stdio is healthy.
 
 ---
 

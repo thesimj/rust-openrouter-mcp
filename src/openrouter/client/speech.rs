@@ -2,10 +2,10 @@
 //! and `POST /api/v1/audio/transcriptions` (speech-to-text).
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use crate::openrouter::{
-    OpenRouterClient, SpeechBody, SpeechResult, TranscriptionBody, TranscriptionResponse,
-    content_type, generation_id,
+    OpenRouterClient, SpeechBody, SpeechResult, TranscriptionBody, content_type, generation_id,
 };
 
 impl OpenRouterClient {
@@ -36,8 +36,10 @@ impl OpenRouterClient {
     }
 
     /// `POST /api/v1/audio/transcriptions` - synchronous speech-to-text.
-    /// Returns the transcript plus the reported usage.
-    pub async fn transcribe(&self, req: &TranscriptionBody) -> Result<TranscriptionResponse> {
+    /// Returns the raw response JSON: shape varies with `response_format`
+    /// (`json` is just `{text, usage}`; `verbose_json` adds `language`,
+    /// `duration`, `segments`, `words`, etc.), so the caller reads it untyped.
+    pub async fn transcribe(&self, req: &TranscriptionBody) -> Result<Value> {
         let rb = self
             .http
             .post(format!("{}/audio/transcriptions", self.base_url))

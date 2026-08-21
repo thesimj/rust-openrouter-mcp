@@ -101,7 +101,10 @@ pub(in crate::openrouter) fn content_type(resp: &reqwest::Response, default: &st
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 /// Bound an upstream error body to [`MAX_ERROR_BODY_CHARS`], marking a cut.
-fn truncate_error_body(mut body: String) -> String {
+/// `pub(in crate::openrouter)` so `client::models::image_model_detail` - which
+/// bails on its own (it needs 404 to mean "no image endpoint", not an error) -
+/// still caps the body it echoes, same as [`OpenRouterClient::send_checked`].
+pub(in crate::openrouter) fn truncate_error_body(mut body: String) -> String {
     if let Some((cut, _)) = body.char_indices().nth(MAX_ERROR_BODY_CHARS) {
         body.truncate(cut);
         body.push_str("... [truncated]");
@@ -236,6 +239,7 @@ mod tests {
                 architecture: None,
                 pricing: None,
                 reasoning: None,
+                supported_voices: None,
             })
             .collect()
     }

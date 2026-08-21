@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::openrouter::{Model, ModelsQuery, ModelsResponse, OpenRouterClient};
+use crate::openrouter::{
+    Model, ModelsQuery, ModelsResponse, OpenRouterClient, truncate_error_body,
+};
 
 impl OpenRouterClient {
     /// The `input_modalities` declared for a single model id (e.g.
@@ -82,6 +84,37 @@ impl OpenRouterClient {
                 .cloned()
         });
         Ok(found)
+    }
+
+    /// `GET /api/v1/images/models/{author}/{slug}/endpoints` - per-endpoint
+    /// image capabilities: definitive `supported_parameters`,
+    /// `allowed_passthrough_parameters`, pricing, and `supports_streaming`.
+    /// `model_id` is the `author/slug` id. A 404 (model has no image endpoint)
+    /// returns `None` rather than failing - best-effort, matching
+    /// [`video_model_detail`](Self::video_model_detail)'s posture of never
+    /// failing the whole `describe_model` call over this enrichment.
+    pub async fn image_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
+        let label = format!("/images/models/{model_id}/endpoints");
+        let resp = self
+            .http
+            .get(format!("{}{label}", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .with_context(|| format!("request to OpenRouter {label} failed"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            let body = truncate_error_body(resp.text().await.unwrap_or_default());
+            anyhow::bail!("OpenRouter {label} returned {status}: {body}");
+        }
+        let mut body: Value = resp
+            .json()
+            .await
+            .with_context(|| format!("failed to decode OpenRouter {label} response"))?;
+        Ok(Some(body.get_mut("data").map(Value::take).unwrap_or(body)))
     }
 }
 
@@ -243,6 +276,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn image_model_detail_unwraps_data_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/openai/gpt-image-2/endpoints"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "openai/gpt-image-2",
+                    "endpoints": [{"supported_parameters": ["quality", "output_format"]}]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let detail = client
+            .image_model_detail("openai/gpt-image-2")
+            .await
+            .unwrap()
+            .expect("image endpoint detail present");
+        assert_eq!(detail["id"], "openai/gpt-image-2");
+        assert_eq!(detail["endpoints"][0]["supported_parameters"][0], "quality");
+    }
+
+    /// A model with no image endpoint (404) is a miss, not a failure - it must
+    /// not fail the whole `describe_model` call.
+    #[tokio::test]
+    async fn image_model_detail_returns_none_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/anthropic/claude-opus-4.7/endpoints"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let detail = client
+            .image_model_detail("anthropic/claude-opus-4.7")
+            .await
+            .unwrap();
+        assert!(detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_model_detail_surfaces_non_404_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/images/models/openai/gpt-image-2/endpoints"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let err = client
+            .image_model_detail("openai/gpt-image-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
+    }
+
+    /// F3: an oversized error body must be capped the same way
+    /// `send_checked` caps it, not echoed verbatim into the caller's context.
+    #[tokio::test]
+    async fn image_model_detail_truncates_an_oversized_error_body() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(5000);
+        Mock::given(method("GET"))
+            .and(path("/images/models/openai/gpt-image-2/endpoints"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let err = client
+            .image_model_detail("openai/gpt-image-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("[truncated]"), "got: {err}");
+        assert!(err.to_string().len() < 1000, "got: {err}");
     }
 
     #[tokio::test]

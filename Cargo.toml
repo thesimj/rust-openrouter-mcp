@@ -2,9 +2,10 @@
 name = "openrouter-mcp"
 version = "0.4.3"
 edition = "2024"
-# Verified, not guessed: `cargo +1.88 check --all-targets` passes. The floor is
-# set by rmcp 3.0 (rust-version 1.88) and by our own use of let-chains, which
-# stabilized in 1.88. CI builds at this version so the claim stays true.
+# Verified, not guessed: `cargo +1.88 check --all-targets` passes. Several
+# dependencies (rmcp, pinned to 3.1.2 in the lock; image 0.25.10; darling 0.24.0;
+# the icu_* 2.3.0 family) declare rust-version 1.88 too, and our own use of
+# let-chains stabilized in 1.88. CI builds at this version so the claim stays true.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
@@ -53,8 +54,8 @@ dotenvy = "0.15"
 base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # Rasterizes SVG inputs to PNG before sending (re-exports usvg + tiny-skia).
-# Pure Rust, no system libraries. As of 0.48 its own MSRV is 1.85, below ours,
-# so rmcp is the only thing setting the 1.88 floor.
+# Pure Rust, no system libraries. As of 0.48 its own MSRV is 1.85, below ours;
+# rmcp, image, darling, and the icu_* family are what actually set the 1.88 floor.
 resvg = { version = "0.48", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 

@@ -131,6 +131,10 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
         seed: args.seed,
         images: args.images.iter().map(|v| parse_image_arg(v)).collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
+        quality: args.quality,
+        output_format: args.output_format,
+        background: args.background,
+        output_compression: args.output_compression,
     };
 
     let summary = image_gen::run_job(&client, &req, variants, &base, &prompt_source).await?;
@@ -255,11 +259,18 @@ pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
             data,
             format,
             language: args.language,
+            response_format: args.response_format,
+            timestamp_granularities: args.timestamp_granularities,
+            temperature: args.temperature,
         },
     )
     .await?;
 
-    println!("{}", result.text);
+    match &result.verbose {
+        // verbose_json: print the full response object, not just the text.
+        Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
+        None => println!("{}", result.text),
+    }
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }

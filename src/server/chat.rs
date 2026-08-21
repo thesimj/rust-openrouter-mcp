@@ -11,7 +11,9 @@ use serde::Deserialize;
 
 use crate::chat_gen;
 use crate::image_gen;
-use crate::server::schema::{de_opt_f64, de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{
+    RequireFields, de_opt_f64, de_opt_uint, require_all, scalarize_nullable,
+};
 
 use super::OpenRouterServer;
 use super::image::{ImageInput, check_image_input, resolve_image_inputs};
@@ -19,6 +21,7 @@ use super::image::{ImageInput, check_image_input, resolve_image_inputs};
 /// Arguments for the `chat_completion` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
+#[schemars(transform = RequireFields(&["prompt"]))]
 pub(crate) struct ChatCompletionArgs {
     /// Chat/text model id, e.g. "openai/gpt-5.4" or "anthropic/claude-sonnet-4.6".
     /// Discover ids with list_models.
@@ -40,6 +43,7 @@ pub(crate) struct ChatCompletionArgs {
     /// Longest-side cap (px) for input images before sending (default 1536,
     /// max 4096). Ignored when no images are provided.
     #[serde(default, deserialize_with = "de_opt_uint")]
+    #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Optional sampling temperature.
     #[serde(default, deserialize_with = "de_opt_f64")]
@@ -70,7 +74,7 @@ impl OpenRouterServer {
         with input_modalities=image to find one). Returns the assistant's text.",
         annotations(
             title = "Chat Completion",
-            read_only_hint = false,
+            read_only_hint = true,
             destructive_hint = false,
             open_world_hint = true
         )
@@ -305,6 +309,20 @@ mod tests {
                 Some(e) => assert_eq!(body["reasoning"]["effort"], e),
             }
         }
+    }
+
+    /// chat_completion writes nothing (like describe_image/transcribe_audio), so
+    /// its tools/list annotation must say so (S11).
+    #[test]
+    fn chat_completion_is_annotated_read_only() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "chat_completion")
+            .expect("chat_completion is registered");
+        assert_eq!(tool.annotations.and_then(|a| a.read_only_hint), Some(true));
     }
 
     #[tokio::test]

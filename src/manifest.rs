@@ -22,6 +22,14 @@ pub struct Manifest {
     pub base_seed: Option<u64>,
     pub variants_requested: usize,
     pub max_image_dimension: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_compression: Option<u32>,
     pub created_at: String,
     pub input_images: Vec<InputImageMeta>,
     pub variants: Vec<VariantMeta>,

@@ -49,6 +49,12 @@ pub struct Model {
     /// the round-trip through this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<serde_json::Value>,
+    /// Voice ids the model accepts (speech/TTS models only). Shape varies
+    /// per provider, so it is passed through untyped - same rationale as
+    /// `reasoning`. Live-confirmed on `GET /models?output_modalities=speech`;
+    /// absent for non-speech models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_voices: Option<serde_json::Value>,
 }
 
 impl Model {
@@ -118,6 +124,11 @@ pub struct Pricing {
     /// Fractional discount applied to the above (numeric, not a price string).
     #[serde(default)]
     pub discount: Option<f64>,
+    /// Tiered/time-window pricing overrides. Shape varies (conditions +
+    /// alternate prices), so it is passed through untyped rather than modeled -
+    /// same rationale as `Model::reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -134,6 +145,7 @@ mod tests {
             architecture: None,
             pricing: None,
             reasoning: None,
+            supported_voices: None,
         };
 
         assert!(model.matches_search("OPENAI"));
@@ -234,5 +246,35 @@ mod tests {
         assert_eq!(out["reasoning"]["supported_efforts"][0], "max");
         let bare = serde_json::to_value(&parsed.data[1]).unwrap();
         assert!(bare.get("reasoning").is_none());
+    }
+
+    /// Tiered/time-window pricing (`overrides[]`) round-trips untyped, like
+    /// `reasoning`, and a model with flat-only pricing doesn't sprout a null field.
+    #[test]
+    fn pricing_round_trips_overrides() {
+        let json = r#"{
+          "data": [
+            {
+              "id": "openai/gpt-5.6-sol",
+              "pricing": {
+                "prompt": "0.000001",
+                "overrides": [
+                  {"condition": "peak_hours", "prompt": "0.000002"}
+                ]
+              }
+            },
+            { "id": "provider/flat-pricing", "pricing": { "prompt": "0.000001" } }
+          ]
+        }"#;
+
+        let parsed: ModelsResponse = serde_json::from_str(json).unwrap();
+        let pricing = parsed.data[0].pricing.as_ref().unwrap();
+        let overrides = pricing.overrides.as_ref().unwrap();
+        assert_eq!(overrides[0]["condition"], "peak_hours");
+
+        let out = serde_json::to_value(&parsed.data[0]).unwrap();
+        assert_eq!(out["pricing"]["overrides"][0]["prompt"], "0.000002");
+        let flat = serde_json::to_value(&parsed.data[1]).unwrap();
+        assert!(flat["pricing"].get("overrides").is_none());
     }
 }
