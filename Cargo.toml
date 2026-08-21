@@ -1,6 +1,6 @@
 [package]
 name = "openrouter-mcp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 # Verified, not guessed: `cargo +1.88 check --all-targets` passes. Several
 # dependencies (rmcp, pinned to 3.1.2 in the lock; image 0.25.10; darling 0.24.0;

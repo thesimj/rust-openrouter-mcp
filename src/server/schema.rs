@@ -82,10 +82,10 @@ impl schemars::transform::Transform for RequireFields {
     }
 }
 
-/// Advertise "at least one of these fields" as an `anyOf` of single-`required`
-/// branches. Deliberately NOT `oneOf`: JSON Schema counts `""` as present, so
-/// `oneOf` would reject placeholder-filling clients the runtime accepts - the
-/// runtime "exactly one of" check owns strictness and the friendly error.
+/// Advertise "at least one of these fields" as an `anyOf` of object-typed
+/// single-`required` branches. NOT `oneOf` ("" counts as present, rejecting
+/// placeholder-filling clients the runtime accepts), and NEVER on a tool-args
+/// root: real clients reject a root anyOf as a union (nested types only).
 pub(crate) struct AtLeastOneOf(pub(crate) &'static [&'static str]);
 
 impl schemars::transform::Transform for AtLeastOneOf {
@@ -95,7 +95,7 @@ impl schemars::transform::Transform for AtLeastOneOf {
             let branches: Vec<serde_json::Value> = self
                 .0
                 .iter()
-                .map(|name| serde_json::json!({ "required": [name] }))
+                .map(|name| serde_json::json!({ "type": "object", "required": [name] }))
                 .collect();
             obj.insert("anyOf".to_string(), serde_json::Value::Array(branches));
         }
@@ -367,28 +367,24 @@ mod tests {
     }
 
     /// S16: "needs one of these sources" is schema-encoded as anyOf
-    /// single-required branches on ImageInput (path/url/base64) and transcribe
-    /// (path/base64). anyOf, not oneOf: "" counts as present in JSON Schema,
-    /// so oneOf would reject placeholder-filling clients the runtime accepts.
+    /// object-typed single-required branches on the NESTED ImageInput only.
+    /// Tool-args roots must stay plain objects: a real client rejected a root
+    /// anyOf as "a union with a non-object branch", so TranscribeAudioArgs
+    /// carries no anyOf and relies on its runtime exactly-one check.
     #[test]
     fn at_least_one_of_is_encoded_as_anyof_required_branches() {
         let img = schema_for_type::<ImageInput>();
         assert_eq!(
             img.get("anyOf").cloned(),
             Some(json!([
-                { "required": ["path"] },
-                { "required": ["url"] },
-                { "required": ["base64"] }
+                { "type": "object", "required": ["path"] },
+                { "type": "object", "required": ["url"] },
+                { "type": "object", "required": ["base64"] }
             ]))
         );
         let tr = schema_for_type::<crate::server::audio::TranscribeAudioArgs>();
-        assert_eq!(
-            tr.get("anyOf").cloned(),
-            Some(json!([
-                { "required": ["path"] },
-                { "required": ["base64"] }
-            ]))
-        );
+        assert!(tr.get("anyOf").is_none(), "no union at a tool-args root");
+        assert!(tr.get("oneOf").is_none());
     }
 
     /// A typo'd field name in AtLeastOneOf must panic in debug builds instead

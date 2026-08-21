@@ -16,16 +16,13 @@ use serde_json::json;
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
 use crate::server::result::{MAX_INLINE_AUDIO_BYTES, client_wants_inline_previews};
-use crate::server::schema::{
-    AtLeastOneOf, RequireFields, de_opt_f64, require_all, scalarize_nullable,
-};
+use crate::server::schema::{RequireFields, de_opt_f64, require_all, scalarize_nullable};
 
 use super::OpenRouterServer;
 
 /// Arguments for the `transcribe_audio` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-#[schemars(transform = AtLeastOneOf(&["path", "base64"]))]
 pub(crate) struct TranscribeAudioArgs {
     /// Speech-to-text model id, e.g. "openai/gpt-4o-mini-transcribe" or
     /// "openai/whisper-1". Discover them with list_models using
