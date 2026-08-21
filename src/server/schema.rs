@@ -270,7 +270,7 @@ mod tests {
 
         let video = required_fields::<GenerateVideoArgs>();
         assert!(video.contains(&"duration".to_string()), "{video:?}");
-        assert!(video.contains(&"generate_audio".to_string()), "{video:?}");
+        assert!(video.contains(&"with_audio".to_string()), "{video:?}");
         // aspect_ratio is conditional (only required for text-to-video without a
         // frame), so it must stay OUT of the unconditional schema required list.
         assert!(!video.contains(&"aspect_ratio".to_string()), "{video:?}");
@@ -317,7 +317,7 @@ mod tests {
             json!("integer")
         );
         assert_eq!(
-            prop_type::<GenerateVideoArgs>("generate_audio"),
+            prop_type::<GenerateVideoArgs>("with_audio"),
             json!("boolean")
         );
         assert_eq!(prop_type::<GenerateVideoArgs>("duration"), json!("integer"));

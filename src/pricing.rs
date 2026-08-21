@@ -112,12 +112,50 @@ pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
 
 /// Build a human-readable sibling for a pricing object: maps each price string
 /// to its "$X/unit" form, skipping zeros/negatives, `discount`, and non-string
-/// values. Returns `None` when nothing meaningful remains.
+/// values. `overrides[]` entries render the same way: price keys (those also
+/// present in the flat object) are humanized-or-dropped, condition keys pass
+/// through verbatim, and priceless overrides are omitted. Returns `None` when
+/// nothing meaningful remains.
 pub(crate) fn humanize_pricing(pricing: &Value) -> Option<Value> {
     let obj = pricing.as_object()?;
     let mut out = Map::new();
     for (k, val) in obj {
         if k == "discount" {
+            continue;
+        }
+        // Tiered/time-window pricing. Only a key that also exists in the parent
+        // pricing object is a price (overrides override flat rates); everything
+        // else is a condition, kept verbatim. Prices humanize_price rejects
+        // (zero/sentinel/garbage) are dropped exactly like the flat path drops
+        // them, and an override with no humanized price at all is noise.
+        if k == "overrides" {
+            if let Some(arr) = val.as_array() {
+                let hum: Vec<Value> = arr
+                    .iter()
+                    .filter_map(|o| {
+                        let ov = o.as_object()?;
+                        let mut m = Map::new();
+                        let mut priced = false;
+                        for (ok, oval) in ov {
+                            if ok == "discount" {
+                                continue;
+                            }
+                            if obj.contains_key(ok) {
+                                if let Some(h) = oval.as_str().and_then(|s| humanize_price(ok, s)) {
+                                    m.insert(ok.clone(), Value::String(h));
+                                    priced = true;
+                                }
+                            } else {
+                                m.insert(ok.clone(), oval.clone());
+                            }
+                        }
+                        (priced && !m.is_empty()).then_some(Value::Object(m))
+                    })
+                    .collect();
+                if !hum.is_empty() {
+                    out.insert(k.clone(), Value::Array(hum));
+                }
+            }
             continue;
         }
         if let Some(human) = val.as_str().and_then(|s| humanize_price(k, s)) {
@@ -274,17 +312,48 @@ mod tests {
         assert!(human.get("discount").is_none());
     }
 
-    /// `overrides` is a non-string (array) value like `discount`'s sibling
-    /// fields: humanize_pricing must ignore it rather than crash, since only
-    /// string price fields are humanized.
+    /// Tiered/time-window overrides get their own humanized schedule: price
+    /// strings render as "$X/M tokens", condition fields pass through verbatim.
     #[test]
-    fn humanize_pricing_tolerates_non_string_overrides() {
+    fn humanize_pricing_renders_overrides_schedule() {
         let p = serde_json::json!({
             "prompt": "0.000005",
-            "overrides": [{"condition": "peak_hours", "prompt": "0.00001"}]
+            "overrides": [
+                {"min_prompt_tokens": 200000, "prompt": "0.00001"},
+                {"start_time": "18:30", "end_time": "23:30", "prompt": "0.0000025"}
+            ]
         });
         let human = humanize_pricing(&p).unwrap();
         assert_eq!(human["prompt"], "$5/M tokens");
-        assert!(human.get("overrides").is_none());
+        let ov = human["overrides"].as_array().unwrap();
+        assert_eq!(ov[0]["min_prompt_tokens"], 200000);
+        assert_eq!(ov[0]["prompt"], "$10/M tokens");
+        assert_eq!(ov[1]["start_time"], "18:30");
+        assert_eq!(ov[1]["prompt"], "$2.5/M tokens");
+    }
+
+    /// Only keys that exist in the flat pricing object are prices: a numeric-
+    /// string condition must never render as a dollar figure, sentinel/zero
+    /// prices are dropped like the flat path drops them, and an override with
+    /// no humanized price is omitted entirely.
+    #[test]
+    fn humanize_pricing_overrides_never_mislabel_conditions_or_leak_sentinels() {
+        let p = serde_json::json!({
+            "prompt": "0.000005",
+            "overrides": [
+                {"min_prompt_tokens": "200000", "hours": "18", "prompt": "0.00001"},
+                {"prompt": "0", "completion": "-1"},
+                {"condition": "peak_hours"}
+            ]
+        });
+        let human = humanize_pricing(&p).unwrap();
+        let ov = human["overrides"].as_array().unwrap();
+        assert_eq!(ov.len(), 1, "priceless overrides are dropped: {ov:?}");
+        assert_eq!(ov[0]["min_prompt_tokens"], "200000");
+        assert_eq!(ov[0]["hours"], "18");
+        assert_eq!(ov[0]["prompt"], "$10/M tokens");
+
+        let junk_only = serde_json::json!({"overrides": [{"condition": "peak_hours"}]});
+        assert!(humanize_pricing(&junk_only).is_none());
     }
 }

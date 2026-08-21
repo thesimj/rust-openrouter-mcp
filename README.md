@@ -42,7 +42,10 @@ per-process usage - all behind one `openrouter-mcp` executable.
   usually needs it) the tool returns a `task_id`; poll `get_result` for
   completion. Once done, the clip is downloaded and saved to disk (a local
   path, plus a `file://` resource link when inline previews are enabled for
-  sandboxed clients), not just the hosted URL.
+  sandboxed clients), not just the hosted URL. `with_audio` (renamed from
+  `generate_audio` in 0.6.0) controls the clip's audio track; if a provider
+  ignores it, the result carries a warning and `has_audio` reports the file's
+  real state.
 - **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
 - **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
@@ -216,10 +219,10 @@ block is optional.
 
 | Tool | Kind | Description |
 | --- | --- | --- |
-| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing; tiered/time-window `overrides` are passed through raw when a model has them). |
+| `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing; tiered/time-window `overrides` are passed through raw and rendered in `pricing_human` when a model has them). |
 | `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, and (for image models) per-endpoint image capabilities merged under an `image` key. |
 | `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. Optional `quality` (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) pass through to the provider. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size` - all four are required by the schema, not just prose; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
-| `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. |
+| `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. Required: `model`, `prompt`, `duration`, `with_audio` (renamed from `generate_audio` in 0.6.0). |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
 | `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), and `temperature`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
 | `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |

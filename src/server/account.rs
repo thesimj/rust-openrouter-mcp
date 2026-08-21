@@ -280,10 +280,10 @@ mod tests {
             serde_json::from_value(json!({ "confirm": "false" })).unwrap();
         assert!(!reset.confirm);
         let vid: GenerateVideoArgs = serde_json::from_value(json!({
-            "model": "m", "prompt": "p", "generate_audio": "true", "duration": "8", "output": "o.mp4",
+            "model": "m", "prompt": "p", "with_audio": "true", "duration": "8", "output": "o.mp4",
         }))
         .unwrap();
-        assert_eq!(vid.generate_audio, Some(true));
+        assert_eq!(vid.with_audio, Some(true));
         assert_eq!(vid.duration, Some(8));
         let aud: GenerateAudioArgs = serde_json::from_value(json!({
             "model": "m", "speed": "1.5", "output": "o.mp3",

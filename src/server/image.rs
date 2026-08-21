@@ -373,7 +373,10 @@ fn image_job_result_json(
 impl OpenRouterServer {
     #[tool(
         description = "Generate or edit an image with an OpenRouter image model (e.g. \
-        google/gemini-3.1-flash-image-preview) and save it. `output` is optional - omit it to \
+        google/gemini-3.1-flash-image-preview) and save it. Runs asynchronously: if the job is \
+        still going after wait_seconds (default 10), it returns status \"pending\" with a \
+        task_id to poll via get_result; otherwise it returns the completed result inline. \
+        `output` is optional - omit it to \
         get an auto-named file (kind_datetime_model_config_seed_hash) under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). For text-to-image, \
         pass a prompt. For editing / image-to-image, also pass `images` - each given as a \
@@ -392,10 +395,7 @@ impl OpenRouterServer {
         for the required fields: model, prompt, aspect_ratio and image_size must all be \
         specified, or the call fails with an error naming what is missing (every other \
         param - seed, images, max_image_dimension, variants, wait_seconds, output, quality, \
-        output_format, background, output_compression - is optional). \
-        Runs asynchronously: if the job is still going after \
-        wait_seconds (default 10), it returns status \"pending\" with a task_id to poll via \
-        get_result; otherwise it returns the completed result inline. To analyze or caption \
+        output_format, background, output_compression - is optional). To analyze or caption \
         an existing image instead of creating one, use describe_image.",
         annotations(
             title = "Generate Image",

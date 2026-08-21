@@ -151,7 +151,7 @@ pub(crate) struct VideoArgs {
     size: Option<String>,
     /// Generate an audio track (for audio-capable models).
     #[arg(long)]
-    generate_audio: bool,
+    with_audio: bool,
     /// Seed (provider support varies).
     #[arg(long)]
     seed: Option<u64>,

@@ -220,8 +220,26 @@ pub async fn run_job(
                         Ok(()) => {
                             // Probe the bytes; fall back to the request only for
                             // a container we cannot read.
-                            let has_audio = has_audio_track(&bytes)
-                                .unwrap_or_else(|| req.generate_audio.unwrap_or(false));
+                            let probed = has_audio_track(&bytes);
+                            let has_audio =
+                                probed.unwrap_or_else(|| req.generate_audio.unwrap_or(false));
+                            // Some providers ignore the flag (e.g. return an
+                            // audio track for with_audio=false); say so instead
+                            // of silently reporting the mismatch in has_audio.
+                            if let (Some(actual), Some(requested)) = (probed, req.generate_audio)
+                                && actual != requested
+                            {
+                                warnings.push(format!(
+                                    "clip {}: requested with_audio={requested} but the file {}",
+                                    index + 1,
+                                    if actual {
+                                        "contains an audio track (the provider ignored the flag)"
+                                    } else {
+                                        "lacks one (the provider ignored the flag or the model \
+                                         does not support audio)"
+                                    },
+                                ));
+                            }
                             meta.path = Some(path.to_string_lossy().into_owned());
                             meta.mime_type = Some(mime.clone());
                             meta.has_audio = Some(has_audio);
@@ -266,7 +284,7 @@ pub async fn run_job(
         resolution: req.resolution.clone(),
         aspect_ratio: req.aspect_ratio.clone(),
         size: req.size.clone(),
-        generate_audio: req.generate_audio,
+        with_audio: req.generate_audio,
         seed: req.seed,
         max_image_dimension: req.max_image_dimension,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -423,6 +441,57 @@ mod tests {
         assert_eq!(v.cost, Some(1.23));
         // The clip bytes landed on disk at the .mp4 path.
         assert_eq!(std::fs::read(&v.path).unwrap(), b"FAKE-MP4-BYTES");
+    }
+
+    /// grok-imagine-video returns an AAC track even for with_audio=false: the
+    /// job must warn about the flag being ignored, not just flip has_audio.
+    #[tokio::test]
+    async fn run_job_warns_when_the_provider_ignores_with_audio_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .and(body_partial_json(json!({ "generate_audio": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "vid-job-2",
+                "status": "pending"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-job-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "vid-job-2",
+                "status": "completed",
+                "unsigned_urls": ["https://cdn/clip-0.mp4"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-job-2/content"))
+            .and(query_param("index", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp4")
+                    .set_body_bytes(fake_mp4(&[b"vide", b"soun"])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let mut req = text_to_video_request("xai/grok-imagine-video");
+        req.generate_audio = Some(false);
+        let base = std::env::temp_dir().join("openrouter-mcp-video-warn-test/clip.mp4");
+        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+
+        assert!(summary.videos[0].has_audio, "probe reads the file");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("with_audio=false") && w.contains("contains")),
+            "warnings: {:?}",
+            summary.warnings
+        );
     }
 
     #[tokio::test]

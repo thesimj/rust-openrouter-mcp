@@ -122,7 +122,7 @@ pub struct VideoManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generate_audio: Option<bool>,
+    pub with_audio: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     pub max_image_dimension: u32,

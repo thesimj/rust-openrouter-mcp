@@ -189,7 +189,7 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
         resolution: args.resolution,
         aspect_ratio: args.aspect_ratio,
         size: args.size,
-        generate_audio: Some(args.generate_audio),
+        generate_audio: Some(args.with_audio),
         seed: args.seed,
         frames,
         references: args

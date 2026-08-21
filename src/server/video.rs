@@ -30,7 +30,7 @@ use super::OpenRouterServer;
 /// runtime check for the conditional rule.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-#[schemars(transform = RequireFields(&["duration", "generate_audio"]))]
+#[schemars(transform = RequireFields(&["duration", "with_audio"]))]
 pub(crate) struct GenerateVideoArgs {
     /// Video model id, e.g. "google/veo-3.1". Use list_models with
     /// output_modalities="video" to discover them.
@@ -61,9 +61,9 @@ pub(crate) struct GenerateVideoArgs {
     pub size: Option<String>,
     /// REQUIRED (no default): true to generate an audio track (for
     /// audio-capable models), false for silent video. This is the audio track
-    /// baked into the clip - unrelated to the generate_audio TTS tool.
+    /// baked into the clip.
     #[serde(default, deserialize_with = "de_opt_bool")]
-    pub generate_audio: Option<bool>,
+    pub with_audio: Option<bool>,
     /// Seed for reproducible-ish generation (provider support varies).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub seed: Option<u64>,
@@ -126,7 +126,10 @@ fn video_job_result_json(summary: &video_gen::VideoJobSummary) -> serde_json::Va
 impl OpenRouterServer {
     #[tool(
         description = "Generate a video with an OpenRouter video model (e.g. google/veo-3.1) and \
-        save it to `output`. For text-to-video, pass a prompt plus (aspect_ratio and/or \
+        save it to `output`. Video generation is slow (30s to several minutes) and runs \
+        asynchronously: it almost always returns status \"pending\" with a task_id after \
+        wait_seconds (default 20) - poll get_result until it is \"completed\". \
+        For text-to-video, pass a prompt plus (aspect_ratio and/or \
         resolution) OR size. `resolution` is a named tier (480p/720p/1080p/1K/2K/4K); `size` is \
         explicit pixels as \"WIDTHxHEIGHT\" (e.g. \"1280x720\") - an alternative to \
         resolution+aspect_ratio, not interchangeable with the tier vocabulary. For image-to-video, \
@@ -134,18 +137,15 @@ impl OpenRouterServer {
         aspect_ratio nor size - the output ratio follows the frame image, and some models reject \
         a ratio outright in that mode; for reference-to-video pass reference_images (ignored, with \
         a warning, if a frame is given - first_frame/last_frame win). No defaults for the required \
-        fields: model, prompt, duration and generate_audio must all be specified, or the call \
+        fields: model, prompt, duration and with_audio must all be specified, or the call \
         fails naming what is missing (resolution/size, seed, frames, references, \
         max_image_dimension, wait_seconds, and output are all optional). `duration` is the clip's \
         length in seconds (model-specific discrete values - see describe_model), not how long \
-        generation takes. `generate_audio` controls the audio track baked into the clip, unrelated \
-        to the generate_audio TTS tool. `output` is \
+        generation takes. `with_audio` controls the audio track baked into the clip. `output` is \
         optional - omit it for an auto-named file under OPENROUTER_MCP_OUTPUT_DIR \
-        (default $HOME/Downloads/openrouter-mcp). Video generation \
-        is slow (30s to several minutes): it runs asynchronously and almost always returns status \
-        \"pending\" with a task_id after wait_seconds (default 20) - poll get_result until it is \
-        \"completed\". The completed result carries the saved file path in JSON plus, for \
-        sandboxed clients, a file:// ResourceLink (mime video/mp4) per clip.",
+        (default $HOME/Downloads/openrouter-mcp). The completed result carries the saved file \
+        path in JSON plus, for sandboxed clients, a file:// ResourceLink (mime video/mp4) per \
+        clip.",
         annotations(
             title = "Generate Video",
             read_only_hint = false,
@@ -185,8 +185,8 @@ impl OpenRouterServer {
         if !has_frame && args.aspect_ratio.is_none() && args.size.is_none() {
             missing.push("aspect_ratio (e.g. \"16:9\", \"9:16\") or size (\"WIDTHxHEIGHT\")");
         }
-        if args.generate_audio.is_none() {
-            missing.push("generate_audio (true for an audio track, false for silent video)");
+        if args.with_audio.is_none() {
+            missing.push("with_audio (true for an audio track, false for silent video)");
         }
         require_all("generate_video", "video", &missing)?;
 
@@ -210,7 +210,7 @@ impl OpenRouterServer {
             resolution: args.resolution,
             aspect_ratio: args.aspect_ratio,
             size: args.size,
-            generate_audio: args.generate_audio,
+            generate_audio: args.with_audio,
             seed: args.seed,
             frames,
             references: args.reference_images.iter().map(PathBuf::from).collect(),
@@ -295,7 +295,7 @@ mod tests {
             resolution: None,
             aspect_ratio: None,
             size: None,
-            generate_audio: None,
+            with_audio: None,
             seed: None,
             first_frame: None,
             last_frame: None,
@@ -307,7 +307,7 @@ mod tests {
         let err = server.run_generate_video(args, false).await.unwrap_err();
         assert!(err.message.contains("duration"));
         assert!(err.message.contains("aspect_ratio"));
-        assert!(err.message.contains("generate_audio"));
+        assert!(err.message.contains("with_audio"));
         assert!(err.message.contains("no defaults"));
     }
 
@@ -325,7 +325,7 @@ mod tests {
             resolution: Some("720p".to_string()),
             aspect_ratio: None,
             size: None,
-            generate_audio: Some(true),
+            with_audio: Some(true),
             seed: None,
             first_frame,
             last_frame: None,
@@ -385,7 +385,7 @@ mod tests {
             resolution: None,
             aspect_ratio: Some("16:9".to_string()),
             size: None,
-            generate_audio: Some(false),
+            with_audio: Some(false),
             seed: None,
             first_frame: None,
             last_frame: None,
