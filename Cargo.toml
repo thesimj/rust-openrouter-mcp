@@ -47,7 +47,7 @@ serde_json = "1"
 # 672,715 -> 71,498 bytes on the wire, an 89% saving on the tool we call most.
 # Costs one new crate, `async-compression`; flate2/miniz_oxide are already in the
 # tree via `png`, so the size delta is just the async wrapper.
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "rustls", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "native-tls", "gzip"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
