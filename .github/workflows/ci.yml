@@ -1,14 +1,14 @@
 name: CI
 
 # Fast quality gate on every push and PR: format, lint, and the full test suite.
-# The release workflow (release-mcpb.yml) only runs on a version tag, so without
-# this nothing exercises the tests before a release ships. Kept to a single Linux
-# runner for speed — the cross-platform build is proven at release time.
+# The release workflow calls this gate before building any bundles.
+# These checks run on Linux. Release packaging also builds macOS and Windows.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 # Cancel an in-progress run when a newer commit lands on the same ref, so a busy
 # PR doesn't queue stale jobs.

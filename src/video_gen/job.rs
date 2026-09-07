@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
@@ -149,58 +149,126 @@ pub async fn run_job(
         seed: req.seed,
     };
 
+    let submitted = client.submit_video(&body).await?;
+    let job_id = submitted.id;
+    let manifest = VideoManifest {
+        endpoint: "/api/v1/videos",
+        job_id: job_id.clone(),
+        generation_id: None,
+        cost: None,
+        model: req.model.clone(),
+        prompt: req.prompt.clone(),
+        prompt_source: prompt_source.to_string(),
+        duration: req.duration,
+        resolution: req.resolution.clone(),
+        aspect_ratio: req.aspect_ratio.clone(),
+        size: req.size.clone(),
+        with_audio: req.generate_audio,
+        seed: req.seed,
+        max_image_dimension: req.max_image_dimension,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        frame_images: frame_meta,
+        input_references: reference_meta,
+        clips: Vec::new(),
+    };
+    let mpath = manifest::path(base_output);
+    // Save the upstream ID before polling, so an interruption leaves recovery data.
+    if let Err(e) = manifest::write(&mpath, &manifest).await {
+        warnings.push(format!(
+            "could not persist accepted video job {job_id}: {e:#}"
+        ));
+    }
+    let terminal = wait_for_video(
+        &job_id,
+        req.poll_interval_secs,
+        req.poll_timeout_secs,
+        || client.poll_video(&job_id),
+    )
+    .await;
+    let interval = std::time::Duration::from_secs(req.poll_interval_secs.max(1));
+    let job = job_id.as_str();
+    save_outputs(req, base_output, manifest, warnings, terminal, |index| {
+        // The clip is already paid for: a transient failure fetching it must
+        // not turn the job into a loss.
+        retry_transient(interval, DOWNLOAD_ATTEMPTS, move || {
+            client.download_video(job, index)
+        })
+    })
+    .await
+}
+
+/// GET attempts per clip download before giving up on a transient failure.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Longest poll deadline honored; `OPENROUTER_VIDEO_POLL_TIMEOUT` is
+/// operator-supplied and an unbounded value would overflow `Instant + Duration`.
+const MAX_POLL_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Run `op` again after a retryable failure (see [`poll_retry_delay`]), up to
+/// `attempts` times in total. Permanent failures return immediately.
+async fn retry_transient<T, F, Fut>(
+    interval: std::time::Duration,
+    attempts: u32,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) => match poll_retry_delay(&error, interval) {
+                Some(delay) if attempt < attempts => {
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                _ => return Err(error),
+            },
+        }
+    }
+}
+
+/// Deliver a submitted job without coupling cost to the number of saved clips.
+async fn save_outputs<F, Fut>(
+    req: &VideoGenRequest,
+    base_output: &Path,
+    mut manifest: VideoManifest,
+    mut warnings: Vec<String>,
+    terminal: Result<crate::openrouter::VideoPollResponse>,
+    mut download: F,
+) -> Result<VideoJobSummary>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, Vec<u8>)>>,
+{
+    let job_id = manifest.job_id.clone();
     let mut videos = Vec::new();
     let mut errors = Vec::new();
     let mut clips = Vec::new();
-
-    // Submit, then poll until a terminal status or the poll timeout elapses.
-    let submitted = client.submit_video(&body).await?;
-    let job_id = submitted.id;
-    let interval = std::time::Duration::from_secs(req.poll_interval_secs);
-    let timeout = std::time::Duration::from_secs(req.poll_timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    let mut terminal: Option<crate::openrouter::VideoPollResponse> = None;
-    let mut timed_out = false;
-    loop {
-        // Poll immediately after submission. Bound the request itself by the
-        // overall deadline so a slow network call cannot overrun the job timeout.
-        let poll = match tokio::time::timeout_at(deadline, client.poll_video(&job_id)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                timed_out = true;
-                break;
-            }
-        };
-        match poll.status.as_str() {
-            "completed" | "succeeded" => {
-                terminal = Some(poll);
-                break;
-            }
-            "failed" | "cancelled" | "canceled" | "expired" | "error" => {
-                errors.push(format!("video generation {}: {}", poll.status, job_id));
-                break;
-            }
-            _ => {
-                // pending/processing/queued/running/unknown -> keep waiting.
-            }
+    // Submission was accepted, so the job is billable even when polling fails.
+    // Until usage arrives, its cost remains unknown.
+    let (terminal, billing) = match terminal {
+        Ok(poll) => {
+            let receipt = crate::billing::Receipt {
+                cost: poll.usage.as_ref().and_then(|u| u.cost),
+                generation_id: poll.generation_id.clone(),
+            };
+            (Some(poll), receipt)
         }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            timed_out = true;
-            break;
+        Err(error) => {
+            let receipt = crate::billing::Receipt::from_error(&error)
+                .cloned()
+                .unwrap_or_default();
+            errors.push(format!("{error:#}"));
+            (None, receipt)
         }
-        tokio::time::sleep_until((now + interval).min(deadline)).await;
-    }
-    if timed_out {
-        errors.push(format!(
-            "video generation timed out after {}s (job {job_id})",
-            req.poll_timeout_secs
-        ));
-    }
+    };
+    manifest.cost = billing.cost;
+    manifest.generation_id = billing.generation_id.clone();
 
     if let Some(poll) = terminal {
-        let cost = poll.usage.as_ref().and_then(|u| u.cost);
         let total = poll.unsigned_urls.len().max(1);
         for index in 0..poll.unsigned_urls.len() {
             let mut meta = VideoClipMeta {
@@ -209,10 +277,9 @@ pub async fn run_job(
                 resolution: req.resolution.clone(),
                 aspect_ratio: req.aspect_ratio.clone(),
                 generation_id: poll.generation_id.clone(),
-                cost,
                 ..Default::default()
             };
-            match client.download_video(&job_id, index).await {
+            match download(index).await {
                 Ok((mime, bytes)) => {
                     let ext = extension_for(&mime);
                     let path = clip_output_path(base_output, index, total, ext);
@@ -250,7 +317,6 @@ pub async fn run_job(
                                 aspect_ratio: req.aspect_ratio.clone(),
                                 has_audio,
                                 mime,
-                                cost,
                             });
                         }
                         Err(e) => {
@@ -275,35 +341,95 @@ pub async fn run_job(
         }
     }
 
-    let manifest = VideoManifest {
-        endpoint: "/api/v1/videos",
-        model: req.model.clone(),
-        prompt: req.prompt.clone(),
-        prompt_source: prompt_source.to_string(),
-        duration: req.duration,
-        resolution: req.resolution.clone(),
-        aspect_ratio: req.aspect_ratio.clone(),
-        size: req.size.clone(),
-        with_audio: req.generate_audio,
-        seed: req.seed,
-        max_image_dimension: req.max_image_dimension,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        frame_images: frame_meta,
-        input_references: reference_meta,
-        clips,
-    };
+    manifest.clips = clips;
     let mpath = manifest::path(base_output);
     if let Err(e) = manifest::write(&mpath, &manifest).await {
         errors.push(format!("manifest write failed: {e}"));
     }
 
     Ok(VideoJobSummary {
+        job_id,
+        billing,
         model: req.model.clone(),
         manifest_path: mpath,
         videos,
         warnings,
         errors,
     })
+}
+
+/// Poll only GET requests again. Never repeat the billable submission.
+async fn wait_for_video<F, Fut>(
+    job_id: &str,
+    interval_secs: u64,
+    timeout_secs: u64,
+    mut poll: F,
+) -> Result<crate::openrouter::VideoPollResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<crate::openrouter::VideoPollResponse>>,
+{
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(timeout_secs.min(MAX_POLL_TIMEOUT_SECS));
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("video generation timed out after {timeout_secs}s (job {job_id})");
+        }
+        let result = tokio::time::timeout_at(deadline, poll())
+            .await
+            .with_context(|| {
+                format!("video generation timed out after {timeout_secs}s (job {job_id})")
+            })?;
+        let delay = match result {
+            Ok(response) => match response.status.as_str() {
+                "completed" | "succeeded" => return Ok(response),
+                "failed" | "cancelled" | "canceled" | "expired" | "error" => {
+                    let error = anyhow::anyhow!(
+                        "video generation {} (job {job_id}): {}",
+                        response.status,
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("no provider explanation")
+                    );
+                    let receipt = crate::billing::Receipt {
+                        cost: response.usage.and_then(|usage| usage.cost),
+                        generation_id: response.generation_id,
+                    };
+                    return Err(receipt.attach(error));
+                }
+                _ => interval,
+            },
+            Err(error) => match poll_retry_delay(&error, interval) {
+                Some(delay) => delay,
+                None => {
+                    return Err(error)
+                        .with_context(|| format!("video polling failed (job {job_id})"));
+                }
+            },
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(delay.min(remaining)).await;
+    }
+}
+
+fn poll_retry_delay(
+    error: &anyhow::Error,
+    interval: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if let Some(http) = error.downcast_ref::<crate::openrouter::HttpFailure>()
+        && (http.status.is_server_error() || matches!(http.status.as_u16(), 408 | 429))
+    {
+        return Some(http.retry_after.unwrap_or(interval).max(interval));
+    }
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.is_timeout() || e.is_connect() || e.is_body())
+    {
+        return Some(interval);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -438,7 +564,7 @@ mod tests {
         let v = &summary.videos[0];
         assert_eq!(v.mime, "video/mp4");
         assert!(v.has_audio, "generate_audio=true -> has_audio");
-        assert_eq!(v.cost, Some(1.23));
+        assert_eq!(summary.billing.cost, Some(1.23));
         // The clip bytes landed on disk at the .mp4 path.
         assert_eq!(std::fs::read(&v.path).unwrap(), b"FAKE-MP4-BYTES");
     }
@@ -546,5 +672,229 @@ mod tests {
             Ok(_) => panic!("submit error should abort the job"),
         };
         assert!(err.to_string().contains("bad model"));
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    fn request() -> VideoGenRequest {
+        VideoGenRequest {
+            model: "test/video".into(),
+            prompt: "test".into(),
+            duration: Some(5),
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            generate_audio: None,
+            seed: None,
+            frames: vec![],
+            references: vec![],
+            max_image_dimension: 800,
+            poll_interval_secs: 1,
+            poll_timeout_secs: 5,
+        }
+    }
+    fn manifest() -> VideoManifest {
+        VideoManifest {
+            endpoint: "/api/v1/videos",
+            job_id: "accepted-job".into(),
+            generation_id: None,
+            cost: None,
+            model: "test/video".into(),
+            prompt: "test".into(),
+            prompt_source: "test".into(),
+            duration: Some(5),
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            with_audio: None,
+            seed: None,
+            max_image_dimension: 800,
+            created_at: "test".into(),
+            frame_images: vec![],
+            input_references: vec![],
+            clips: vec![],
+        }
+    }
+    #[tokio::test]
+    async fn video_delivery_counts_one_cost_for_multiple_clips_and_failed_writes() {
+        for fail_writes in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("nested/clip.webm");
+            if fail_writes {
+                std::fs::create_dir_all(clip_output_path(&base, 0, 3, "webm")).unwrap();
+                std::fs::create_dir_all(clip_output_path(&base, 1, 3, "webm")).unwrap();
+            }
+            let poll = serde_json::from_value(serde_json::json!({
+                "status":"completed", "generation_id":"gen-test", "usage":{"cost":0.75},
+                "unsigned_urls":["https://cdn/0", "https://cdn/1", "https://cdn/2"]
+            }))
+            .unwrap();
+            let summary = save_outputs(&request(), &base, manifest(), vec![], Ok(poll), |index| {
+                std::future::ready(if index == 2 {
+                    Err(anyhow::anyhow!("download failed"))
+                } else {
+                    Ok(("video/webm".into(), vec![1, 2, 3]))
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(summary.videos.len(), if fail_writes { 0 } else { 2 });
+            assert_eq!(summary.billing.cost, Some(0.75));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
+            assert_eq!(saved["cost"], 0.75);
+            assert_eq!(saved["generation_id"], "gen-test");
+            assert_eq!(saved["job_id"], "accepted-job");
+            assert_eq!(saved["clips"].as_array().unwrap().len(), 3);
+            assert!(
+                saved["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|clip| clip.get("cost").is_none())
+            );
+            assert!(saved["clips"][2]["error"].is_string());
+        }
+    }
+    #[tokio::test]
+    async fn accepted_video_without_usage_keeps_unknown_cost_and_recovery_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("new/clip.mp4");
+        let summary = save_outputs(
+            &request(),
+            &base,
+            manifest(),
+            vec![],
+            Err(anyhow::anyhow!("poll timed out")),
+            |_| std::future::ready(Err(anyhow::anyhow!("must not download"))),
+        )
+        .await
+        .unwrap();
+        assert!(summary.videos.is_empty());
+        assert_eq!(summary.billing.cost, None);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
+        assert_eq!(saved["job_id"], "accepted-job");
+        assert!(saved["cost"].is_null());
+    }
+    fn response(status: &str) -> crate::openrouter::VideoPollResponse {
+        serde_json::from_value(serde_json::json!({"status":status})).unwrap()
+    }
+    fn failure(status: u16, retry_after: Option<u64>) -> anyhow::Error {
+        crate::openrouter::HttpFailure {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            retry_after: retry_after.map(std::time::Duration::from_secs),
+            label: "/videos/job-test".into(),
+            body: "synthetic".into(),
+        }
+        .into()
+    }
+    #[tokio::test(start_paused = true)]
+    async fn poll_retries_transient_failures_and_respects_retry_after() {
+        let start = tokio::time::Instant::now();
+        let mut responses = std::collections::VecDeque::from([
+            Err(failure(429, Some(7))),
+            Err(failure(503, None)),
+            Ok(response("processing")),
+            Ok(response("completed")),
+        ]);
+        let done = wait_for_video("job-test", 2, 30, || {
+            std::future::ready(responses.pop_front().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(11));
+        assert!(responses.is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn poll_timeout_never_exceeds_deadline_or_loses_job_id() {
+        let start = tokio::time::Instant::now();
+        let error = wait_for_video("job-test", 1, 5, || {
+            std::future::ready(Err(failure(429, Some(100))))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(format!("{error:#}").contains("job-test"));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_poll_is_bounded_and_permanent_errors_do_not_retry() {
+        let error = wait_for_video("stalled", 1, 5, std::future::pending)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stalled"));
+        for status in [401, 403, 404] {
+            let mut calls = 0;
+            let error = wait_for_video("permanent", 1, 30, || {
+                calls += 1;
+                std::future::ready(Err(failure(status, None)))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(format!("{error:#}").contains("permanent"));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn download_retries_transient_failures_but_not_permanent_ones() {
+        let interval = std::time::Duration::from_secs(2);
+        let mut responses = std::collections::VecDeque::from([
+            Err(failure(503, None)),
+            Err(failure(429, Some(1))),
+            Ok(("video/mp4".to_string(), vec![1u8])),
+        ]);
+        let start = tokio::time::Instant::now();
+        let (mime, bytes) = retry_transient(interval, DOWNLOAD_ATTEMPTS, || {
+            std::future::ready(responses.pop_front().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!((mime.as_str(), bytes), ("video/mp4", vec![1u8]));
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(4));
+
+        let mut calls = 0;
+        let error = retry_transient(interval, DOWNLOAD_ATTEMPTS, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(failure(404, None)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(format!("{error:#}").contains("404"));
+
+        let mut calls = 0;
+        retry_transient(interval, DOWNLOAD_ATTEMPTS, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(failure(503, None)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, DOWNLOAD_ATTEMPTS);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn absurd_poll_timeout_is_capped_instead_of_overflowing() {
+        let error = wait_for_video("capped", 1, u64::MAX, || {
+            std::future::ready(Err(failure(401, None)))
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("capped"));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn terminal_failure_preserves_provider_explanation_and_known_cost() {
+        let error = wait_for_video("rejected",1,30,|| std::future::ready(Ok(
+            serde_json::from_value(serde_json::json!({"status":"failed","error":"provider explanation","usage":{"cost":0.2}})).unwrap()
+        ))).await.unwrap_err();
+        assert!(format!("{error:#}").contains("provider explanation"));
+        assert_eq!(
+            error
+                .downcast_ref::<crate::billing::Receipt>()
+                .unwrap()
+                .cost,
+            Some(0.2)
+        );
     }
 }

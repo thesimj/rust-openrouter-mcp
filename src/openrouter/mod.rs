@@ -1,8 +1,6 @@
 //! Minimal async REST client for the OpenRouter HTTP API.
 //!
-//! OpenRouter is an OpenAI-compatible JSON REST API. For now this client only
-//! covers `GET /api/v1/models`, which lists every available model along with
-//! its capabilities (modalities, context length) and pricing.
+//! Covers model discovery, account information, chat, images, audio, and video.
 
 mod client;
 mod dto;
@@ -22,7 +20,7 @@ const APP_TITLE: &str = "rust-openrouter-mcp";
 /// Stall detection, not a deadline. `read_timeout` resets after every successful
 /// read, so a slow-but-progressing transfer is never cut off - which matters
 /// because `download_video` and `transcribe_audio` move tens of megabytes and
-/// have no size bound we control. A total `timeout()` would cap those by wall
+/// can take longer than the generation request. A total `timeout()` would cap those by wall
 /// clock and fail a video generation that already succeeded and was paid for.
 ///
 /// The caveat that sets the value: `/images` is synchronous and buffered. It
@@ -40,8 +38,8 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Build the shared `reqwest::Client`, attaching the OpenRouter app-attribution
 /// headers (`HTTP-Referer` / `X-Title`) as defaults so every endpoint inherits
-/// them. Falls back to a bare client if header construction fails.
-fn build_http_client() -> reqwest::Client {
+/// them. Invalid optional headers are omitted. Client construction errors propagate.
+fn build_http_client() -> Result<reqwest::Client> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let referer = std::env::var("OPENROUTER_HTTP_REFERER").unwrap_or_else(|_| APP_REFERER.into());
     let title = std::env::var("OPENROUTER_X_TITLE").unwrap_or_else(|_| APP_TITLE.into());
@@ -61,11 +59,45 @@ fn build_http_client() -> reqwest::Client {
     // holding. Note this client is not the only one: `server::image::fetch_url`
     // builds its own (pinned to a validated IP) and sets its own bounds.
     reqwest::Client::builder()
+        .tls_backend_rustls()
         .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .context("could not build OpenRouter HTTP client")
+}
+
+/// Retain HTTP metadata so polling can distinguish transient errors.
+#[derive(Debug)]
+pub(crate) struct HttpFailure {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<std::time::Duration>,
+    pub(crate) label: String,
+    pub(crate) body: String,
+}
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenRouter {} returned {}: {}",
+            self.label, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
+fn retry_after(value: &str) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default(),
+    )
 }
 
 /// Thin wrapper around `reqwest::Client` carrying the OpenRouter API key.
@@ -118,7 +150,7 @@ impl OpenRouterClient {
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .context("OPENROUTER_API_KEY environment variable is not set")?;
         Ok(Self {
-            http: build_http_client(),
+            http: build_http_client()?,
             api_key,
             base_url: BASE_URL.to_string(),
         })
@@ -129,7 +161,7 @@ impl OpenRouterClient {
     #[cfg(test)]
     pub(crate) fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: build_http_client(),
+            http: build_http_client().expect("test HTTP client"),
             api_key: api_key.into(),
             base_url: base_url.into(),
         }
@@ -150,8 +182,19 @@ impl OpenRouterClient {
             .with_context(|| format!("request to OpenRouter {label} failed"))?;
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(retry_after);
             let body = truncate_error_body(resp.text().await.unwrap_or_default());
-            anyhow::bail!("OpenRouter {label} returned {status}: {body}");
+            return Err(HttpFailure {
+                status,
+                retry_after,
+                label: label.to_string(),
+                body,
+            }
+            .into());
         }
         Ok(resp)
     }
@@ -287,5 +330,30 @@ mod tests {
         assert_eq!(filtered.total, 25);
         assert_eq!(filtered.models.len(), DEFAULT_MODEL_LIMIT);
         assert_eq!(filtered.truncated(), 5);
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn retry_after_parses_seconds_dates_and_invalid_values() {
+        assert_eq!(retry_after("7"), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(
+            retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(std::time::Duration::ZERO)
+        );
+        assert!(retry_after("invalid").is_none());
+    }
+    #[test]
+    fn rustls_client_builds_with_the_selected_backend() {
+        assert!(build_http_client().is_ok());
+        let manifest = include_str!("../../Cargo.toml");
+        let reqwest = manifest
+            .lines()
+            .find(|line| line.starts_with("reqwest ="))
+            .unwrap();
+        assert!(reqwest.contains("\"rustls\""));
+        assert!(!reqwest.contains("\"native-tls\""));
     }
 }

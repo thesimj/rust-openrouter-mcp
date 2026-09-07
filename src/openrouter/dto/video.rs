@@ -20,8 +20,14 @@ pub struct VideoModelsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VideoModel {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_pricing")]
     pub pricing_skus: BTreeMap<String, String>,
+}
+
+fn null_pricing<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(Option::<BTreeMap<String, String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Request body for `POST /api/v1/videos`. Optional fields are omitted when
@@ -97,10 +103,31 @@ pub struct VideoPollResponse {
     #[serde(default)]
     pub generation_id: Option<String>,
     pub status: String,
+    /// Documented as a string; tolerate an object (`{code, message}`) too, since
+    /// a decode failure here would lose the terminal status and its receipt.
+    #[serde(default, deserialize_with = "lenient_error")]
+    pub error: Option<String>,
     #[serde(default)]
     pub unsigned_urls: Vec<String>,
     #[serde(default)]
     pub usage: Option<VideoUsage>,
+}
+
+fn lenient_error<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(ref map) => Some(
+            map.get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string()),
+        ),
+        other => Some(other.to_string()),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,5 +176,38 @@ mod tests {
                 "image_url": { "url": "https://example.com/ref.png" }
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn catalog_accepts_null_missing_and_populated_pricing_together() {
+        let response: VideoModelsResponse = serde_json::from_value(serde_json::json!({"data":[
+            {"id":"a","pricing_skus":null}, {"id":"b"}, {"id":"c","pricing_skus":{"duration_seconds":"0.1"}}
+        ]})).unwrap();
+        assert_eq!(response.data.len(), 3);
+        assert!(response.data[0].pricing_skus.is_empty());
+        assert!(response.data[1].pricing_skus.is_empty());
+        assert_eq!(response.data[2].pricing_skus["duration_seconds"], "0.1");
+    }
+    #[test]
+    fn poll_error_accepts_string_object_and_null() {
+        let parse = |error: serde_json::Value| -> VideoPollResponse {
+            serde_json::from_value(serde_json::json!({"status": "failed", "error": error})).unwrap()
+        };
+        assert_eq!(parse("policy".into()).error.as_deref(), Some("policy"));
+        assert_eq!(
+            parse(serde_json::json!({"code": 500, "message": "provider down"}))
+                .error
+                .as_deref(),
+            Some("provider down")
+        );
+        assert_eq!(
+            parse(serde_json::json!({"code": 500})).error.as_deref(),
+            Some(r#"{"code":500}"#)
+        );
+        assert_eq!(parse(serde_json::Value::Null).error, None);
     }
 }

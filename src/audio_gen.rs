@@ -19,15 +19,21 @@ use crate::openrouter::{InputAudio, OpenRouterClient, SpeechBody, TranscriptionB
 /// the same string for every format we support.
 const TRANSCRIBE_FORMATS: [&str; 7] = ["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"];
 
-/// Largest audio payload the transcription endpoint accepts (25 MB). Checked
-/// before upload so an oversized file fails locally with a clear message rather
-/// than after a long transfer.
+/// Local decoded audio limit (25 MiB), applied to files and inline inputs.
+/// This bounds memory use; OpenRouter JSON requests may support larger inputs.
 const MAX_TRANSCRIBE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// The `input_audio.format` value for a file extension, if it is one the
 /// endpoint accepts. Case-insensitive.
 fn transcribe_format(ext: &str) -> Option<&'static str> {
-    let ext = ext.to_ascii_lowercase();
+    let ext = ext.trim().to_ascii_lowercase();
+    let ext = match ext.as_str() {
+        "mpeg" => "mp3",
+        "mp4" | "x-m4a" => "m4a",
+        "x-wav" | "wave" => "wav",
+        "x-flac" => "flac",
+        other => other,
+    };
     TRANSCRIBE_FORMATS.into_iter().find(|f| *f == ext)
 }
 
@@ -86,8 +92,8 @@ pub async fn read_audio_file(
         .len();
     if size > MAX_TRANSCRIBE_BYTES {
         bail!(
-            "audio file is {size} bytes; the transcription endpoint accepts at most \
-             {MAX_TRANSCRIBE_BYTES}"
+            "audio file is {size} bytes; the local transcription limit is \
+             {MAX_TRANSCRIBE_BYTES} bytes"
         );
     }
 
@@ -98,6 +104,30 @@ pub async fn read_audio_file(
         base64::engine::general_purpose::STANDARD.encode(bytes),
         format.to_string(),
     ))
+}
+
+/// Validate encoded input before upload, including MIME aliases from data URLs.
+/// Whitespace inside the base64 (line-wrapping encoders) is removed so the
+/// payload sent upstream is the compact form; padding is optional.
+fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
+    let data = crate::image_io::compact_base64(data);
+    let format = transcribe_format(format).context("unsupported audio format")?;
+    let encoded_limit = MAX_TRANSCRIBE_BYTES.div_ceil(3) * 4;
+    if data.len() as u64 > encoded_limit {
+        bail!(
+            "audio exceeds the local transcription limit of {MAX_TRANSCRIBE_BYTES} decoded bytes"
+        );
+    }
+    let bytes = crate::image_io::decode_base64(&data).context("invalid base64 audio")?;
+    if bytes.is_empty() {
+        bail!("audio is empty");
+    }
+    if bytes.len() as u64 > MAX_TRANSCRIBE_BYTES {
+        bail!(
+            "audio exceeds the local transcription limit of {MAX_TRANSCRIBE_BYTES} decoded bytes"
+        );
+    }
+    Ok((data.into_owned(), format.to_string()))
 }
 
 /// Transcribe audio to text. Requires already-encoded base64 `data` (see
@@ -124,30 +154,32 @@ pub async fn transcribe(
         .filter(|s| !s.is_empty())
         .collect();
 
+    let (data, format) = validate_inline_audio(&req.data, &req.format)?;
     let body = TranscriptionBody {
         model: req.model.clone(),
-        input_audio: InputAudio {
-            data: req.data.clone(),
-            format: req.format.clone(),
-        },
+        input_audio: InputAudio { data, format },
         language: req.language.clone(),
         response_format: response_format.clone(),
         timestamp_granularities,
         temperature: req.temperature,
     };
     let raw = client.transcribe(&body).await?;
+    let cost = raw
+        .get("usage")
+        .and_then(|u| u.get("cost"))
+        .and_then(serde_json::Value::as_f64);
+    let receipt = crate::billing::Receipt {
+        cost,
+        generation_id: None,
+    };
     let text = raw
         .get("text")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
     if text.trim().is_empty() {
-        bail!("model returned an empty transcript");
+        return Err(receipt.attach(anyhow::anyhow!("model returned an empty transcript")));
     }
-    let cost = raw
-        .get("usage")
-        .and_then(|u| u.get("cost"))
-        .and_then(serde_json::Value::as_f64);
     let mut verbose = (response_format.as_deref() == Some("verbose_json")).then_some(raw);
     // A provider that silently ignores verbose_json returns the bare json
     // shape; say so instead of handing back an object missing the promised
@@ -264,7 +296,14 @@ pub async fn run_job(
     let path = output.with_extension(ext);
     crate::output::write_bytes(&path, &result.bytes)
         .await
-        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+        .map_err(|e| {
+            // The speech endpoint returns bytes, not usage: billed, amount unknown.
+            let receipt = crate::billing::Receipt {
+                cost: None,
+                generation_id: result.generation_id.clone(),
+            };
+            receipt.attach(anyhow::anyhow!("could not write {}: {e}", path.display()))
+        })?;
 
     let mut warnings = Vec::new();
     let manifest = AudioManifest {
@@ -531,5 +570,33 @@ mod tests {
         assert!(w.contains("verbose_json"), "got: {w}");
         assert!(w.contains("ignored"), "got: {w}");
         assert!(w.contains("language"), "got: {w}");
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn inline_audio_validates_format_encoding_and_local_size_limit() {
+        assert_eq!(
+            validate_inline_audio(" QUJD ", "mpeg").unwrap(),
+            ("QUJD".into(), "mp3".into())
+        );
+        assert!(validate_inline_audio("invalid!", "mp3").is_err());
+        // Line-wrapped and unpadded base64 are compacted, not rejected.
+        assert_eq!(
+            validate_inline_audio("QUJD\r\nRA==", "wav").unwrap().0,
+            "QUJDRA=="
+        );
+        assert_eq!(validate_inline_audio("QUJDRA", "wav").unwrap().0, "QUJDRA");
+        assert!(validate_inline_audio("QUJD", "exe").is_err());
+        assert!(validate_inline_audio("", "wav").is_err());
+        let too_large = "A".repeat((MAX_TRANSCRIBE_BYTES.div_ceil(3) * 4 + 4) as usize);
+        assert!(
+            validate_inline_audio(&too_large, "wav")
+                .unwrap_err()
+                .to_string()
+                .contains("local transcription limit")
+        );
     }
 }

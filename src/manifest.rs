@@ -99,7 +99,7 @@ pub fn path(base: &Path) -> PathBuf {
 /// paths that share a Tokio worker with concurrent `get_result` polls.
 pub async fn write(path: &Path, manifest: &impl Serialize) -> Result<()> {
     let json = serde_json::to_string_pretty(manifest).context("could not serialize manifest")?;
-    tokio::fs::write(path, json)
+    crate::output::write_bytes(path, json.as_bytes())
         .await
         .with_context(|| format!("could not write manifest {}", path.display()))?;
     Ok(())
@@ -109,6 +109,9 @@ pub async fn write(path: &Path, manifest: &impl Serialize) -> Result<()> {
 #[derive(Debug, Serialize)]
 pub struct VideoManifest {
     pub endpoint: &'static str,
+    pub job_id: String,
+    pub generation_id: Option<String>,
+    pub cost: Option<f64>,
     pub model: String,
     pub prompt: String,
     /// `inline`, `file`, or `stdin`.
@@ -160,8 +163,6 @@ pub struct VideoClipMeta {
     pub has_audio: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

@@ -64,7 +64,7 @@ pub(crate) struct ChatCompletionArgs {
 impl OpenRouterServer {
     #[tool(
         description = "Send a prompt to any OpenRouter chat/text model and return the model's text \
-        reply (text out). This is a synchronous, fast call (not a background task). Useful \
+        reply (text out). This call waits for the provider response. Useful \
         to route a sub-task to a DIFFERENT model than the host - e.g. ask a cheaper or specialized \
         model on OpenRouter. Provide `model` (a chat model id; discover with list_models) and \
         `prompt` (the user message); both are required or the call fails naming what is missing. \
@@ -148,6 +148,7 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_text(&args.model, false, None).await;
+                self.stats.record_failed_receipt(&args.model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }

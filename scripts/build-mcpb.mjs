@@ -23,13 +23,15 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN_NAME = "openrouter-mcp";
+// Explicit version keeps packer updates reviewable.
+const MCPB_PACKAGE = "@anthropic-ai/mcpb@2.1.2";
 
 // Map Node's process.platform to a friendly OS slug + manifest values.
 //
 // `target` is a rustc triple the binary is built for instead of the host default:
 // Linux ships the static musl build so the .mcpb runs on any distro regardless of
 // the host's glibc version (a glibc binary carries a floor set by the build box).
-// Requires `rustup target add x86_64-unknown-linux-musl`; the pure-Rust rustls TLS
+// Requires `rustup target add x86_64-unknown-linux-musl`; the rustls TLS
 // stack (see Cargo.toml) means no OpenSSL to cross-link into the static binary.
 const PLATFORMS = {
   linux: { slug: "linux", nodePlatform: "linux", exe: "", target: "x86_64-unknown-linux-musl" },
@@ -114,10 +116,10 @@ function main() {
   buildBinary(stageBinDir);
 
   console.log("==> Validating manifest");
-  npx(["-y", "@anthropic-ai/mcpb", "validate", join(stageDir, "manifest.json")]);
+  npx(["-y", MCPB_PACKAGE, "validate", join(stageDir, "manifest.json")]);
 
   console.log("==> Packing .mcpb");
-  npx(["-y", "@anthropic-ai/mcpb", "pack", stageDir, outFile]);
+  npx(["-y", MCPB_PACKAGE, "pack", stageDir, outFile]);
 
   rmSync(stageDir, { recursive: true, force: true });
   console.log(`==> Done: ${outFile}`);

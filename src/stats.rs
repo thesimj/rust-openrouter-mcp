@@ -138,21 +138,27 @@ impl UsageStats {
         s.account_cost(model, cost).requests += 1;
     }
 
-    /// Record one finished video generation. `success` is false when the job
-    /// produced no clip; `cost` is the reported USD `usage.cost`, if any.
-    pub async fn record_video(&self, model: &str, success: bool, cost: Option<f64>) {
+    /// Record one video request and its saved clip count. An accepted job keeps
+    /// its receipt even if delivery fails. Rejected submissions have no receipt.
+    pub async fn record_video(
+        &self,
+        model: &str,
+        clips: u64,
+        receipt: Option<&crate::billing::Receipt>,
+    ) {
         let mut s = self.inner.lock().await;
         s.requests_total += 1;
         s.video_generations += 1;
-        if !success {
+        if clips == 0 {
             s.requests_failed += 1;
-            s.by_model.entry(model.to_string()).or_default().requests += 1;
-            return;
         }
-        s.videos_generated += 1;
-        let m = s.account_cost(model, cost);
+        s.videos_generated += clips;
+        let m = match receipt {
+            Some(receipt) => s.account_cost(model, receipt.cost),
+            None => s.by_model.entry(model.to_string()).or_default(),
+        };
         m.requests += 1;
-        m.videos_generated += 1;
+        m.videos_generated += clips;
     }
 
     /// Record one finished text-to-speech request. `cost` is typically `None`
@@ -171,6 +177,15 @@ impl UsageStats {
         let m = s.account_cost(model, cost);
         m.requests += 1;
         m.audio_files += 1;
+    }
+
+    /// Account the receipt carried by a failed request, if the provider had
+    /// already answered (and so billed) before the local failure. A receipt
+    /// without usage counts as an unknown cost, not as free.
+    pub async fn record_failed_receipt(&self, model: &str, error: &anyhow::Error) {
+        if let Some(receipt) = crate::billing::Receipt::from_error(error) {
+            self.inner.lock().await.account_cost(model, receipt.cost);
+        }
     }
 
     /// A JSON snapshot of the current counters.
@@ -265,5 +280,59 @@ mod tests {
         let s = stats.snapshot().await;
         assert_eq!(s["requests_total"], 0);
         assert_eq!(s["actual_cost_usd"], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    use crate::billing::Receipt;
+    #[tokio::test]
+    async fn video_billing_is_per_request_and_survives_failed_delivery() {
+        let stats = UsageStats::new();
+        stats
+            .record_video(
+                "video",
+                2,
+                Some(&Receipt {
+                    cost: Some(0.9),
+                    generation_id: None,
+                }),
+            )
+            .await;
+        stats
+            .record_video(
+                "video",
+                0,
+                Some(&Receipt {
+                    cost: Some(0.4),
+                    generation_id: None,
+                }),
+            )
+            .await;
+        stats
+            .record_video("video", 0, Some(&Receipt::default()))
+            .await;
+        let output = stats.snapshot().await;
+        assert_eq!(output["requests_total"], 3);
+        assert_eq!(output["requests_failed"], 2);
+        assert_eq!(output["videos_generated"], 2);
+        assert_eq!(output["actual_cost_usd"], 1.3);
+        assert_eq!(output["unknown_cost_count"], 1);
+        assert_eq!(output["by_model"]["video"]["actual_cost_usd"], 1.3);
+    }
+    #[tokio::test]
+    async fn failed_text_extraction_keeps_receipt_without_double_counting_requests() {
+        let stats = UsageStats::new();
+        let error = anyhow::anyhow!("empty answer").context(Receipt {
+            cost: Some(0.02),
+            generation_id: None,
+        });
+        stats.record_text("chat", false, None).await;
+        stats.record_failed_receipt("chat", &error).await;
+        let output = stats.snapshot().await;
+        assert_eq!(output["requests_total"], 1);
+        assert_eq!(output["requests_failed"], 1);
+        assert_eq!(output["actual_cost_usd"], 0.02);
     }
 }

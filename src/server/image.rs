@@ -83,6 +83,9 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_documentation()
+                || v4.is_multicast()
+                || o[0] == 0
+                || o[0] >= 240
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
         }
         IpAddr::V6(v6) => {
@@ -116,16 +119,26 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
         .host_str()
         .ok_or_else(|| invalid("image url has no host".to_string()))?
         .to_string();
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS);
 
     // Resolve off the async runtime, then refuse internal/private targets.
     let lookup = host.clone();
-    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
-        (lookup.as_str(), port)
-            .to_socket_addrs()
-            .map(|it| it.collect::<Vec<_>>())
-    })
+    let addrs: Vec<SocketAddr> = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            (lookup.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+        }),
+    )
     .await
+    .map_err(|_| invalid("image URL DNS lookup timed out".to_string()))?
     .map_err(|e| ErrorData::internal_error(format!("dns task failed: {e}"), None))?
     .map_err(|e| invalid(format!("could not resolve image url host: {e}")))?;
 
@@ -152,9 +165,11 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
     // which would silently kill the early size check below; image bytes are
     // already compressed, so there is nothing to win here anyway.
     let client = reqwest::Client::builder()
+        .no_proxy()
+        .tls_backend_rustls()
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, addrs[0])
-        .timeout(std::time::Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS))
+        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
         .no_gzip()
         .build()
         .map_err(|e| ErrorData::internal_error(format!("http client build failed: {e}"), None))?;
@@ -279,8 +294,9 @@ pub(crate) struct GenerateImageArgs {
     #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
-    /// With >1, files are named <output>-var-<seed> (zero-padded to 4 digits), or
-    /// -var-<index> when no seed is set; one manifest covers all variants.
+    /// With >1, files are named <output>-var-<seed>-<index> (seed zero-padded to
+    /// 4 digits, index to 3), or -var-<index> when no seed is set; one manifest
+    /// covers all variants.
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 1, max = 16))]
     pub variants: Option<usize>,
@@ -492,22 +508,23 @@ impl OpenRouterServer {
             inline_previews,
             move |ctx| async move {
                 match image_gen::run_job(&ctx.client, &req, variants, &base, "inline").await {
-                    Ok(summary) if !summary.images.is_empty() => {
-                        let images = summary.images.len() as u64;
-                        let cost: f64 = summary.images.iter().filter_map(|i| i.cost).sum();
-                        let unknown =
-                            summary.images.iter().filter(|i| i.cost.is_none()).count() as u64;
-                        ctx.stats
-                            .record_job(&model, variants_u64, images, cost, unknown)
-                            .await;
-                        Ok(image_job_result_json(&summary, &aspect_ratio, &image_size))
-                    }
                     Ok(summary) => {
-                        ctx.stats.record_job(&model, variants_u64, 0, 0.0, 0).await;
-                        Err(format!(
-                            "all {variants} variant(s) failed: {}",
-                            summary.errors.join("; ")
-                        ))
+                        ctx.stats
+                            .record_job(
+                                &model,
+                                variants_u64,
+                                summary.images.len() as u64,
+                                summary.billing.cost,
+                                summary.billing.unknown,
+                            )
+                            .await;
+                        if summary.images.is_empty() {
+                            return Err(format!(
+                                "all {variants} variant(s) failed: {}",
+                                summary.errors.join("; ")
+                            ));
+                        }
+                        Ok(image_job_result_json(&summary, &aspect_ratio, &image_size))
                     }
                     Err(e) => {
                         ctx.stats.record_job(&model, variants_u64, 0, 0.0, 0).await;
@@ -562,7 +579,8 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;
-                Err(ErrorData::internal_error(e.to_string(), None))
+                self.stats.record_failed_receipt(&model, &e).await;
+                Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
     }

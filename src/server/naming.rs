@@ -35,15 +35,15 @@ impl MediaKind {
 }
 
 /// Lowercase a model id to a filename-safe token: drop the vendor prefix
-/// (`google/…`), keep alphanumerics, `.` and `-`, collapse everything else to a
-/// single `-`. "google/gemini-3.1-flash-image-preview" -> "gemini-3.1-flash-image-preview".
+/// (`google/…`), keep alphanumerics and `-`, collapse everything else to a
+/// single `-`. Dots would be mistaken for file extensions by the output writers.
 fn model_token(model: &str) -> String {
     let tail = model.rsplit('/').next().unwrap_or(model);
     sanitize(tail, true)
 }
 
 /// Sanitize one config/model token to filesystem-safe characters. Maps `:` to
-/// `x` (so "16:9" -> "16x9"), keeps alphanumerics/`.`/`-`, collapses any other
+/// `x` (so "16:9" -> "16x9"), keeps alphanumerics/`-`, collapses any other
 /// run to a single `-`, and trims leading/trailing `-`. Config tokens keep their
 /// case ("2K", "720p"); the model token is lowercased.
 fn sanitize(s: &str, lowercase: bool) -> String {
@@ -51,7 +51,7 @@ fn sanitize(s: &str, lowercase: bool) -> String {
     let mut prev_dash = false;
     for c in s.chars() {
         let c = if c == ':' { 'x' } else { c };
-        if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+        if c.is_ascii_alphanumeric() || c == '-' {
             out.push(if lowercase { c.to_ascii_lowercase() } else { c });
             prev_dash = c == '-';
         } else if !prev_dash {
@@ -159,7 +159,7 @@ mod tests {
         );
         // <kind>_<datetime>_<model>_<aspect>_<size>_seed<n>_<hash4>
         assert!(
-            n.starts_with("img_20260617-172245_gemini-3.1-flash-image-preview_16x9_2K_seed4242_")
+            n.starts_with("img_20260617-172245_gemini-3-1-flash-image-preview_16x9_2K_seed4242_")
         );
         let tail = n.rsplit('_').next().unwrap();
         assert_eq!(tail.len(), 4);
@@ -221,5 +221,51 @@ mod tests {
             None,
         );
         assert!(p.file_name().unwrap().to_string_lossy().starts_with("img_"));
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+    #[test]
+    fn final_artifact_and_manifest_names_keep_configuration_and_nonce() {
+        let t = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
+        for (kind, ext) in [
+            (MediaKind::Image, "png"),
+            (MediaKind::Video, "webm"),
+            (MediaKind::Audio, "mp3"),
+        ] {
+            let a = PathBuf::from(auto_base_name(
+                kind,
+                "google/gemini-3.1",
+                &["1:1", "0.5K"],
+                Some(7),
+                t,
+            ));
+            let b = PathBuf::from(auto_base_name(
+                kind,
+                "google/gemini-3.1",
+                &["16:9", "2K"],
+                Some(8),
+                t.with_nanosecond(500_000_000).unwrap(),
+            ));
+            assert_ne!(a.with_extension(ext), b.with_extension(ext));
+            assert_eq!(a.with_extension(ext).file_stem(), a.file_name());
+            assert!(a.to_str().unwrap().contains("0-5K_seed7"));
+            assert_ne!(crate::manifest::path(&a), crate::manifest::path(&b));
+            assert!(
+                crate::manifest::path(&a)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(a.to_str().unwrap())
+            );
+            assert_ne!(
+                crate::image_gen::job::variant_output_path(&a, None, 0, 2, ext),
+                crate::image_gen::job::variant_output_path(&b, None, 0, 2, ext)
+            );
+        }
     }
 }

@@ -24,7 +24,8 @@ per-process usage - all behind one `openrouter-mcp` executable.
   - Input images may be PNG, JPEG, WebP, GIF, or **SVG**. SVG inputs are
     rasterized to PNG (longest side scaled to the dimension cap; transparency
     preserved). Text in SVGs is not rendered (no fonts are loaded) and is flagged
-    as a warning.
+    as a warning. SVGs cannot load external files or URLs through image references.
+    Embedded data images remain supported where the renderer supports their format.
   - The output format is **chosen by the provider**: PNG/JPEG/WebP/GIF are
     sniffed from the response bytes; SVG is taken from the provider's declared
     media type instead (sniffing can't detect it). Either way the file
@@ -41,11 +42,14 @@ per-process usage - all behind one `openrouter-mcp` executable.
   **Asynchronous**: if the job runs longer than `wait_seconds` (default 20, video
   usually needs it) the tool returns a `task_id`; poll `get_result` for
   completion. Once done, the clip is downloaded and saved to disk (a local
-  path, plus a `file://` resource link when inline previews are enabled for
-  sandboxed clients), not just the hosted URL. `with_audio` (renamed from
+  path, plus a `file://` resource link when previews are enabled).
+  Links retain the clip's media type and require client access to the server filesystem. `with_audio` (renamed from
   `generate_audio` in 0.6.0) controls the clip's audio track; if a provider
   ignores it, the result carries a warning and `has_audio` reports the file's
-  real state.
+  real state. The manifest records the upstream `job_id` before polling starts.
+  Polling retries transient failures within the configured deadline and respects `Retry-After`;
+  clip downloads retry transient failures too, since the job is already paid for.
+  Retries never submit another generation request.
 - **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
 - **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
@@ -69,7 +73,9 @@ per-process usage - all behind one `openrouter-mcp` executable.
   limit / remaining balance, and tier / key-type flags).
 - **Usage stats** - `get_usage_stats` (read-only) and `reset_usage_stats`
   (destructive, requires `confirm: true`): per-process request/cost counters with
-  a by-model breakdown.
+  a by-model breakdown. Known charges remain counted when decoding or saving fails.
+  Video cost belongs to the job and is counted once, regardless of clip count.
+  Accepted video jobs without reported usage count as unknown cost.
 
 ## Add to Claude Desktop (one-click)
 
@@ -98,9 +104,10 @@ Per-platform specifics, all handled by the generator: macOS produces a universal
 arm64+x86_64 binary (via `lipo`); Linux builds a static `x86_64-unknown-linux-musl`
 binary so the bundle runs on any distro regardless of the host's glibc version;
 Windows statically links the CRT so it starts on a fresh install with no Visual
-C++ Redistributable. TLS is pure-Rust [rustls](https://github.com/rustls/rustls)
-trusting the OS certificate store, so no system OpenSSL is needed to build any
-target and custom/corporate root CAs installed on the machine still work.
+C++ Redistributable. TLS uses [rustls](https://github.com/rustls/rustls) with the OS certificate store.
+The crypto provider, aws-lc, requires C build tools.
+OpenSSL is not required. Custom root CAs use the platform certificate verifier.
+Release packaging runs only after formatting, lint, tests, and the MSRV check pass.
 
 ## Connect another client (CLI, IDE, agent)
 
@@ -178,15 +185,18 @@ links, or inline audio blocks), in addition to saving it to disk:
   `claude-code` CLI, which shares the filesystem and can open the saved file
   directly.
 - `always` - always embed previews. The Claude Desktop connector sets this,
-  because Desktop runs the server in a sandboxed filesystem it can't read, so the
-  saved path is unreachable and the image must come back inline.
+  so images and small audio files can render without shared filesystem access.
 - `never` - paths only, never inline bytes.
 
 Inline previews are downscaled to a 1568px longest side; the full-resolution
 image is always the file saved on disk. At most 4 inline previews are embedded
 per job (remaining images are reported by path only in the JSON), and inline
 audio previews are capped at 4 MB (larger clips are saved to disk with the
-path returned instead).
+path returned instead). Video links contain no inline bytes and grant no filesystem access.
+
+The task registry accepts at most 32 pending image/video jobs per process.
+Further requests fail before generation starts. Finished jobs release their pending slots.
+Each image job allows four concurrent variant requests.
 
 ## MCP usage
 
@@ -224,8 +234,8 @@ block is optional.
 | `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. Optional `quality` (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) pass through to the provider. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size` - all four are required by the schema, not just prose; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. Required: `model`, `prompt`, `duration`, `with_audio` (renamed from `generate_audio` in 0.6.0). |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
-| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, max 25 MB), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), and `temperature`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
-| `chat_completion` | write | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
+| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, local 25 MiB limit for files and inline data), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), and `temperature`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
+| `chat_completion` | read-only | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
 | `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
 | `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
 | `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |
@@ -283,7 +293,7 @@ openrouter-mcp image \
   --output ./out/owl-hat.png
 ```
 
-Four parallel variants (files named `*-var-<seed>.<ext>` plus a manifest):
+Four parallel variants (files named `*-var-<seed>-<index>.<ext>` plus a manifest):
 
 ```bash
 openrouter-mcp image -m bytedance-seed/seedream-4.5 \

@@ -2,10 +2,8 @@
 name = "openrouter-mcp"
 version = "0.7.2"
 edition = "2024"
-# Verified, not guessed: `cargo +1.88 check --all-targets` passes. Several
-# dependencies (rmcp, pinned to 3.1.2 in the lock; image 0.25.10; darling 0.24.0;
-# the icu_* 2.3.0 family) declare rust-version 1.88 too, and our own use of
-# let-chains stabilized in 1.88. CI builds at this version so the claim stays true.
+# Rust 1.88 supports the let-chains used here and the dependency MSRV.
+# CI checks all targets at this floor, including before release packaging.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server and CLI for OpenRouter: model discovery, image generation/editing, and image description"
@@ -34,9 +32,9 @@ tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", 
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# rustls (pure Rust) instead of the default native-tls/OpenSSL backend: no C
-# toolchain or system OpenSSL to link, so the static musl build (shipped as the
-# Linux .mcpb) is a plain cross-compile. In reqwest 0.13, `rustls` uses the
+# rustls avoids a system OpenSSL dependency in the static musl build.
+# Its default aws-lc crypto provider still requires a C toolchain.
+# In reqwest 0.13, `rustls` uses the
 # platform verifier and system trust configuration, matching the old native-tls
 # behavior - so a user behind a corporate TLS-inspecting proxy whose custom root
 # CA lives in the OS store still connects. `charset` + `http2` are default
@@ -47,7 +45,7 @@ serde_json = "1"
 # 672,715 -> 71,498 bytes on the wire, an 89% saving on the tool we call most.
 # Costs one new crate, `async-compression`; flate2/miniz_oxide are already in the
 # tree via `png`, so the size delta is just the async wrapper.
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "native-tls", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "charset", "http2", "rustls", "gzip"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
@@ -60,6 +58,8 @@ resvg = { version = "0.48", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
 # Test-only HTTP mock server for exercising the OpenRouter client and MCP tool
 # without hitting the live API. Not shipped to users (dev-dependencies are
 # excluded from `cargo install` and the published crate).

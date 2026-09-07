@@ -84,9 +84,9 @@ pub async fn generate_variants(
 }
 
 /// Output path for one variant. A single variant uses `base` with the given
-/// extension. Multiple variants get a `-var-<seed>` suffix (seed zero-padded to
-/// at least 4 digits, so it is self-identifying and reproducible); when no seed
-/// is set the variant `index` is used instead, zero-padded so 10+ sort.
+/// extension. Multiple variants get a `-var-<seed>-<index>` suffix.
+/// Seeds use at least four digits, and indices use at least three digits.
+/// Without a seed, the suffix contains only the index.
 /// The file stem of `base`, or `"image"` if it has none.
 pub(crate) fn base_stem(base: &Path) -> String {
     base.file_stem()
@@ -113,7 +113,8 @@ pub fn variant_output_path(
         return base.with_extension(ext);
     }
     let marker = match seed {
-        Some(s) => format!("{s:04}"),
+        // The index stays unique even if seed stepping saturates at u64::MAX.
+        Some(s) => format!("{s:04}-{:03}", index_zero_based + 1),
         None => {
             let width = 3.max(total.to_string().len());
             format!("{:0width$}", index_zero_based + 1, width = width)
@@ -130,8 +131,6 @@ pub struct ImageSummary {
     pub height: u32,
     pub actual_aspect_ratio: String,
     pub actual_image_size: &'static str,
-    /// Actual USD cost from `usage.cost`, when reported (for usage stats).
-    pub cost: Option<f64>,
 }
 
 /// Result of a full generation job: the saved images, the manifest path, plus
@@ -142,6 +141,7 @@ pub struct JobSummary {
     pub images: Vec<ImageSummary>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+    pub billing: crate::billing::Totals,
 }
 
 /// Run a generation job: fan out `variants` in parallel, save each output (with
@@ -180,18 +180,40 @@ pub async fn run_job(
 
     let outcomes = generate_variants(client, req, variants, content).await;
 
+    let warnings = prepared
+        .iter()
+        .enumerate()
+        .flat_map(|(i, p)| {
+            p.warnings
+                .iter()
+                .map(move |w| format!("input image {}: {w}", i + 1))
+        })
+        .collect();
+    save_outcomes(
+        req,
+        base_output,
+        prompt_source,
+        input_images,
+        warnings,
+        outcomes,
+    )
+    .await
+}
+
+/// Persist outcomes independently from generation so delivery failures retain billing.
+async fn save_outcomes(
+    req: &GenerateRequest,
+    base_output: &Path,
+    prompt_source: &str,
+    input_images: Vec<InputImageMeta>,
+    mut warnings: Vec<String>,
+    outcomes: Vec<VariantOutcome>,
+) -> Result<JobSummary> {
+    let variants = outcomes.len();
+    let mut billing = crate::billing::Totals::default();
     let mut images = Vec::new();
-    let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut variant_metas = Vec::new();
-
-    // Surface per-input notes (e.g. an SVG with unrendered text) alongside the
-    // per-variant dimension warnings.
-    for (i, p) in prepared.iter().enumerate() {
-        for w in &p.warnings {
-            warnings.push(format!("input image {}: {w}", i + 1));
-        }
-    }
 
     for outcome in outcomes {
         let mut meta = VariantMeta {
@@ -204,6 +226,13 @@ pub async fn run_job(
         };
         match outcome.result {
             Ok(img) => {
+                billing.add(&crate::billing::Receipt {
+                    cost: img.cost,
+                    generation_id: img.generation_id.clone(),
+                });
+                meta.generation_id = img.generation_id.clone();
+                meta.provider = img.provider.clone();
+                meta.cost = img.cost;
                 let ext = image_io::extension_for(&img.mime);
                 let path =
                     variant_output_path(base_output, outcome.seed, outcome.index, variants, ext);
@@ -237,7 +266,6 @@ pub async fn run_job(
                             height: img.height,
                             actual_aspect_ratio: check.actual_aspect_ratio,
                             actual_image_size: check.actual_image_size,
-                            cost: img.cost,
                         });
                     }
                     Err(e) => {
@@ -248,6 +276,11 @@ pub async fn run_job(
                 }
             }
             Err(e) => {
+                if let Some(receipt) = crate::billing::Receipt::from_error(&e) {
+                    billing.add(receipt);
+                    meta.cost = receipt.cost;
+                    meta.generation_id = receipt.generation_id.clone();
+                }
                 let msg = format!("{e:#}");
                 errors.push(format!("variant {}: {msg}", outcome.index + 1));
                 meta.error = Some(msg);
@@ -286,6 +319,7 @@ pub async fn run_job(
         images,
         warnings,
         errors,
+        billing,
     })
 }
 
@@ -304,14 +338,14 @@ mod tests {
         // base seed 1000 -> variants 1000, 1001, ...
         let p1 = variant_output_path(Path::new("out/hero.png"), Some(1000), 0, 4, "png");
         let p2 = variant_output_path(Path::new("out/hero.png"), Some(1003), 3, 4, "png");
-        assert_eq!(p1, PathBuf::from("out/hero-var-1000.png"));
-        assert_eq!(p2, PathBuf::from("out/hero-var-1003.png"));
+        assert_eq!(p1, PathBuf::from("out/hero-var-1000-001.png"));
+        assert_eq!(p2, PathBuf::from("out/hero-var-1003-004.png"));
     }
 
     #[test]
     fn variant_output_path_pads_small_seed_to_four_digits() {
         let p = variant_output_path(Path::new("hero.png"), Some(42), 0, 4, "png");
-        assert_eq!(p, PathBuf::from("hero-var-0042.png"));
+        assert_eq!(p, PathBuf::from("hero-var-0042-001.png"));
     }
 
     #[test]
@@ -372,5 +406,99 @@ mod tests {
         assert_eq!(manifest["output_format"], "webp");
         assert_eq!(manifest["background"], "transparent");
         assert_eq!(manifest["output_compression"], 80);
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    fn request() -> GenerateRequest {
+        GenerateRequest {
+            model: "test/image".into(),
+            prompt: "test".into(),
+            aspect_ratio: None,
+            image_size: None,
+            seed: None,
+            images: vec![],
+            max_image_dimension: 800,
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_image_delivery_keeps_all_receipts_and_manifest_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("outputs/image.png");
+        // A directory at one output path forces that write to fail on every OS.
+        std::fs::create_dir_all(variant_output_path(&base, None, 0, 4, "png")).unwrap();
+        let image = |cost, id: &str| GeneratedImage {
+            bytes: vec![1, 2, 3],
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            text: None,
+            cost,
+            generation_id: Some(id.into()),
+            provider: Some("test".into()),
+            warnings: vec![],
+        };
+        let results = vec![
+            Ok(image(Some(0.25), "write-failed")),
+            Ok(image(None, "saved-unknown")),
+            Err(
+                anyhow::anyhow!("bad image bytes").context(crate::billing::Receipt {
+                    cost: Some(0.5),
+                    generation_id: Some("decode-failed".into()),
+                }),
+            ),
+            Err(anyhow::anyhow!("submission rejected")),
+        ];
+        let outcomes = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| VariantOutcome {
+                index,
+                seed: None,
+                duration_ms: 1,
+                result,
+            })
+            .collect();
+        let summary = save_outcomes(&request(), &base, "test", vec![], vec![], outcomes)
+            .await
+            .unwrap();
+        assert_eq!(summary.images.len(), 1);
+        assert_eq!(
+            std::fs::read(&summary.images[0].path).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(summary.billing.cost, 0.75);
+        assert_eq!(summary.billing.unknown, 1);
+        assert_eq!(summary.errors.len(), 3);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["variants"][0]["cost"], 0.25);
+        assert_eq!(manifest["variants"][0]["generation_id"], "write-failed");
+        assert!(manifest["variants"][0]["error"].is_string());
+        assert_eq!(manifest["variants"][2]["cost"], 0.5);
+        assert_eq!(manifest["variants"][2]["generation_id"], "decode-failed");
+    }
+
+    #[test]
+    fn extreme_seed_variants_keep_distinct_output_paths() {
+        let paths: std::collections::HashSet<_> = (0..16)
+            .map(|i| {
+                variant_output_path(
+                    Path::new("probe.png"),
+                    Some(u64::MAX.saturating_add(i as u64)),
+                    i,
+                    16,
+                    "png",
+                )
+            })
+            .collect();
+        assert_eq!(paths.len(), 16);
     }
 }

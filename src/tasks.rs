@@ -46,6 +46,7 @@ struct TaskEntry {
 }
 
 const MAX_RETAINED_TASKS: usize = 256;
+const MAX_PENDING_TASKS: usize = 32;
 const TERMINAL_TASK_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// A read-only view of a task for building a response.
@@ -68,9 +69,17 @@ impl TaskRegistry {
     }
 
     /// Register a new pending task.
-    pub async fn insert_pending(&self, id: &str, kind: TaskKind) {
+    pub async fn insert_pending(&self, id: &str, kind: TaskKind) -> bool {
         let now = Instant::now();
         let mut entries = self.inner.lock().await;
+        if entries
+            .values()
+            .filter(|entry| matches!(entry.status, Status::Pending))
+            .count()
+            >= MAX_PENDING_TASKS
+        {
+            return false;
+        }
         entries.insert(
             id.to_string(),
             TaskEntry {
@@ -81,6 +90,7 @@ impl TaskRegistry {
             },
         );
         prune_terminal(&mut entries, now);
+        true
     }
 
     /// Mark a task completed with its result.
@@ -228,10 +238,20 @@ mod tests {
     #[tokio::test]
     async fn polling_a_just_finished_task_does_not_evict_it() {
         let reg = TaskRegistry::new();
+        // Construct an overfull legacy state directly; admission now prevents it.
+        let mut entries = reg.inner.lock().await;
         for i in 0..=MAX_RETAINED_TASKS {
-            reg.insert_pending(&format!("task-{i}"), TaskKind::Video)
-                .await;
+            entries.insert(
+                format!("task-{i}"),
+                TaskEntry {
+                    kind: TaskKind::Video,
+                    status: Status::Pending,
+                    created_at: Instant::now(),
+                    finished_at: None,
+                },
+            );
         }
+        drop(entries);
         // Nothing is terminal yet, so the registry sits one over the bound.
         reg.complete("task-0", json!({"i": 0})).await;
 
@@ -246,5 +266,25 @@ mod tests {
         // The prune still runs, just after the read: now that task-0 is terminal
         // and the registry is over its bound, the next call reclaims it.
         assert!(reg.snapshot("task-0").await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[tokio::test]
+    async fn pending_limit_rejects_work_and_reopens_after_completion() {
+        let registry = TaskRegistry::new();
+        for i in 0..MAX_PENDING_TASKS {
+            assert!(
+                registry
+                    .insert_pending(&i.to_string(), TaskKind::Image)
+                    .await
+            );
+        }
+        assert!(!registry.insert_pending("excess", TaskKind::Video).await);
+        assert!(registry.snapshot("excess").await.is_none());
+        registry.complete("0", serde_json::json!({})).await;
+        assert!(registry.insert_pending("next", TaskKind::Video).await);
     }
 }

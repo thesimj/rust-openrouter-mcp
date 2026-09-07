@@ -121,6 +121,8 @@ pub struct Pricing {
     pub input_cache_read: Option<String>,
     #[serde(default)]
     pub input_cache_write: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cache_write_1h: Option<String>,
     /// Fractional discount applied to the above (numeric, not a price string).
     #[serde(default)]
     pub discount: Option<f64>,

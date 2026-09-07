@@ -71,40 +71,45 @@ fn envelope_image_paths(env: &serde_json::Value) -> Vec<String> {
 }
 
 /// Collect the on-disk paths of the generated clips in a video job envelope.
-fn envelope_video_paths(env: &serde_json::Value) -> Vec<String> {
+fn envelope_video_paths(env: &serde_json::Value) -> Vec<(String, String)> {
     env.get("videos")
         .and_then(|v| v.as_array())
         .map(|videos| {
             videos
                 .iter()
-                .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
-                .map(str::to_string)
+                .filter_map(|v| {
+                    Some((
+                        v.get("path")?.as_str()?.to_string(),
+                        v.get("mime")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("video/mp4")
+                            .to_string(),
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default()
 }
 
 /// Build a `ResourceLink` content block for each generated clip path. rmcp has
-/// no native video content block, so a sandboxed client gets a `file://`
-/// ResourceLink (mime video/mp4, size from the file) rather than an embedded
-/// blob; the path is also in the JSON text block. Capped at [`MAX_INLINE_MEDIA`].
+/// no native video content block. Links use absolute file URIs and the saved
+/// media type. Clients need access to the server filesystem to open them.
+/// The JSON also carries each path. Capped at [`MAX_INLINE_MEDIA`].
 ///
 /// Blocking: does a filesystem stat per path - run via `spawn_blocking`.
-fn video_resource_link_blocks(paths: &[String]) -> Vec<ContentBlock> {
+fn video_resource_link_blocks(paths: &[(String, String)]) -> Vec<ContentBlock> {
     paths
         .iter()
         .take(MAX_INLINE_MEDIA)
-        .map(|path| {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            let mut resource =
-                Resource::new(format!("file://{path}"), name).with_mime_type("video/mp4");
-            if let Ok(meta) = std::fs::metadata(path) {
+        .filter_map(|(path, mime)| {
+            let absolute = std::path::absolute(path).ok()?;
+            let uri = reqwest::Url::from_file_path(&absolute).ok()?;
+            let name = absolute.file_name()?.to_string_lossy().into_owned();
+            let mut resource = Resource::new(uri.to_string(), name).with_mime_type(mime.clone());
+            if let Ok(meta) = std::fs::metadata(&absolute) {
                 resource = resource.with_size(meta.len());
             }
-            ContentBlock::resource_link(resource)
+            Some(ContentBlock::resource_link(resource))
         })
         .collect()
 }
@@ -272,7 +277,11 @@ impl OpenRouterServer {
             "task-{}",
             NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        self.tasks.insert_pending(&task_id, kind).await;
+        if !self.tasks.insert_pending(&task_id, kind).await {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Too many pending generation jobs; wait for one to finish before starting another.",
+            )]));
+        }
 
         let ctx = OpenRouterClientCtx {
             client: self.client.clone(),
@@ -281,9 +290,17 @@ impl OpenRouterServer {
         let tasks = self.tasks.clone();
         let id_bg = task_id.clone();
         let handle = tokio::spawn(async move {
-            match run(ctx).await {
-                Ok(result_json) => tasks.complete(&id_bg, result_json).await,
-                Err(message) => tasks.fail(&id_bg, message).await,
+            // The job runs in its own task so a panic inside it (debug builds;
+            // release aborts) still reaches `fail` and releases the pending
+            // slot instead of leaving the entry pending forever.
+            match tokio::spawn(run(ctx)).await {
+                Ok(Ok(result_json)) => tasks.complete(&id_bg, result_json).await,
+                Ok(Err(message)) => tasks.fail(&id_bg, message).await,
+                Err(join) => {
+                    tasks
+                        .fail(&id_bg, format!("generation job aborted: {join}"))
+                        .await
+                }
             }
         });
 
@@ -302,7 +319,12 @@ impl OpenRouterServer {
             .await
             .unwrap_or_else(|| TaskSnapshot::pending(kind));
         let env = snapshot_to_envelope(&task_id, &snap);
-        job_call_result(&env, inline_previews).await
+        let mut result = job_call_result(&env, inline_previews).await?;
+        // A lookup may succeed for a failed job, but the original generation failed.
+        if snap.status == "failed" {
+            result.is_error = Some(true);
+        }
+        Ok(result)
     }
 }
 
@@ -425,5 +447,42 @@ mod tests {
         // A pending job never carries a preview, even with previews enabled.
         let pending = json!({ "status": "pending", "images": [] });
         assert!(!has_image(&job_call_result(&pending, true).await.unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[tokio::test]
+    async fn generation_failure_is_a_tool_error_but_lookup_still_succeeds() {
+        let server = crate::server::test_support::server_for("http://127.0.0.1:9".into());
+        let result = server
+            .spawn_job_and_wait(TaskKind::Image, 1, false, |_| async {
+                Err("synthetic generation failure".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let envelope = crate::server::test_support::tool_result_json(&result);
+        assert_eq!(envelope["status"], "failed");
+        let lookup = server
+            .run_get_result(envelope["task_id"].as_str().unwrap().into(), false)
+            .await
+            .unwrap();
+        assert_eq!(lookup.is_error, Some(false));
+    }
+    #[test]
+    fn resource_links_encode_absolute_paths_and_keep_media_types() {
+        let relative = "out/a #é.webm";
+        let blocks = video_resource_link_blocks(&[(relative.into(), "video/webm".into())]);
+        let value = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(value["mimeType"], "video/webm");
+        let uri = reqwest::Url::parse(value["uri"].as_str().unwrap()).unwrap();
+        assert_eq!(uri.host_str(), None);
+        assert_eq!(uri.fragment(), None);
+        assert_eq!(
+            uri.to_file_path().unwrap(),
+            std::path::absolute(relative).unwrap()
+        );
     }
 }

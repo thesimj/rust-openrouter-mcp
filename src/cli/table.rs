@@ -121,12 +121,14 @@ pub(crate) fn render_sectioned_table(
                     let p = m.pricing.as_ref();
                     let in_ = per_million(&p.and_then(|x| x.prompt.clone()));
                     let out = per_million(&p.and_then(|x| x.completion.clone()));
-                    // Prefer per-output-image price; fall back to the `image` field.
-                    let img = dollars(
-                        &p.and_then(|x| x.image_output.clone().or_else(|| x.image.clone())),
-                    );
+                    // image_output has inconsistent units in the generic catalog.
+                    // Only the explicit per-image field belongs under $/IMG.
+                    let img = dollars(&p.and_then(|x| x.image.clone()));
+                    if p.is_some_and(|p| p.image_output.is_some()) {
+                        image_note = true;
+                    }
                     // No per-image price AND no real token price => price not in
-                    // /models (these are per-image billed; see /endpoints).
+                    // /models; consult endpoint pricing for the billing unit.
                     let no_token =
                         matches!(in_.as_str(), "-" | "0") && matches!(out.as_str(), "-" | "0");
                     if img == "-" && no_token {
@@ -180,14 +182,14 @@ pub(crate) fn render_sectioned_table(
     if video_note {
         notes.push(
             "* video pricing from /videos/models; units vary: /s = per second, \
-             /vid-tok = per video token."
+             /MP-s = per megapixel-second; /M vid-tok = per million video tokens."
                 .to_string(),
         );
     }
     if image_note {
         notes.push(
-            "Note: some image models don't expose pricing in /models (shown as -); \
-             see the per-endpoint detail or the model page for their per-image rate."
+            "Note: image_output has provider-specific units and is omitted from $/IMG; \
+             use describe_model for image endpoint rates and explicit billing units."
                 .to_string(),
         );
     }
@@ -282,7 +284,7 @@ mod tests {
             rendered
                 .notes
                 .iter()
-                .any(|n| n.contains("don't expose pricing"))
+                .any(|n| n.contains("explicit billing units"))
         );
     }
 
@@ -316,5 +318,21 @@ mod tests {
             supported_voices: None,
         };
         assert_eq!(primary_modality(&no_arch), "text");
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn ambiguous_image_output_never_appears_as_a_per_image_rate() {
+        let model: openrouter::Model = serde_json::from_value(serde_json::json!({
+            "id":"image/example", "architecture":{"output_modalities":["image"]},
+            "pricing":{"image_output":"0.00003"}
+        }))
+        .unwrap();
+        let rendered = render_sectioned_table(&[model], &Default::default());
+        assert!(!rendered.table.contains("0.00003"));
+        assert!(rendered.notes.join(" ").contains("image_output"));
     }
 }

@@ -89,7 +89,7 @@ impl OpenRouterServer {
     #[tool(
         description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
         hexgrad/kokoro-82m with voice af_heart) and save the audio to `output`. This is a \
-        synchronous, fast call (not a background task). No defaults for the required fields: \
+        synchronous call that waits for the provider response. No defaults for the required fields: \
         model, input (the text), and voice must all be specified, or the call fails naming what is \
         missing. Voice ids are model-specific and are not interchangeable between models - \
         call list_models with output_modalities=speech to see each model's supported_voices. \
@@ -214,6 +214,7 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_audio(&model, false, None).await;
+                self.stats.record_failed_receipt(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -222,9 +223,9 @@ impl OpenRouterServer {
     #[tool(
         description = "Transcribe speech to text with an OpenRouter STT model (e.g. \
         openai/gpt-4o-mini-transcribe, openai/whisper-1, or a Voxtral/Chirp model). This is a \
-        synchronous, fast call (not a background task). Pass the audio as `path` (a local file, \
+        synchronous call that waits for the provider response. Pass the audio as `path` (a local file, \
         format inferred from its extension) or `base64` (inline data, with `format`); accepted \
-        formats are wav, mp3, flac, m4a, ogg, webm, aac, up to 25 MB. An optional `language` \
+        formats are wav, mp3, flac, m4a, ogg, webm, aac, with a local 25 MiB limit for both paths and inline data. An optional `language` \
         hint (ISO-639-1, e.g. \"en\") improves accuracy. Returns the transcript text by default \
         (response_format=\"json\"). Set response_format=\"verbose_json\" to get the full \
         response object (language, duration, segments, words, ...) instead - this needs an \
@@ -262,6 +263,7 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;
+                self.stats.record_failed_receipt(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -283,15 +285,14 @@ async fn resolve_transcribe_request(
         (None, Some(b64)) => {
             // Tolerate a `data:audio/mp3;base64,...` URL: upstream wants the raw
             // bytes, and the subtype is a usable format when none was passed.
-            let (from_url, data) = match b64.strip_prefix("data:").and_then(|r| r.split_once(',')) {
-                Some((meta, data)) => (
-                    meta.split(';')
-                        .next()
-                        .and_then(|m| m.rsplit('/').next())
-                        .map(str::to_string),
+            let (from_url, data) = if b64.trim().starts_with("data:") {
+                let (mime, data) = crate::image_io::split_data_url(&b64)?;
+                (
+                    mime.rsplit('/').next().map(str::to_string),
                     data.trim().to_string(),
-                ),
-                None => (None, b64.trim().to_string()),
+                )
+            } else {
+                (None, b64.trim().to_string())
             };
             let format = args.format.or(from_url).context(
                 "base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)",

@@ -1,6 +1,6 @@
 //! Video-generation orchestration over the async OpenRouter video job API.
 //!
-//! Unlike image generation (synchronous chat-completions), video uses an async
+//! Unlike synchronous image generation, video uses an async
 //! job API: submit `POST /api/v1/videos`, poll `GET /api/v1/videos/{id}` until
 //! the job completes or fails, then download each clip from the content
 //! endpoint. Frame images (first/last) and reference images are reused from the
@@ -72,12 +72,14 @@ pub struct VideoSummary {
     pub aspect_ratio: Option<String>,
     pub has_audio: bool,
     pub mime: String,
-    pub cost: Option<f64>,
 }
 
 /// Result of a full video job: the saved clips, the manifest path, plus warnings
 /// and errors.
 pub struct VideoJobSummary {
+    pub job_id: String,
+    /// The accepted job's receipt; cost is `None` until usage is reported.
+    pub billing: crate::billing::Receipt,
     pub model: String,
     pub manifest_path: PathBuf,
     pub videos: Vec<VideoSummary>,

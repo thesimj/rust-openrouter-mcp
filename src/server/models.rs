@@ -385,7 +385,7 @@ mod tests {
                     "id": "openai/gpt-image-2",
                     "endpoints": [{
                         "supported_parameters": ["quality", "output_format"],
-                        "pricing": [{"billable": "output_image", "cost_usd": 0.00004}]
+                        "pricing": [{"billable": "output_image", "unit": "token", "cost_usd": 0.00003}]
                     }]
                 }
             })))
@@ -405,11 +405,12 @@ mod tests {
             v["image"]["endpoints"][0]["supported_parameters"][0],
             "quality"
         );
-        // The wiring, not just the helper: the merged endpoint carries the
-        // human rendering of its numeric cost_usd pricing lines (F11).
+        // Endpoint pricing uses the explicit unit even when the billable name
+        // contains "image". Preserve the original unit alongside the rendering.
+        assert_eq!(v["image"]["endpoints"][0]["pricing"][0]["unit"], "token");
         assert_eq!(
             v["image"]["endpoints"][0]["pricing_human"][0],
-            "output_image: $0.00004/image"
+            "output_image: $30/M tokens"
         );
     }
 

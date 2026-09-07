@@ -1,4 +1,4 @@
-//! Image-generation orchestration over the OpenRouter chat-completions API.
+//! Image-generation orchestration over the OpenRouter Images API.
 //!
 //! Phase 1: a single text-to-image request. The returned image format is
 //! whatever the provider sends (sniffed, not assumed) and the dimensions are
@@ -320,7 +320,27 @@ pub(crate) async fn generate_core(
     };
 
     let (resp, generation_id) = client.generate_images(&request).await?;
-    let cost = resp.usage.and_then(|u| u.cost);
+    let cost = resp.usage.as_ref().and_then(|u| u.cost);
+    let receipt = crate::billing::Receipt {
+        cost,
+        generation_id: generation_id.clone(),
+    };
+    receipt.wrap(|| decode_generated(resp, cost, generation_id))
+}
+
+/// Decode the first image of an Images API response into a [`GeneratedImage`].
+///
+/// Sniff the raster magic bytes first - they are ground truth. A declared
+/// `image/svg+xml` is trusted as-is (sniffing never recognizes SVG text as a
+/// raster format, so there is nothing to cross-check it against). Otherwise,
+/// when the response also declared a `media_type` that disagrees with the
+/// sniffed bytes, the sniffed one wins and the mismatch is recorded as a
+/// warning rather than silently saving the file under the wrong extension.
+fn decode_generated(
+    resp: crate::openrouter::ImagesResponse,
+    cost: Option<f64>,
+    generation_id: Option<String>,
+) -> Result<GeneratedImage> {
     let item = resp
         .data
         .into_iter()
@@ -328,12 +348,6 @@ pub(crate) async fn generate_core(
         .context("model returned no image (it may have refused)")?;
 
     let bytes = image_io::decode_base64(&item.b64_json)?;
-    // Sniff the raster magic bytes first - they are ground truth. A declared
-    // `image/svg+xml` is trusted as-is (sniffing never recognizes SVG text as a
-    // raster format, so there is nothing to cross-check it against). Otherwise,
-    // when the response also declared a `media_type` that disagrees with the
-    // sniffed bytes, the sniffed one wins and the mismatch is recorded as a
-    // warning rather than silently saving the file under the wrong extension.
     let mut warnings = Vec::new();
     let sniffed = image_io::sniff_mime(&bytes).map(str::to_string);
     let declared_canonical = item.media_type.as_deref().map(canonical_mime);

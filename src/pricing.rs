@@ -46,27 +46,53 @@ pub(crate) fn range_str(vals: &[f64], unit: &str) -> String {
 /// Derive a concise price for a video model from its heterogeneous
 /// `pricing_skus`: dollars-per-second, cents-per-second, or per-1M video tokens.
 pub(crate) fn video_price(skus: &BTreeMap<String, String>) -> String {
-    let collect = |pred: &dyn Fn(&str) -> bool| -> Vec<f64> {
-        skus.iter()
-            .filter(|(k, _)| pred(k))
-            .filter_map(|(_, v)| v.parse::<f64>().ok())
-            .collect()
-    };
-    let secs = collect(&|k| k.contains("duration_seconds"));
-    if !secs.is_empty() {
-        return range_str(&secs, "/s");
+    let mut groups: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for (key, raw) in skus {
+        let Some(value) = raw
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        else {
+            continue;
+        };
+        if let Some((scale, unit)) = video_unit(key) {
+            groups.entry(unit).or_default().push(value * scale);
+        } else {
+            unknown.push(format!("{key}: ${} (unit unknown)", trim_num(value)));
+        }
     }
-    let cents = collect(&|k| k.contains("second"));
-    if !cents.is_empty() {
-        let dollars: Vec<f64> = cents.iter().map(|c| c / 100.0).collect();
-        return range_str(&dollars, "/s");
+    let mut prices: Vec<String> = groups
+        .iter()
+        .map(|(unit, values)| range_str(values, unit))
+        .collect();
+    prices.extend(unknown);
+    if prices.is_empty() {
+        "-".to_string()
+    } else {
+        prices.join("; ")
     }
-    let toks = collect(&|k| k.contains("token"));
-    if !toks.is_empty() {
-        let per_m: Vec<f64> = toks.iter().map(|t| t * 1_000_000.0).collect();
-        return range_str(&per_m, "/M vid-tok");
+}
+
+/// Known video SKU families. Unknown names retain their names and raw rate.
+fn video_unit(key: &str) -> Option<(f64, &'static str)> {
+    if key.starts_with("cents_per_megapixel_second") {
+        Some((0.01, "/MP-s"))
+    } else if key.starts_with("duration_seconds") {
+        Some((1.0, "/s"))
+    } else if key.starts_with("second_")
+        || key == "second"
+        || key.starts_with("cents_per_second")
+        || key == "per-video-second"
+    {
+        Some((0.01, "/s"))
+    } else if key.starts_with("video_tokens") || key == "video_token" {
+        Some((1_000_000.0, "/M vid-tok"))
+    } else if key == "generate" {
+        Some((1.0, "/video"))
+    } else {
+        None
     }
-    "-".to_string()
 }
 
 /// Humanize one OpenRouter price (a USD-per-unit decimal string) by pricing key.
@@ -83,13 +109,9 @@ pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
     Some(match key {
         "prompt" | "completion" | "input_cache_read" | "input_cache_write"
         | "internal_reasoning" | "image_token" => per_m(v, "tokens"),
-        // Per *output token*, despite the name - verified against two providers.
-        // x-ai/grok-imagine-image-quality reports image_output == image_token
-        // (1.198e-5), and 8 images at 2K billed $0.64, i.e. ~6.7k tokens each.
-        // google/gemini-3.1-flash-image reports 6e-5 with no image_token, and
-        // its documented 1K price ($0.067) is ~1.1k tokens at that rate.
-        // Rendered as "$/image" this read as $0.00006 per image.
-        "image_output" => per_m(v, "output tokens"),
+        // Generic catalog prose and provider rates disagree on this field.
+        // The dedicated image endpoint supplies the authoritative unit.
+        "image_output" => format!("${}/unit (see image endpoint)", trim_num(v)),
         "audio" | "audio_output" | "input_audio_cache" => per_m(v, "audio tokens"),
         "request" => format!("${}/request", trim_num(v)),
         // A flat per-image SKU that is not always what bills: grok-imagine
@@ -101,12 +123,10 @@ pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
         // catch-all and rendered as "$0.00002/unit" beside "$12.5/M tokens" - the
         // same unit shown two ways, 10^6 apart.
         k if k.starts_with("input_cache_write") => per_m(v, "tokens"),
-        // Video SKUs: match the conventions in `video_price`.
-        k if k.contains("duration_seconds") => format!("${}/s", trim_num(v)),
-        k if k.contains("second") => format!("${}/s", trim_num(v / 100.0)), // cents -> dollars
-        k if k.contains("token") => per_m(v, "vid-tok"),                    // video tokens, per 1M
-        "generate" => format!("${}/video", trim_num(v)),
-        _ => format!("${}/unit", trim_num(v)),
+        k => match video_unit(k) {
+            Some((scale, unit)) => format!("${}{unit}", trim_num(v * scale)),
+            None => format!("${}/unit (unit unknown)", trim_num(v)),
+        },
     })
 }
 
@@ -176,7 +196,7 @@ pub(crate) fn attach_pricing_human(obj: &mut Value) {
 }
 
 /// Attach a `pricing_human` sibling to one merged image-endpoint object. Its
-/// `pricing` is an array of `{billable, cost_usd}` lines with NUMERIC costs
+/// `pricing` is an array of `{billable, unit, cost_usd}` lines with NUMERIC costs
 /// (unlike the string-priced flat pricing objects), rendered as "billable: $X".
 pub(crate) fn attach_image_pricing_human(endpoint: &mut Value) {
     let Some(lines) = endpoint.get("pricing").and_then(Value::as_array) else {
@@ -190,16 +210,20 @@ pub(crate) fn attach_image_pricing_human(endpoint: &mut Value) {
             if !(cost > 0.0 && cost.is_finite()) {
                 return None;
             }
-            // Same unit conventions as humanize_price: per-token rates scale
-            // to $/M, per-image rates read per image, the rest say /unit.
-            let rendered = if billable.contains("token") {
-                format!("${}/M tokens", trim_num(cost * 1_000_000.0))
-            } else if billable.contains("image") {
-                format!("${}/image", trim_num(cost))
-            } else {
-                format!("${}/unit", trim_num(cost))
+            let rendered = match l.get("unit").and_then(Value::as_str) {
+                Some("token") => format!("${}/M tokens", trim_num(cost * 1_000_000.0)),
+                Some("image") => format!("${}/image", trim_num(cost)),
+                Some("megapixel") => format!("${}/MP", trim_num(cost)),
+                Some("request") => format!("${}/request", trim_num(cost)),
+                Some(unit) => format!("${}/{unit}", trim_num(cost)),
+                None => format!("${}/unit (unit unknown)", trim_num(cost)),
             };
-            Some(Value::String(format!("{billable}: {rendered}")))
+            let variant = match l.get("variant") {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(s)) => format!(" [{s}]"),
+                Some(other) => format!(" [{other}]"),
+            };
+            Some(Value::String(format!("{billable}{variant}: {rendered}")))
         })
         .collect();
     if !human.is_empty()
@@ -257,7 +281,7 @@ mod tests {
         let mut skus = BTreeMap::new();
         skus.insert("duration_seconds".to_string(), "0.12".to_string());
         skus.insert("video_tokens".to_string(), "0.01".to_string());
-        assert_eq!(video_price(&skus), "$0.12/s");
+        assert_eq!(video_price(&skus), "$10000/M vid-tok; $0.12/s");
 
         let mut skus = BTreeMap::new();
         skus.insert("second_with_audio".to_string(), "3".to_string());
@@ -295,22 +319,20 @@ mod tests {
             humanize_price("input_cache_write_1h", "0.00002").as_deref(),
             Some("$20/M tokens")
         );
-        // `image` is a flat per-image SKU; `image_output` is per output token
-        // despite the name, so it must not render in the same unit. The two
-        // values below are the real ones from grok-imagine-image-quality, where
-        // reading image_output as per-image understated the cost ~8x.
+        // Generic image_output units are ambiguous. Explicit endpoint units
+        // supply the authoritative rate; do not invent a per-image rate here.
         assert_eq!(
             humanize_price("image", "0.01").as_deref(),
             Some("$0.01/image")
         );
         assert_eq!(
             humanize_price("image_output", "0.0000119760479041916").as_deref(),
-            Some("$11.9760479/M output tokens")
+            Some("$0.00001198/unit (see image endpoint)")
         );
         // gemini-3.1-flash-image quotes image_output with no image_token beside it.
         assert_eq!(
             humanize_price("image_output", "0.00006").as_deref(),
-            Some("$60/M output tokens")
+            Some("$0.00006/unit (see image endpoint)")
         );
         // Video SKUs use their real units (matching video_price).
         assert_eq!(
@@ -398,8 +420,8 @@ mod tests {
         let mut ep = serde_json::json!({
             "provider_name": "OpenAI",
             "pricing": [
-                {"billable": "output_image", "cost_usd": 0.00004},
-                {"billable": "input_text_tokens", "cost_usd": 0.000005},
+                {"billable": "output_image", "unit": "image", "cost_usd": 0.00004},
+                {"billable": "input_text_tokens", "unit": "token", "cost_usd": 0.000005},
                 {"billable": "zeroed_tokens", "cost_usd": 0.0},
                 {"billable": "weird", "cost_usd": -1.0}
             ]
@@ -416,5 +438,61 @@ mod tests {
         let mut no_pricing = serde_json::json!({"provider_name": "X"});
         attach_image_pricing_human(&mut no_pricing);
         assert!(no_pricing.get("pricing_human").is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn explicit_image_units_override_billable_names_and_keep_variants() {
+        let mut endpoint = serde_json::json!({"pricing": [
+            {"billable":"output_image","unit":"token","cost_usd":0.00003,"variant":"high"},
+            {"billable":"input_text","unit":"token","cost_usd":0.000005},
+            {"billable":"input_image","unit":"megapixel","cost_usd":0.02},
+            {"billable":"output_image","cost_usd":0.1}
+        ]});
+        attach_image_pricing_human(&mut endpoint);
+        assert_eq!(
+            endpoint["pricing_human"],
+            serde_json::json!([
+                "output_image [high]: $30/M tokens",
+                "input_text: $5/M tokens",
+                "input_image: $0.02/MP",
+                "output_image: $0.1/unit (unit unknown)"
+            ])
+        );
+    }
+    #[test]
+    fn video_rates_keep_megapixel_factors_and_unknown_sku_names() {
+        let skus = BTreeMap::from([
+            ("cents_per_megapixel_second_precise".into(), "7.5".into()),
+            ("cents_per_megapixel_second_creative".into(), "10.5".into()),
+        ]);
+        assert_eq!(video_price(&skus), "$0.075-0.105/MP-s");
+        assert_eq!(
+            humanize_price("cents_per_megapixel_second_precise", "7.5").as_deref(),
+            Some("$0.075/MP-s")
+        );
+        assert_eq!(
+            video_price(&BTreeMap::from([(
+                "unrecognized_second_unit".into(),
+                "2".into()
+            )])),
+            "unrecognized_second_unit: $2 (unit unknown)"
+        );
+    }
+    #[test]
+    fn catalog_round_trip_preserves_one_hour_cache_write_pricing() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id":"anthropic/example", "pricing":{"input_cache_write_1h":"0.00001"}
+        }))
+        .unwrap();
+        let output = models_to_json(&[model]);
+        assert_eq!(output[0]["pricing"]["input_cache_write_1h"], "0.00001");
+        assert_eq!(
+            output[0]["pricing_human"]["input_cache_write_1h"],
+            "$10/M tokens"
+        );
     }
 }

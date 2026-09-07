@@ -114,6 +114,8 @@ fn video_job_result_json(summary: &video_gen::VideoJobSummary) -> serde_json::Va
     let mut result = json!({
         "ok": true,
         "model": summary.model,
+        "job_id": summary.job_id,
+        "cost": summary.billing.cost,
         "kind": "video",
         "videos": videos,
         "manifest": summary.manifest_path.to_string_lossy(),
@@ -144,8 +146,8 @@ impl OpenRouterServer {
         generation takes. `with_audio` controls the audio track baked into the clip. `output` is \
         optional - omit it for an auto-named file under OPENROUTER_MCP_OUTPUT_DIR \
         (default $HOME/Downloads/openrouter-mcp). The completed result carries the saved file \
-        path in JSON plus, for sandboxed clients, a file:// ResourceLink (mime video/mp4) per \
-        clip.",
+        path in JSON plus a file:// ResourceLink per clip when previews are enabled. \
+        Links preserve the media type and require client access to the server filesystem.",
         annotations(
             title = "Generate Video",
             read_only_hint = false,
@@ -251,22 +253,26 @@ impl OpenRouterServer {
             inline_previews,
             move |ctx| async move {
                 match video_gen::run_job(&ctx.client, &req, &base, "inline").await {
-                    Ok(summary) if !summary.videos.is_empty() => {
-                        let costs: Vec<f64> =
-                            summary.videos.iter().filter_map(|v| v.cost).collect();
-                        let cost = (!costs.is_empty()).then(|| costs.iter().sum());
-                        ctx.stats.record_video(&model, true, cost).await;
+                    Ok(summary) => {
+                        ctx.stats
+                            .record_video(
+                                &model,
+                                summary.videos.len() as u64,
+                                Some(&summary.billing),
+                            )
+                            .await;
+                        if summary.videos.is_empty() {
+                            return Err(format!(
+                                "video job {} failed: {}; recovery manifest: {}",
+                                summary.job_id,
+                                summary.errors.join("; "),
+                                summary.manifest_path.display()
+                            ));
+                        }
                         Ok(video_job_result_json(&summary))
                     }
-                    Ok(summary) => {
-                        ctx.stats.record_video(&model, false, None).await;
-                        Err(format!(
-                            "video generation failed: {}",
-                            summary.errors.join("; ")
-                        ))
-                    }
                     Err(e) => {
-                        ctx.stats.record_video(&model, false, None).await;
+                        ctx.stats.record_video(&model, 0, None).await;
                         Err(format!("{e:#}"))
                     }
                 }

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::image_gen::{self, InputImage};
 use crate::openrouter::{
-    ChatRequest, Content, ContentPart, ImageUrl, Message, OpenRouterClient, Reasoning,
+    ChatRequest, Choice, Content, ContentPart, ImageUrl, Message, OpenRouterClient, Reasoning,
 };
 
 /// A chat reply: the assistant text plus the reported USD cost (when present).
@@ -94,23 +94,32 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
 
     let completion = client.chat_completion(&req).await?;
     let cost = completion.usage.and_then(|u| u.cost);
-    let choice = completion
-        .choices
+    let receipt = crate::billing::Receipt {
+        cost,
+        generation_id: None,
+    };
+    receipt.wrap(|| {
+        let text = first_text(completion.choices, !inputs.images.is_empty())?;
+        Ok(ChatResult { text, cost })
+    })
+}
+
+/// The first choice's non-empty text, or why there is none.
+fn first_text(choices: Vec<Choice>, has_images: bool) -> Result<String> {
+    let choice = choices
         .into_iter()
         .next()
         .context("OpenRouter returned no choices")?;
-    let text = choice
+    choice
         .message
         .content
         .filter(|t| !t.is_empty())
         .with_context(|| {
-            if inputs.images.is_empty() {
-                "model returned no text".to_string()
-            } else {
+            if has_images {
                 "model returned no text (it may be an image-output-only model; \
                  use one with text output)"
-                    .to_string()
+            } else {
+                "model returned no text"
             }
-        })?;
-    Ok(ChatResult { text, cost })
+        })
 }

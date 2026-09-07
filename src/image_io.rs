@@ -10,20 +10,30 @@ use base64::Engine;
 
 /// Parse a `data:image/<mime>;base64,<data>` URL into `(mime, bytes)`.
 pub fn parse_data_url(url: &str) -> Result<(String, Vec<u8>)> {
+    let (mime, data) = split_data_url(url)?;
+    let bytes = decode_base64(data).context("failed to base64-decode data URL")?;
+    Ok((mime.to_string(), bytes))
+}
+
+/// Split a `data:<mime>[;<param>...];base64,<data>` URL into its MIME type and
+/// still-encoded payload. Shared by every inline input (image and audio) so
+/// they agree on what counts as a base64 data URL.
+pub fn split_data_url(url: &str) -> Result<(&str, &str)> {
     let rest = url
+        .trim()
         .strip_prefix("data:")
         .context("not a data URL (missing `data:` prefix)")?;
     let (meta, data) = rest
         .split_once(',')
         .context("malformed data URL (missing comma)")?;
-    if !meta.contains("base64") {
+    if !meta
+        .split(';')
+        .any(|part| part.trim().eq_ignore_ascii_case("base64"))
+    {
         bail!("unsupported data URL: not base64-encoded");
     }
-    let mime = meta.split(';').next().unwrap_or_default().to_string();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
-        .context("failed to base64-decode data URL")?;
-    Ok((mime, bytes))
+    let mime = meta.split(';').next().unwrap_or_default().trim();
+    Ok((mime, data))
 }
 
 /// Decode an input image (png/jpeg/webp/gif), downscale so its longest side is
@@ -109,11 +119,11 @@ pub struct RasterizedSvg {
 /// cap rather than at their tiny intrinsic size). The pixmap is bounded by
 /// `max_side` on both axes by construction, so a hostile `width`/`viewBox` can't
 /// trigger a huge allocation. No fonts are loaded (text is skipped) and no
-/// external resources are resolved (`resources_dir` is `None`).
+/// external image paths are resolved (the string resolver rejects them).
 pub fn svg_to_png(bytes: &[u8], max_side: u32) -> Result<RasterizedSvg> {
     use resvg::{tiny_skia, usvg};
 
-    let opt = usvg::Options::default();
+    let opt = svg_options();
     let tree = usvg::Tree::from_data(bytes, &opt).context("could not parse SVG")?;
     let size = tree.size();
     let (w, h) = (size.width(), size.height());
@@ -164,12 +174,32 @@ pub fn extension_for(mime: &str) -> &'static str {
     }
 }
 
-/// Decode raw base64 image bytes (no `data:` prefix). Used for the Images API,
-/// which returns bytes in `data[].b64_json` rather than as a data URL.
+/// Decode raw base64 bytes (no `data:` prefix). Lenient on purpose: interior
+/// whitespace (line-wrapping encoders such as `base64 file`) is ignored and
+/// padding is optional, since inline payloads are often hand-assembled and the
+/// bytes, not the encoding style, are what matters.
 pub fn decode_base64(data: &str) -> Result<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
-        .context("failed to base64-decode image data")
+    LENIENT_BASE64
+        .decode(compact_base64(data).as_bytes())
+        .context("failed to base64-decode data")
+}
+
+/// Standard alphabet, whitespace already removed by [`compact_base64`],
+/// padding accepted but not required.
+const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::general_purpose::PAD
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
+/// `data` with ASCII whitespace removed, borrowed when there was none.
+pub fn compact_base64(data: &str) -> std::borrow::Cow<'_, str> {
+    let data = data.trim();
+    if data.bytes().any(|b| b.is_ascii_whitespace()) {
+        std::borrow::Cow::Owned(data.chars().filter(|c| !c.is_ascii_whitespace()).collect())
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
 }
 
 /// Sniff a raster image's MIME type from its magic bytes. Returns `None` for
@@ -190,13 +220,24 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
 /// [`decode_dimensions`] cannot read.
 pub fn svg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     use resvg::usvg;
-    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+    let tree = usvg::Tree::from_data(bytes, &svg_options()).ok()?;
     let size = tree.size();
     let (w, h) = (size.width(), size.height());
     if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
         return None;
     }
     Some((w.round() as u32, h.round() as u32))
+}
+
+/// Apply the same resource policy to top-level and embedded SVG documents.
+fn svg_options() -> resvg::usvg::Options<'static> {
+    resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_string: Box::new(|_, _| None),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// Decode the pixel dimensions of an encoded image, auto-detecting the format
@@ -316,6 +357,11 @@ mod tests {
     fn parse_data_url_rejects_non_data_and_non_base64() {
         assert!(parse_data_url("https://example.com/x.png").is_err());
         assert!(parse_data_url("data:image/png,notbase64").is_err());
+        // Parameter order, case and spacing around the base64 marker vary.
+        assert_eq!(
+            split_data_url(" data:audio/mp3;charset=x; BASE64,QUJD ").unwrap(),
+            ("audio/mp3", "QUJD")
+        );
     }
 
     const SVG_200X100: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100" fill="#1e50a0"/></svg>"##;
@@ -371,6 +417,14 @@ mod tests {
         let bytes = decode_base64(PNG_1X1_B64).unwrap();
         assert_eq!(&bytes[1..4], b"PNG");
         assert!(decode_base64("!!!not base64!!!").is_err());
+        // Line-wrapped and unpadded encodings decode to the same bytes.
+        assert_eq!(decode_base64("QUJD\nRA==").unwrap(), b"ABCD");
+        assert_eq!(decode_base64("QUJDRA").unwrap(), b"ABCD");
+        assert_eq!(compact_base64(" QUJD\r\nRA== "), "QUJDRA==");
+        assert!(matches!(
+            compact_base64("QUJD"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -460,5 +514,48 @@ mod tests {
     fn check_dimensions_clean_when_request_honored() {
         let check = check_dimensions(1024, 1024, Some("1:1"), Some("1K"));
         assert!(check.warnings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    #[test]
+    fn svg_rejects_absolute_relative_and_nested_file_references() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let local = dir.path().join("synthetic.svg");
+        let red = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#ff0000"/></svg>"##;
+        std::fs::write(&local, red).unwrap();
+        let wrap = |href: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image width="4" height="4" xlink:href="{href}"/></svg>"#
+            )
+        };
+        let absolute = wrap(local.to_str().unwrap());
+        let relative = wrap(
+            local
+                .strip_prefix(std::env::current_dir().unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
+        let nested = wrap(&data_url(absolute.as_bytes(), "image/svg+xml"));
+        for input in [&absolute, &relative, &nested] {
+            assert_eq!(svg_dimensions(input.as_bytes()), Some((4, 4)));
+            let png = svg_to_png(input.as_bytes(), 4).unwrap().png;
+            let pixels = image::load_from_memory(&png).unwrap().to_rgba8();
+            assert!(pixels.pixels().all(|p| p.0[3] == 0));
+        }
+        // Data references remain usable, including nested vector content.
+        let embedded = wrap(&data_url(red.as_bytes(), "image/svg+xml"));
+        let png = svg_to_png(embedded.as_bytes(), 4).unwrap().png;
+        assert_eq!(
+            image::load_from_memory(&png)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(2, 2)
+                .0,
+            [255, 0, 0, 255]
+        );
     }
 }
