@@ -10,7 +10,7 @@ use rmcp::{
 use serde_json::json;
 
 use crate::stats::UsageStats;
-use crate::tasks::{TaskKind, TaskSnapshot};
+use crate::tasks::{JobReservation, TaskKind, TaskSnapshot};
 
 use super::OpenRouterServer;
 
@@ -138,7 +138,9 @@ fn encode_preview_blocks(paths: &[String]) -> Vec<ContentBlock> {
         .iter()
         .take(MAX_INLINE_PREVIEWS)
         .filter_map(|path| {
-            let bytes = std::fs::read(path).ok()?;
+            let bytes =
+                crate::resources::read_file_limited(std::path::Path::new(path), 64 * 1024 * 1024)
+                    .ok()?;
             let png = if is_png_within_bound(&bytes, PREVIEW_MAX_SIDE) {
                 bytes
             } else {
@@ -192,13 +194,25 @@ pub(crate) async fn job_call_result(
     let mut blocks = vec![ContentBlock::text(body)];
 
     if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
+        static PREVIEW_CAPACITY: std::sync::OnceLock<tokio::sync::Semaphore> =
+            std::sync::OnceLock::new();
+        let Ok(_preview_permit) = PREVIEW_CAPACITY
+            .get_or_init(|| tokio::sync::Semaphore::new(4))
+            .try_acquire()
+        else {
+            blocks.push(ContentBlock::text(
+                "Inline preview capacity reached; use the saved paths above.",
+            ));
+            return Ok(CallToolResult::success(blocks));
+        };
         match env.get("kind").and_then(|k| k.as_str()) {
             Some("video") => {
                 let paths = envelope_video_paths(env);
                 // A filesystem stat per clip is blocking I/O; keep it off the worker.
-                let links = tokio::task::spawn_blocking(move || video_resource_link_blocks(&paths))
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let links =
+                    crate::resources::run_blocking(move || Ok(video_resource_link_blocks(&paths)))
+                        .await
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 blocks.extend(links);
             }
             // "image" (and the historical default) get inline image previews.
@@ -208,9 +222,10 @@ pub(crate) async fn job_call_result(
                 // Reading + decoding + resizing + re-encoding images is blocking CPU
                 // and disk I/O; run it off the async worker so concurrent tool calls
                 // (e.g. get_result polls) aren't stalled behind it.
-                let previews = tokio::task::spawn_blocking(move || encode_preview_blocks(&paths))
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let previews =
+                    crate::resources::run_blocking(move || Ok(encode_preview_blocks(&paths)))
+                        .await
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 let shown = previews.len();
                 blocks.extend(previews);
                 if total > MAX_INLINE_PREVIEWS {
@@ -270,43 +285,41 @@ impl OpenRouterServer {
         F: FnOnce(OpenRouterClientCtx) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = JobOutcome> + Send + 'static,
     {
-        // Task ids never leave this process and are dropped on restart, so a
-        // monotonic counter is as unique as it needs to be.
-        static NEXT_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let task_id = format!(
-            "task-{}",
-            NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        if !self.tasks.insert_pending(&task_id, kind).await {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "Too many pending generation jobs; wait for one to finish before starting another.",
-            )]));
-        }
+        let Some(reservation) = self.tasks.reserve(kind) else {
+            return Ok(Self::admission_error());
+        };
+        self.spawn_reserved_job_and_wait(reservation, wait, inline_previews, run)
+            .await
+    }
 
+    pub(crate) fn admission_error() -> CallToolResult {
+        CallToolResult::error(vec![ContentBlock::text(
+            "Generation admission closed or too many pending generation jobs; wait for one to finish before starting another.",
+        )])
+    }
+
+    pub(crate) async fn spawn_reserved_job_and_wait<F, Fut>(
+        &self,
+        reservation: JobReservation,
+        wait: u64,
+        inline_previews: bool,
+        run: F,
+    ) -> Result<CallToolResult, ErrorData>
+    where
+        F: FnOnce(OpenRouterClientCtx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = JobOutcome> + Send + 'static,
+    {
+        let task_id = reservation.id.clone();
+        let kind = reservation.kind;
         let ctx = OpenRouterClientCtx {
             client: self.client.clone(),
             stats: self.stats.clone(),
         };
-        let tasks = self.tasks.clone();
-        let id_bg = task_id.clone();
-        let handle = tokio::spawn(async move {
-            // The job runs in its own task so a panic inside it (debug builds;
-            // release aborts) still reaches `fail` and releases the pending
-            // slot instead of leaving the entry pending forever.
-            match tokio::spawn(run(ctx)).await {
-                Ok(Ok(result_json)) => tasks.complete(&id_bg, result_json).await,
-                Ok(Err(message)) => tasks.fail(&id_bg, message).await,
-                Err(join) => {
-                    tasks
-                        .fail(&id_bg, format!("generation job aborted: {join}"))
-                        .await
-                }
-            }
-        });
-
-        // Fast-return window: wait up to `wait` seconds, then report whatever
-        // state the task is in (dropping the handle leaves it running).
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(wait), handle).await;
+        let Some(done) = self.tasks.start(reservation, async move { run(ctx).await }) else {
+            return Ok(Self::admission_error());
+        };
+        // Only the completion receiver expires. The registry continues owning the job.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(wait), done).await;
         // Not guaranteed present despite the insert above: a concurrent call's
         // prune can evict this entry once it is terminal. Release builds set
         // `panic = "abort"`, so an `expect` here would take down the whole server

@@ -4,7 +4,9 @@
 //! whatever the provider sends (sniffed, not assumed) and the dimensions are
 //! decoded from the actual bytes (the requested `image_size` is only a hint).
 
+use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -14,7 +16,7 @@ use crate::openrouter::{ImageUrl, ImagesRequest, InputReference, OpenRouterClien
 
 pub(crate) mod job;
 
-pub(crate) use job::{JobSummary, base_stem, in_parent_of, run_job};
+pub(crate) use job::{JobSummary, run_job};
 
 /// Default input-image longest-side cap (px). Small enough to keep payloads and
 /// image-token cost bounded, large enough to keep dense text legible.
@@ -34,7 +36,7 @@ pub enum ImageSource {
     Path(PathBuf),
     /// Already-decoded bytes (from a URL fetch or a base64/data-URL argument),
     /// with a human-readable `name` for prompts/manifest.
-    Inline { bytes: Vec<u8>, name: String },
+    Inline { bytes: Arc<[u8]>, name: String },
 }
 
 /// An image used as input (editing / image-to-image). Order is preserved.
@@ -57,7 +59,7 @@ impl InputImage {
     pub fn inline(bytes: Vec<u8>, name: impl Into<String>, label: Option<String>) -> Self {
         Self {
             source: ImageSource::Inline {
-                bytes,
+                bytes: bytes.into(),
                 name: name.into(),
             },
             label,
@@ -183,14 +185,42 @@ pub(crate) struct PreparedInput {
 /// [`image_io::svg_to_png`]), with the SVG's intrinsic viewBox size recorded as
 /// the "original" dimensions.
 pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<PreparedInput>> {
+    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_INPUTS, MAX_IMAGE_TOTAL_BYTES};
+
+    anyhow::ensure!(
+        images.len() <= MAX_IMAGE_INPUTS,
+        "at most {MAX_IMAGE_INPUTS} input images are allowed"
+    );
+    // Validate and read the complete batch before decoding any image. Borrow
+    // inline buffers and retain each bounded file read for normalization.
+    let mut total = 0usize;
+    let mut inputs = Vec::with_capacity(images.len());
+    for img in images {
+        let limit = MAX_IMAGE_BYTES.min(MAX_IMAGE_TOTAL_BYTES - total);
+        let bytes: Cow<'_, [u8]> = match &img.source {
+            ImageSource::Path(p) => Cow::Owned(
+                crate::resources::read_file_limited(p, limit)
+                    .with_context(|| format!("could not read input image {}", p.display()))?,
+            ),
+            ImageSource::Inline { bytes, .. } => {
+                anyhow::ensure!(
+                    bytes.len() <= MAX_IMAGE_BYTES,
+                    "input image exceeds {MAX_IMAGE_BYTES} bytes"
+                );
+                anyhow::ensure!(
+                    bytes.len() <= limit,
+                    "input images exceed {MAX_IMAGE_TOTAL_BYTES} total bytes"
+                );
+                Cow::Borrowed(bytes)
+            }
+        };
+        total += bytes.len();
+        inputs.push(bytes);
+    }
     images
         .iter()
-        .map(|img| {
-            let bytes = match &img.source {
-                ImageSource::Path(p) => std::fs::read(p)
-                    .with_context(|| format!("could not read input image {}", p.display()))?,
-                ImageSource::Inline { bytes, .. } => bytes.clone(),
-            };
+        .zip(inputs)
+        .map(|(img, bytes)| {
             if image_io::is_svg(&bytes) {
                 let svg = image_io::svg_to_png(&bytes, max_dim)
                     .with_context(|| format!("could not rasterize SVG {}", img.source_label()))?;
@@ -238,10 +268,13 @@ pub(crate) async fn prepare_inputs_async(
     images: &[InputImage],
     max_dim: u32,
 ) -> Result<Vec<PreparedInput>> {
+    anyhow::ensure!(
+        images.len() <= crate::resources::MAX_IMAGE_INPUTS,
+        "at most {} input images are allowed",
+        crate::resources::MAX_IMAGE_INPUTS
+    );
     let images = images.to_vec();
-    tokio::task::spawn_blocking(move || prepare_inputs(&images, max_dim))
-        .await
-        .context("input image preparation task failed")?
+    crate::resources::run_blocking(move || prepare_inputs(&images, max_dim)).await
 }
 
 /// Pre-built inputs for one generation, computed once and shared across
@@ -325,7 +358,9 @@ pub(crate) async fn generate_core(
         cost,
         generation_id: generation_id.clone(),
     };
-    receipt.wrap(|| decode_generated(resp, cost, generation_id))
+    crate::resources::run_blocking(move || decode_generated(resp, cost, generation_id))
+        .await
+        .map_err(|error| receipt.attach(error))
 }
 
 /// Decode the first image of an Images API response into a [`GeneratedImage`].

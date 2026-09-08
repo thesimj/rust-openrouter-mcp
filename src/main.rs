@@ -15,6 +15,7 @@ mod manifest;
 mod openrouter;
 mod output;
 mod pricing;
+mod resources;
 mod server;
 mod stats;
 mod tasks;

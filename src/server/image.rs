@@ -59,7 +59,18 @@ pub(crate) struct ImageInput {
 /// Decode an inline `base64`/data-URL argument to raw bytes.
 fn decode_inline(data: &str) -> Result<Vec<u8>, ErrorData> {
     let data = data.trim();
-    if data.starts_with("data:") {
+    let payload = if data.starts_with("data:") {
+        data.split_once(',').map(|(_, body)| body).unwrap_or(data)
+    } else {
+        data
+    };
+    if payload.len() > crate::resources::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err(ErrorData::invalid_params(
+            "inline image exceeds 20 MiB",
+            None,
+        ));
+    }
+    let bytes = if data.starts_with("data:") {
         crate::image_io::parse_data_url(data)
             .map(|(_mime, bytes)| bytes)
             .map_err(|e| ErrorData::invalid_params(format!("invalid data URL: {e}"), None))
@@ -67,7 +78,14 @@ fn decode_inline(data: &str) -> Result<Vec<u8>, ErrorData> {
         base64::engine::general_purpose::STANDARD
             .decode(data)
             .map_err(|e| ErrorData::invalid_params(format!("invalid base64 image data: {e}"), None))
+    }?;
+    if bytes.len() > crate::resources::MAX_IMAGE_BYTES {
+        return Err(ErrorData::invalid_params(
+            "inline image exceeds 20 MiB",
+            None,
+        ));
     }
+    Ok(bytes)
 }
 
 /// True for IPs a fetched URL must never reach (SSRF guard): loopback, private
@@ -131,15 +149,14 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
     let lookup = host.clone();
     let addrs: Vec<SocketAddr> = tokio::time::timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || {
-            (lookup.as_str(), port)
-                .to_socket_addrs()
-                .map(|it| it.collect::<Vec<_>>())
+        crate::resources::run_blocking(move || {
+            Ok((lookup.as_str(), port)
+                .to_socket_addrs()?
+                .collect::<Vec<_>>())
         }),
     )
     .await
     .map_err(|_| invalid("image URL DNS lookup timed out".to_string()))?
-    .map_err(|e| ErrorData::internal_error(format!("dns task failed: {e}"), None))?
     .map_err(|e| invalid(format!("could not resolve image url host: {e}")))?;
 
     if addrs.is_empty() {
@@ -240,11 +257,12 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
     if let Some(p) = img.path.filter(|s| !s.trim().is_empty()) {
         Ok(image_gen::InputImage::from_path(p, label))
     } else if let Some(b64) = img.base64.filter(|s| !s.trim().is_empty()) {
-        Ok(image_gen::InputImage::inline(
-            decode_inline(&b64)?,
-            "inline",
-            label,
-        ))
+        let bytes = crate::resources::run_blocking(move || {
+            decode_inline(&b64).map_err(|e| anyhow::anyhow!(e.to_string()))
+        })
+        .await
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(image_gen::InputImage::inline(bytes, "inline", label))
     } else {
         let url = img.url.unwrap();
         let bytes = fetch_url(&url).await?;
@@ -256,9 +274,26 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
 pub(crate) async fn resolve_image_inputs(
     images: Vec<ImageInput>,
 ) -> Result<Vec<image_gen::InputImage>, ErrorData> {
+    if images.len() > crate::resources::MAX_IMAGE_INPUTS {
+        return Err(ErrorData::invalid_params(
+            "at most 16 input images are supported",
+            None,
+        ));
+    }
+    let mut total = 0usize;
     let mut out = Vec::with_capacity(images.len());
     for img in images {
-        out.push(resolve_image_input(img).await?);
+        let input = resolve_image_input(img).await?;
+        if let image_gen::ImageSource::Inline { bytes, .. } = &input.source {
+            total += bytes.len();
+            if total > crate::resources::MAX_IMAGE_TOTAL_BYTES {
+                return Err(ErrorData::invalid_params(
+                    "input images exceed 64 MiB in total",
+                    None,
+                ));
+            }
+        }
+        out.push(input);
     }
     Ok(out)
 }
@@ -461,6 +496,9 @@ impl OpenRouterServer {
         }
         require_all("generate_image", "image", &missing)?;
 
+        let Some(reservation) = self.tasks.reserve(TaskKind::Image) else {
+            return Ok(Self::admission_error());
+        };
         let aspect_ratio = args.aspect_ratio.clone();
         let image_size = args.image_size.clone();
         let images = resolve_image_inputs(args.images).await?;
@@ -502,8 +540,8 @@ impl OpenRouterServer {
         let model = args.model;
         let variants_u64 = variants as u64;
 
-        self.spawn_job_and_wait(
-            TaskKind::Image,
+        self.spawn_reserved_job_and_wait(
+            reservation,
             wait,
             inline_previews,
             move |ctx| async move {
@@ -554,6 +592,7 @@ impl OpenRouterServer {
         &self,
         Parameters(args): Parameters<DescribeImageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let _work = self.admit_work()?;
         if args.images.is_empty() {
             return Err(ErrorData::invalid_params(
                 "describe_image requires at least one image".to_string(),
@@ -911,5 +950,61 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("integer"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_excess_jobs_before_decoding_inputs() {
+        let server = super::super::test_support::server_for("http://127.0.0.1:9".into());
+        let reservations: Vec<_> = (0..32)
+            .map(|_| server.tasks.reserve(TaskKind::Image).unwrap())
+            .collect();
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model":"test", "prompt":"test", "aspect_ratio":"1:1", "image_size":"1K",
+            "images":[{"base64":"invalid!"}]
+        }))
+        .unwrap();
+        let result = server.run_generate(args, false).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("pending generation jobs")
+        );
+        drop(reservations);
+        assert!(server.tasks.reserve(TaskKind::Image).is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_image_count_before_resolving_sources() {
+        let images = (0..17)
+            .map(|_| ImageInput {
+                path: None,
+                url: None,
+                base64: Some("invalid!".into()),
+                label: None,
+            })
+            .collect();
+        let error = resolve_image_inputs(images).await.unwrap_err();
+        assert!(error.message.contains("at most 16"));
+    }
+
+    #[tokio::test]
+    async fn invalid_preparation_releases_job_reservation() {
+        let server = super::super::test_support::server_for("http://127.0.0.1:9".into());
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model":"test", "prompt":"test", "aspect_ratio":"1:1", "image_size":"1K",
+            "images":[{"base64":"invalid!"}]
+        }))
+        .unwrap();
+        assert!(server.run_generate(args, false).await.is_err());
+        let reservations: Vec<_> = (0..32)
+            .map(|_| server.tasks.reserve(TaskKind::Image).unwrap())
+            .collect();
+        assert_eq!(reservations.len(), 32);
     }
 }

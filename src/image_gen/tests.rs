@@ -464,3 +464,49 @@ fn canonical_mime_normalizes_case_and_aliases() {
     assert_eq!(super::canonical_mime("image/svg"), "image/svg+xml");
     assert_eq!(super::canonical_mime("image/png"), "image/png");
 }
+
+#[test]
+fn input_limits_reject_the_batch_before_decoding() {
+    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_INPUTS, MAX_IMAGE_TOTAL_BYTES};
+    let invalid = InputImage::inline(vec![0], "invalid", None);
+    let too_many = vec![invalid.clone(); MAX_IMAGE_INPUTS + 1];
+    assert!(
+        prepare_inputs(&too_many, 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("at most")
+    );
+
+    let oversized = InputImage::inline(vec![0; MAX_IMAGE_BYTES + 1], "large", None);
+    assert!(
+        prepare_inputs(&[invalid, oversized], 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceeds")
+    );
+
+    let shared = InputImage::inline(vec![0; MAX_IMAGE_TOTAL_BYTES / 4 + 1], "shared", None);
+    let total = vec![shared; 4];
+    assert!(
+        prepare_inputs(&total, 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("total bytes")
+    );
+}
+
+#[test]
+fn file_input_limit_rejects_before_normalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.png");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::resources::MAX_IMAGE_BYTES as u64 + 1)
+        .unwrap();
+    let error = prepare_inputs(&[InputImage::from_path(path, None)], 1)
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("limit") || format!("{error:#}").contains("exceed"));
+}

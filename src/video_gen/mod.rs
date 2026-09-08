@@ -64,6 +64,20 @@ pub fn resolve_poll_timeout() -> u64 {
     parse_secs(raw.as_deref(), DEFAULT_POLL_TIMEOUT_SECS)
 }
 
+/// Optional wall-clock budget for all clip downloads and retry waits.
+/// Zero, unset, or invalid values leave progressing downloads unrestricted.
+/// Cap enabled budgets at 30 days to keep timer arithmetic representable.
+fn parse_delivery_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| std::time::Duration::from_secs(seconds.min(30 * 24 * 60 * 60)))
+}
+
+pub(super) fn resolve_delivery_timeout() -> Option<std::time::Duration> {
+    let raw = std::env::var("OPENROUTER_VIDEO_DELIVERY_TIMEOUT").ok();
+    parse_delivery_timeout(raw.as_deref())
+}
+
 /// One saved clip in a job's lean summary.
 pub struct VideoSummary {
     pub path: PathBuf,
@@ -90,6 +104,21 @@ pub struct VideoJobSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_timeout_is_optional_and_bounded() {
+        assert_eq!(parse_delivery_timeout(None), None);
+        assert_eq!(parse_delivery_timeout(Some("0")), None);
+        assert_eq!(parse_delivery_timeout(Some("bad")), None);
+        assert_eq!(
+            parse_delivery_timeout(Some(" 12 ")),
+            Some(std::time::Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_delivery_timeout(Some(&u64::MAX.to_string())),
+            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60))
+        );
+    }
 
     #[test]
     fn parse_secs_defaults_and_floors_at_one() {

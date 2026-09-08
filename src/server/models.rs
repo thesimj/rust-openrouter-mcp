@@ -155,83 +155,88 @@ impl OpenRouterServer {
             ));
         }
 
-        let mut detail = self
-            .client
-            .describe_model(model)
+        let detail = enriched_model_detail(&self.client, model)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        // Video models price via a separate SKU endpoint; the token-based
-        // pricing on the main record is 0 and misleading. Merge the real
-        // pricing_skus + supported resolutions/durations/sizes under "video".
-        let outputs_video = detail["architecture"]["output_modalities"]
-            .as_array()
-            .is_some_and(|m| m.iter().any(|v| v == "video"));
-        if outputs_video {
-            match self.client.video_model_detail(model).await {
-                Ok(Some(mut video)) => {
-                    // pricing_skus is the video model's real pricing object.
-                    if let Some(human) = video.get("pricing_skus").and_then(humanize_pricing) {
-                        video["pricing_skus_human"] = human;
-                    }
-                    detail["video"] = video;
-                }
-                Ok(None) => {}
-                // Surface the failure instead of silently returning the
-                // misleading 0 token pricing as if it were complete.
-                Err(e) => {
-                    detail["video_pricing_error"] =
-                        Value::String(format!("could not fetch /videos/models: {e:#}"));
-                }
-            }
-        }
-
-        // Image models: merge the per-endpoint detail (definitive
-        // supported_parameters, allowed_passthrough_parameters, pricing,
-        // supports_streaming) from the dedicated image-models endpoint, the
-        // same best-effort way the video block above is merged.
-        let outputs_image = detail["architecture"]["output_modalities"]
-            .as_array()
-            .is_some_and(|m| m.iter().any(|v| v == "image"));
-        if outputs_image {
-            match self.client.image_model_detail(model).await {
-                Ok(Some(mut image)) => {
-                    // Same human rendering the video block gets: image pricing
-                    // lines carry numeric cost_usd, unreadable at 4e-05.
-                    if let Some(endpoints) =
-                        image.get_mut("endpoints").and_then(Value::as_array_mut)
-                    {
-                        for ep in endpoints {
-                            crate::pricing::attach_image_pricing_human(ep);
-                            // Fallback: if the shape ever turns string-priced
-                            // (like flat pricing objects), humanize that too.
-                            attach_pricing_human(ep);
-                        }
-                    }
-                    detail["image"] = image;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    detail["image_pricing_error"] =
-                        Value::String(format!("could not fetch /images/models: {e:#}"));
-                }
-            }
-        }
-
-        // Normalize every pricing block to human "$X/M tokens" form alongside
-        // the raw decimals: the top-level record and each per-provider endpoint.
-        attach_pricing_human(&mut detail);
-        if let Some(endpoints) = detail.get_mut("endpoints").and_then(Value::as_array_mut) {
-            for ep in endpoints {
-                attach_pricing_human(ep);
-            }
-        }
 
         let json = serde_json::to_string_pretty(&detail)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
+}
+
+/// Fetch model detail and preserve optional modality enrichment failures inline.
+async fn enriched_model_detail(
+    client: &crate::openrouter::OpenRouterClient,
+    model: &str,
+) -> anyhow::Result<Value> {
+    let mut detail = client.describe_model(model).await?;
+
+    // Video models price via a separate SKU endpoint; the token-based
+    // pricing on the main record is 0 and misleading. Merge the real
+    // pricing_skus + supported resolutions/durations/sizes under "video".
+    let outputs_video = detail["architecture"]["output_modalities"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|v| v == "video"));
+    if outputs_video {
+        match client.video_model_detail(model).await {
+            Ok(Some(mut video)) => {
+                // pricing_skus is the video model's real pricing object.
+                if let Some(human) = video.get("pricing_skus").and_then(humanize_pricing) {
+                    video["pricing_skus_human"] = human;
+                }
+                detail["video"] = video;
+            }
+            Ok(None) => {}
+            // Surface the failure instead of silently returning the
+            // misleading 0 token pricing as if it were complete.
+            Err(e) => {
+                detail["video_pricing_error"] =
+                    Value::String(format!("could not fetch /videos/models: {e:#}"));
+            }
+        }
+    }
+
+    // Image models: merge the per-endpoint detail (definitive
+    // supported_parameters, allowed_passthrough_parameters, pricing,
+    // supports_streaming) from the dedicated image-models endpoint, the
+    // same best-effort way the video block above is merged.
+    let outputs_image = detail["architecture"]["output_modalities"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|v| v == "image"));
+    if outputs_image {
+        match client.image_model_detail(model).await {
+            Ok(Some(mut image)) => {
+                // Same human rendering the video block gets: image pricing
+                // lines carry numeric cost_usd, unreadable at 4e-05.
+                if let Some(endpoints) = image.get_mut("endpoints").and_then(Value::as_array_mut) {
+                    for ep in endpoints {
+                        crate::pricing::attach_image_pricing_human(ep);
+                        // Fallback: if the shape ever turns string-priced
+                        // (like flat pricing objects), humanize that too.
+                        attach_pricing_human(ep);
+                    }
+                }
+                detail["image"] = image;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                detail["image_pricing_error"] =
+                    Value::String(format!("could not fetch /images/models: {e:#}"));
+            }
+        }
+    }
+
+    // Normalize every pricing block to human "$X/M tokens" form alongside
+    // the raw decimals: the top-level record and each per-provider endpoint.
+    attach_pricing_human(&mut detail);
+    if let Some(endpoints) = detail.get_mut("endpoints").and_then(Value::as_array_mut) {
+        for ep in endpoints {
+            attach_pricing_human(ep);
+        }
+    }
+    Ok(detail)
 }
 
 #[cfg(test)]
@@ -506,5 +511,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("500"), "got: {}", err.message);
+    }
+    #[tokio::test]
+    async fn describe_model_preserves_both_modalities_and_video_errors() {
+        for video_status in [200, 500] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models/test/multimodal/endpoints"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {
+                        "id": "test/multimodal",
+                        "architecture": {"output_modalities": ["video", "image"]},
+                        "pricing": {"prompt": "0.000001"},
+                        "custom_field": "preserved"
+                    }
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/videos/models"))
+                .respond_with(ResponseTemplate::new(video_status).set_body_json(json!({
+                    "data": [{"id": "test/multimodal", "pricing_skus": {"video_tokens": "0.000007"}}]
+                }))).expect(1).mount(&mock).await;
+            Mock::given(method("GET"))
+                .and(path("/images/models/test/multimodal/endpoints"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"endpoints": [{"pricing": [{"billable": "output_image", "unit": "token", "cost_usd": 0.00003}]}]}
+                }))).expect(1).mount(&mock).await;
+            let result = server_for(mock.uri())
+                .describe_model(Parameters(DescribeModelArgs {
+                    model: "test/multimodal".into(),
+                }))
+                .await
+                .unwrap();
+            let detail = tool_result_json(&result);
+            assert_eq!(detail["custom_field"], "preserved");
+            assert_eq!(detail["pricing"]["prompt"], "0.000001");
+            assert!(detail["pricing_human"].is_object());
+            assert_eq!(
+                detail["image"]["endpoints"][0]["pricing"][0]["cost_usd"],
+                0.00003
+            );
+            assert_eq!(
+                detail["image"]["endpoints"][0]["pricing_human"][0],
+                "output_image: $30/M tokens"
+            );
+            if video_status == 200 {
+                assert_eq!(detail["video"]["pricing_skus"]["video_tokens"], "0.000007");
+                assert!(detail.get("video_pricing_error").is_none());
+            } else {
+                assert!(
+                    detail["video_pricing_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("/videos/models")
+                );
+                assert!(detail.get("video").is_none());
+            }
+        }
     }
 }

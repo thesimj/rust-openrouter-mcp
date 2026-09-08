@@ -3,9 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::openrouter::{
-    Model, ModelsQuery, ModelsResponse, OpenRouterClient, truncate_error_body,
-};
+use crate::openrouter::{Model, ModelsQuery, ModelsResponse, OpenRouterClient};
 
 impl OpenRouterClient {
     /// The `input_modalities` declared for a single model id (e.g.
@@ -95,21 +93,15 @@ impl OpenRouterClient {
     /// failing the whole `describe_model` call over this enrichment.
     pub async fn image_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
         let label = format!("/images/models/{model_id}/endpoints");
-        let resp = self
+        let rb = self
             .http
             .get(format!("{}{label}", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .with_context(|| format!("request to OpenRouter {label} failed"))?;
+            .bearer_auth(&self.api_key);
+        let resp = self.send_response(rb, &label).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let status = resp.status();
-        if !status.is_success() {
-            let body = truncate_error_body(resp.text().await.unwrap_or_default());
-            anyhow::bail!("OpenRouter {label} returned {status}: {body}");
-        }
+        let resp = resp.checked(&label).await?;
         let mut body: Value = resp
             .json()
             .await

@@ -29,7 +29,14 @@ impl OpenRouterClient {
         let parsed: ImagesResponse = resp
             .json()
             .await
-            .context("failed to decode OpenRouter /images response")?;
+            .context("failed to decode OpenRouter /images response")
+            .map_err(|error| {
+                crate::billing::Receipt {
+                    cost: None,
+                    generation_id: generation_id.clone(),
+                }
+                .attach(error)
+            })?;
         Ok((parsed, generation_id))
     }
 }
@@ -55,6 +62,43 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_image_headers_retain_receipt_on_oversize_or_invalid_json() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for length in [crate::openrouter::MAX_JSON_BYTES + 1, 1] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let sender = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nX-Generation-Id: gen-paid-image\r\nConnection: close\r\n\r\n{{"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let client = OpenRouterClient::with_base_url(url, "test-key");
+            let error = client
+                .generate_images(&request())
+                .await
+                .expect_err("invalid body");
+            sender.await.unwrap();
+            let receipt =
+                crate::billing::Receipt::from_error(&error).expect("unknown charge survives");
+            assert_eq!(receipt.cost, None);
+            assert_eq!(receipt.generation_id.as_deref(), Some("gen-paid-image"));
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to decode OpenRouter /images response")
+            );
+            if length > crate::openrouter::MAX_JSON_BYTES {
+                assert!(error.to_string().contains("byte limit"));
+            }
         }
     }
 

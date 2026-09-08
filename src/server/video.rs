@@ -272,7 +272,9 @@ impl OpenRouterServer {
                         Ok(video_job_result_json(&summary))
                     }
                     Err(e) => {
-                        ctx.stats.record_video(&model, 0, None).await;
+                        ctx.stats
+                            .record_video(&model, 0, crate::billing::Receipt::from_error(&e))
+                            .await;
                         Err(format!("{e:#}"))
                     }
                 }
@@ -360,6 +362,70 @@ mod tests {
         assert!(!text.contains("aspect_ratio"), "{text}");
         assert!(!text.contains("no defaults"), "{text}");
         assert!(text.contains("/nonexistent.png"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_accepted_video_submission_keeps_unknown_billing_without_a_job_id() {
+        for status in [202, 400] {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/videos"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("x-generation-id", "gen-accepted-video")
+                        .set_body_string("{"),
+                )
+                .expect(1)
+                .mount(&mock)
+                .await;
+            let server = server_for(mock.uri());
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("clip.mp4");
+            let result = server
+                .run_generate_video(
+                    GenerateVideoArgs {
+                        model: "test/video".into(),
+                        prompt: "a kite".into(),
+                        duration: Some(4),
+                        resolution: None,
+                        aspect_ratio: Some("16:9".into()),
+                        size: None,
+                        with_audio: Some(false),
+                        seed: None,
+                        first_frame: None,
+                        last_frame: None,
+                        reference_images: vec![],
+                        max_image_dimension: None,
+                        wait_seconds: Some(1),
+                        output: Some(out.to_string_lossy().into_owned()),
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            let envelope = tool_result_json(&result);
+            assert_eq!(envelope["status"], "failed");
+            assert!(envelope.get("job_id").is_none());
+            let stats = server.stats.snapshot().await;
+            assert_eq!(stats["requests_total"], 1);
+            assert_eq!(stats["requests_failed"], 1);
+            assert_eq!(stats["unknown_cost_count"], u64::from(status == 202));
+            assert_eq!(
+                stats["by_model"]["test/video"]["unknown_cost_count"],
+                u64::from(status == 202)
+            );
+            assert!(!out.exists());
+            assert!(!crate::manifest::path(&out).exists());
+            assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+            if status == 202 {
+                assert!(
+                    envelope["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("gen-accepted-video")
+                );
+            }
+        }
     }
 
     #[tokio::test]

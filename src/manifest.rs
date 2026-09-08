@@ -88,9 +88,9 @@ pub struct VariantMeta {
 /// Sidecar manifest path next to the outputs: `<stem>.manifest.json`. Shared by
 /// the image, video, and audio jobs.
 pub fn path(base: &Path) -> PathBuf {
-    crate::image_gen::in_parent_of(
+    crate::output::in_parent_of(
         base,
-        format!("{}.manifest.json", crate::image_gen::base_stem(base)),
+        format!("{}.manifest.json", crate::output::base_stem(base)),
     )
 }
 

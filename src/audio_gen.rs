@@ -86,24 +86,16 @@ pub async fn read_audio_file(
         }
     };
 
-    let size = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("could not read audio file {}", path.display()))?
-        .len();
-    if size > MAX_TRANSCRIBE_BYTES {
-        bail!(
-            "audio file is {size} bytes; the local transcription limit is \
-             {MAX_TRANSCRIBE_BYTES} bytes"
-        );
-    }
-
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("could not read audio file {}", path.display()))?;
-    Ok((
-        base64::engine::general_purpose::STANDARD.encode(bytes),
-        format.to_string(),
-    ))
+    let path = path.to_path_buf();
+    let format = format.to_string();
+    crate::resources::run_blocking(move || {
+        let bytes = crate::resources::read_file_limited(&path, MAX_TRANSCRIBE_BYTES as usize)?;
+        Ok((
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            format,
+        ))
+    })
+    .await
 }
 
 /// Validate encoded input before upload, including MIME aliases from data URLs.

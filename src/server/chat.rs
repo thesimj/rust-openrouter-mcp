@@ -91,6 +91,7 @@ impl OpenRouterServer {
         &self,
         args: ChatCompletionArgs,
     ) -> Result<CallToolResult, ErrorData> {
+        let _work = self.admit_work()?;
         let mut missing: Vec<&str> = Vec::new();
         if args
             .prompt

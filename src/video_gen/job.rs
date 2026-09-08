@@ -56,11 +56,11 @@ fn clip_output_path(base: &Path, index_zero_based: usize, total: usize, ext: &st
         return base.with_extension(ext);
     }
     let width = 3.max(total.to_string().len());
-    image_gen::in_parent_of(
+    crate::output::in_parent_of(
         base,
         format!(
             "{}-clip-{:0width$}.{ext}",
-            image_gen::base_stem(base),
+            crate::output::base_stem(base),
             index_zero_based + 1,
             width = width
         ),
@@ -187,13 +187,23 @@ pub async fn run_job(
     .await;
     let interval = std::time::Duration::from_secs(req.poll_interval_secs.max(1));
     let job = job_id.as_str();
-    save_outputs(req, base_output, manifest, warnings, terminal, |index| {
-        // The clip is already paid for: a transient failure fetching it must
-        // not turn the job into a loss.
-        retry_transient(interval, DOWNLOAD_ATTEMPTS, move || {
-            client.download_video(job, index)
-        })
-    })
+    let deadline =
+        super::resolve_delivery_timeout().map(|budget| tokio::time::Instant::now() + budget);
+    save_outputs(
+        req,
+        base_output,
+        manifest,
+        warnings,
+        terminal,
+        deadline,
+        |index| {
+            // The clip is already paid for: a transient failure fetching it must
+            // not turn the job into a loss.
+            retry_transient(interval, DOWNLOAD_ATTEMPTS, move || {
+                client.download_video(job, index)
+            })
+        },
+    )
     .await
 }
 
@@ -222,12 +232,93 @@ where
             Err(error) => match poll_retry_delay(&error, interval) {
                 Some(delay) if attempt < attempts => {
                     attempt += 1;
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(delay.min(std::time::Duration::from_secs(300))).await;
                 }
                 _ => return Err(error),
             },
         }
     }
+}
+
+/// Bound network work while letting final file and recovery-manifest writes finish.
+/// A shared deadline covers every clip and its retries. Never repeat submission.
+async fn within_delivery_deadline<T, F, Fut>(
+    deadline: Option<tokio::time::Instant>,
+    job_id: &str,
+    download: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    if let Some(deadline) = deadline {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "video delivery timed out (job {job_id}); recover using the saved job ID"
+            );
+        }
+        tokio::time::timeout_at(deadline, download())
+            .await
+            .with_context(|| {
+                format!("video delivery timed out (job {job_id}); recover using the saved job ID")
+            })?
+    } else {
+        download().await
+    }
+}
+
+/// One saved clip and its optional audio warning. Billing belongs to the job.
+struct DeliveredClip {
+    video: VideoSummary,
+    warning: Option<String>,
+}
+
+/// Download and save one clip, then inspect its audio track.
+/// Failed writes produce neither saved-file metadata nor audio warnings.
+async fn deliver_clip<Fut>(
+    req: &VideoGenRequest,
+    base_output: &Path,
+    index: usize,
+    total: usize,
+    download: Fut,
+) -> Result<DeliveredClip>
+where
+    Fut: std::future::Future<Output = Result<(String, Vec<u8>)>>,
+{
+    let (mime, bytes) = download.await?;
+    let path = clip_output_path(base_output, index, total, extension_for(&mime));
+    crate::output::write_bytes(&path, &bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+
+    // Unknown containers retain the requested audio setting as a fallback.
+    let probed = has_audio_track(&bytes);
+    let has_audio = probed.unwrap_or_else(|| req.generate_audio.unwrap_or(false));
+    let warning = match (probed, req.generate_audio) {
+        (Some(actual), Some(requested)) if actual != requested => Some(format!(
+            "clip {}: requested with_audio={requested} but the file {}",
+            index + 1,
+            if actual {
+                "contains an audio track (the provider ignored the flag)"
+            } else {
+                "lacks one (the provider ignored the flag or the model \
+                 does not support audio)"
+            },
+        )),
+        _ => None,
+    };
+
+    Ok(DeliveredClip {
+        video: VideoSummary {
+            path,
+            duration: req.duration,
+            resolution: req.resolution.clone(),
+            aspect_ratio: req.aspect_ratio.clone(),
+            has_audio,
+            mime,
+        },
+        warning,
+    })
 }
 
 /// Deliver a submitted job without coupling cost to the number of saved clips.
@@ -237,6 +328,7 @@ async fn save_outputs<F, Fut>(
     mut manifest: VideoManifest,
     mut warnings: Vec<String>,
     terminal: Result<crate::openrouter::VideoPollResponse>,
+    deadline: Option<tokio::time::Instant>,
     mut download: F,
 ) -> Result<VideoJobSummary>
 where
@@ -279,52 +371,21 @@ where
                 generation_id: poll.generation_id.clone(),
                 ..Default::default()
             };
-            match download(index).await {
-                Ok((mime, bytes)) => {
-                    let ext = extension_for(&mime);
-                    let path = clip_output_path(base_output, index, total, ext);
-                    match crate::output::write_bytes(&path, &bytes).await {
-                        Ok(()) => {
-                            // Probe the bytes; fall back to the request only for
-                            // a container we cannot read.
-                            let probed = has_audio_track(&bytes);
-                            let has_audio =
-                                probed.unwrap_or_else(|| req.generate_audio.unwrap_or(false));
-                            // Some providers ignore the flag (e.g. return an
-                            // audio track for with_audio=false); say so instead
-                            // of silently reporting the mismatch in has_audio.
-                            if let (Some(actual), Some(requested)) = (probed, req.generate_audio)
-                                && actual != requested
-                            {
-                                warnings.push(format!(
-                                    "clip {}: requested with_audio={requested} but the file {}",
-                                    index + 1,
-                                    if actual {
-                                        "contains an audio track (the provider ignored the flag)"
-                                    } else {
-                                        "lacks one (the provider ignored the flag or the model \
-                                         does not support audio)"
-                                    },
-                                ));
-                            }
-                            meta.path = Some(path.to_string_lossy().into_owned());
-                            meta.mime_type = Some(mime.clone());
-                            meta.has_audio = Some(has_audio);
-                            videos.push(VideoSummary {
-                                path,
-                                duration: req.duration,
-                                resolution: req.resolution.clone(),
-                                aspect_ratio: req.aspect_ratio.clone(),
-                                has_audio,
-                                mime,
-                            });
-                        }
-                        Err(e) => {
-                            let msg = format!("could not write {}: {e}", path.display());
-                            errors.push(format!("clip {}: {msg}", index + 1));
-                            meta.error = Some(msg);
-                        }
-                    }
+            match deliver_clip(
+                req,
+                base_output,
+                index,
+                total,
+                within_delivery_deadline(deadline, &job_id, || download(index)),
+            )
+            .await
+            {
+                Ok(DeliveredClip { video, warning }) => {
+                    meta.path = Some(video.path.to_string_lossy().into_owned());
+                    meta.mime_type = Some(video.mime.clone());
+                    meta.has_audio = Some(video.has_audio);
+                    warnings.extend(warning);
+                    videos.push(video);
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -461,7 +522,7 @@ mod tests {
     }
 
     /// Build a minimal ISO-BMFF byte string with the given `hdlr` handler types.
-    fn fake_mp4(handlers: &[&[u8; 4]]) -> Vec<u8> {
+    pub(super) fn fake_mp4(handlers: &[&[u8; 4]]) -> Vec<u8> {
         let mut v = vec![0, 0, 0, 0];
         v.extend_from_slice(b"ftypisom");
         for h in handlers {
@@ -717,31 +778,153 @@ mod audit_regression {
             clips: vec![],
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn delivery_deadline_bounds_retry_wait_and_stalled_body() {
+        let budget = std::time::Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        let error = within_delivery_deadline(Some(start + budget), "paid-job", || {
+            retry_transient(std::time::Duration::from_secs(1), DOWNLOAD_ATTEMPTS, || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(failure(429, Some(u64::MAX))))
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), budget);
+        assert!(format!("{error:#}").contains("paid-job"));
+        let start = tokio::time::Instant::now();
+        let error =
+            within_delivery_deadline::<(), _, _>(Some(start + budget), "slow-body", || async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(start.elapsed(), budget);
+        assert!(format!("{error:#}").contains("slow-body"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_delivery_deadline_still_bounds_extreme_retry_hints() {
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        within_delivery_deadline(None, "paid-job", || {
+            retry_transient(
+                std::time::Duration::from_secs(u64::MAX),
+                DOWNLOAD_ATTEMPTS,
+                || {
+                    calls += 1;
+                    std::future::ready(Err::<(), _>(failure(429, Some(u64::MAX))))
+                },
+            )
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_delivery_deadline_preserves_receipt_and_manifest_for_all_clips() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("clip.mp4");
+        let poll = serde_json::from_value(serde_json::json!({
+            "status":"completed", "generation_id":"gen-test", "usage":{"cost":0.75},
+            "unsigned_urls":["https://cdn/0", "https://cdn/1"]
+        }))
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut downloads = Vec::new();
+        let summary = save_outputs(
+            &request(),
+            &base,
+            manifest(),
+            vec![],
+            Ok(poll),
+            Some(deadline),
+            |index| {
+                downloads.push(index);
+                std::future::pending::<Result<(String, Vec<u8>)>>()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            downloads,
+            vec![0],
+            "do not start another download after expiry"
+        );
+        assert!(summary.videos.is_empty());
+        assert_eq!(summary.billing.cost, Some(0.75));
+        assert_eq!(summary.billing.generation_id.as_deref(), Some("gen-test"));
+        assert_eq!(summary.errors.len(), 2);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
+        assert_eq!(saved["job_id"], "accepted-job");
+        assert_eq!(saved["cost"], 0.75);
+        assert_eq!(saved["generation_id"], "gen-test");
+        for clip in saved["clips"].as_array().unwrap() {
+            assert!(
+                clip["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("delivery timed out")
+            );
+            assert!(clip.get("path").is_none());
+        }
+    }
+
     #[tokio::test]
     async fn video_delivery_counts_one_cost_for_multiple_clips_and_failed_writes() {
-        for fail_writes in [false, true] {
+        for failed_writes in 0..=2 {
             let dir = tempfile::tempdir().unwrap();
-            let base = dir.path().join("nested/clip.webm");
-            if fail_writes {
-                std::fs::create_dir_all(clip_output_path(&base, 0, 3, "webm")).unwrap();
-                std::fs::create_dir_all(clip_output_path(&base, 1, 3, "webm")).unwrap();
+            let base = dir.path().join("nested/clip.mp4");
+            for index in 0..failed_writes {
+                std::fs::create_dir_all(clip_output_path(&base, index, 3, "mp4")).unwrap();
             }
+            let mut req = request();
+            req.generate_audio = Some(false);
+            let bytes = super::tests::fake_mp4(&[b"vide", b"soun"]);
             let poll = serde_json::from_value(serde_json::json!({
                 "status":"completed", "generation_id":"gen-test", "usage":{"cost":0.75},
                 "unsigned_urls":["https://cdn/0", "https://cdn/1", "https://cdn/2"]
             }))
             .unwrap();
-            let summary = save_outputs(&request(), &base, manifest(), vec![], Ok(poll), |index| {
+            let mut downloads = Vec::new();
+            let summary = save_outputs(&req, &base, manifest(), vec![], Ok(poll), None, |index| {
+                downloads.push(index);
                 std::future::ready(if index == 2 {
-                    Err(anyhow::anyhow!("download failed"))
+                    Err(anyhow::anyhow!("network failure").context("download failed"))
                 } else {
-                    Ok(("video/webm".into(), vec![1, 2, 3]))
+                    Ok(("video/mp4".into(), bytes.clone()))
                 })
             })
             .await
             .unwrap();
-            assert_eq!(summary.videos.len(), if fail_writes { 0 } else { 2 });
+            assert_eq!(downloads, [0, 1, 2]);
+            assert_eq!(summary.videos.len(), 2 - failed_writes);
             assert_eq!(summary.billing.cost, Some(0.75));
+            assert_eq!(summary.billing.generation_id.as_deref(), Some("gen-test"));
+            assert_eq!(summary.errors.len(), failed_writes + 1);
+            assert_eq!(
+                summary.errors.last().unwrap(),
+                "clip 3: download failed: network failure"
+            );
+            let expected_warnings: Vec<_> = (failed_writes..2)
+                .map(|index| format!(
+                    "clip {}: requested with_audio=false but the file contains an audio track (the provider ignored the flag)",
+                    index + 1
+                ))
+                .collect();
+            assert_eq!(summary.warnings, expected_warnings);
+            for (video, index) in summary.videos.iter().zip(failed_writes..2) {
+                assert_eq!(video.path, clip_output_path(&base, index, 3, "mp4"));
+                assert_eq!(std::fs::read(&video.path).unwrap(), bytes);
+                assert!(video.has_audio);
+            }
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
             assert_eq!(saved["cost"], 0.75);
@@ -755,8 +938,74 @@ mod audit_regression {
                     .iter()
                     .all(|clip| clip.get("cost").is_none())
             );
-            assert!(saved["clips"][2]["error"].is_string());
+            for (index, clip) in saved["clips"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(clip["index"], index + 1);
+                assert_eq!(clip["generation_id"], "gen-test");
+                if index < failed_writes || index == 2 {
+                    for key in ["path", "mime_type", "has_audio"] {
+                        assert!(clip.get(key).is_none(), "failed clip has {key}");
+                    }
+                    let error = clip["error"].as_str().unwrap();
+                    let error_index = if index == 2 { failed_writes } else { index };
+                    assert_eq!(
+                        summary.errors[error_index],
+                        format!("clip {}: {error}", index + 1)
+                    );
+                    if index < failed_writes {
+                        assert!(error.starts_with(&format!(
+                            "could not write {}:",
+                            clip_output_path(&base, index, 3, "mp4").display()
+                        )));
+                    }
+                } else {
+                    assert_eq!(
+                        clip["path"],
+                        clip_output_path(&base, index, 3, "mp4")
+                            .to_string_lossy()
+                            .as_ref()
+                    );
+                    assert_eq!(clip["mime_type"], "video/mp4");
+                    assert_eq!(clip["has_audio"], true);
+                    assert!(clip.get("error").is_none());
+                }
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn manifest_write_failure_preserves_saved_video_and_billing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("clip.webm");
+        let manifest_path = manifest::path(&base);
+        std::fs::create_dir(&manifest_path).unwrap();
+        let mut req = request();
+        req.generate_audio = Some(true);
+        let poll = serde_json::from_value(serde_json::json!({
+            "status":"completed", "generation_id":"gen-test", "usage":{"cost":0.75},
+            "unsigned_urls":["https://cdn/0"]
+        }))
+        .unwrap();
+        let summary = save_outputs(&req, &base, manifest(), vec![], Ok(poll), None, |_| {
+            std::future::ready(Ok(("video/webm".into(), vec![1, 2, 3])))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.job_id, "accepted-job");
+        assert_eq!(summary.billing.cost, Some(0.75));
+        assert_eq!(summary.billing.generation_id.as_deref(), Some("gen-test"));
+        assert_eq!(summary.manifest_path, manifest_path);
+        assert_eq!(summary.videos.len(), 1);
+        assert_eq!(summary.videos[0].path, base);
+        assert_eq!(std::fs::read(&base).unwrap(), [1, 2, 3]);
+        assert!(
+            summary.videos[0].has_audio,
+            "unknown container uses request fallback"
+        );
+        assert!(summary.warnings.is_empty());
+        assert_eq!(summary.errors.len(), 1);
+        assert!(summary.errors[0].starts_with("manifest write failed:"));
+        assert!(manifest_path.is_dir());
     }
     #[tokio::test]
     async fn accepted_video_without_usage_keeps_unknown_cost_and_recovery_manifest() {
@@ -768,6 +1017,7 @@ mod audit_regression {
             manifest(),
             vec![],
             Err(anyhow::anyhow!("poll timed out")),
+            None,
             |_| std::future::ready(Err(anyhow::anyhow!("must not download"))),
         )
         .await

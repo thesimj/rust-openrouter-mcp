@@ -170,6 +170,8 @@ All environment variables read by the server/CLI:
 | `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `4096`; larger values are reduced to `4096`. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
 | `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
+| `OPENROUTER_VIDEO_DELIVERY_TIMEOUT` | Shared deadline in seconds for clip downloads and retries. Positive values cap at 30 days. Zero, invalid, or unset disables it. | disabled |
+| `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to drain generation jobs after disconnect or Ctrl-C. Caps at 300 seconds. Zero cancels immediately. | `30` |
 | `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |
 | `OPENROUTER_X_TITLE` | Overrides the `X-Title` app-attribution header. | `rust-openrouter-mcp` |
 | `HOME` | OS variable; only used to derive the default output directory when `OPENROUTER_MCP_OUTPUT_DIR` is unset. Only `HOME` is checked, not `USERPROFILE` - a stock Windows install without `HOME` set falls straight to the system temp dir. | (OS-provided) |
@@ -195,8 +197,27 @@ audio previews are capped at 4 MB (larger clips are saved to disk with the
 path returned instead). Video links contain no inline bytes and grant no filesystem access.
 
 The task registry accepts at most 32 pending image/video jobs per process.
-Further requests fail before generation starts. Finished jobs release their pending slots.
-Each image job allows four concurrent variant requests.
+Image jobs reserve capacity before fetching or decoding inputs. Finished or cancelled jobs release their pending slots.
+Each image job allows four concurrent variant requests. Cancelling a job aborts its remaining variant tasks.
+Eight synchronous chat, description, speech, or transcription calls may run per server.
+Input preparation, DNS, and preview encoding share four blocking workers.
+Four image/video preview calls may run concurrently. Further preview calls return paths without inline media.
+
+Image inputs allow 16 images, 20 MiB per image, and 64 MiB per batch.
+These limits apply to local files, inline data, and fetched images, including CLI preparation.
+Local media inputs must be regular files. FIFOs and device files are rejected.
+Upstream requests share 16 slots across client clones. Each response keeps its slot until consumed or dropped.
+Decompressed JSON responses cap at 64 MiB. Audio and video bodies cap at 256 MiB.
+Error bodies retain at most 2 KiB before truncating displayed text to 500 characters.
+
+The optional video delivery deadline covers all clip downloads and retry waits together.
+Retry waits cap at 300 seconds. Delivery expiry preserves recovery metadata and never resubmits the paid generation request.
+Filesystem writes and manifest finalization finish outside this network deadline.
+
+On disconnect or Ctrl-C, the server stops admission and drains tracked generation jobs for the configured grace period.
+It cancels remaining tasks when that period expires. Already running blocking work must still finish.
+Cancellation cannot undo provider charges. Forced shutdown can discard unsaved variant results and their unrecorded charges.
+Task status remains process-local and disappears when the server exits.
 
 ## MCP usage
 

@@ -26,8 +26,14 @@ impl OpenRouterClient {
         let bytes = resp
             .bytes()
             .await
-            .context("failed to read speech audio bytes")?
-            .to_vec();
+            .context("failed to read speech audio bytes")
+            .map_err(|error| {
+                crate::billing::Receipt {
+                    cost: None,
+                    generation_id: generation_id.clone(),
+                }
+                .attach(error)
+            })?;
         Ok(SpeechResult {
             mime,
             bytes,
@@ -45,7 +51,16 @@ impl OpenRouterClient {
             .post(format!("{}/audio/transcriptions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        self.send_json(rb, "/audio/transcriptions").await
+        let response = self.send_checked(rb, "/audio/transcriptions").await?;
+        let receipt = crate::billing::Receipt {
+            cost: None,
+            generation_id: generation_id(&response),
+        };
+        response
+            .json()
+            .await
+            .context("failed to decode OpenRouter /audio/transcriptions response")
+            .map_err(|error| receipt.attach(error))
     }
 }
 
@@ -56,6 +71,48 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{OpenRouterClient, SpeechBody};
+
+    #[tokio::test]
+    async fn malformed_transcription_success_retains_receipt_but_http_failure_does_not() {
+        for status in [200, 401] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/audio/transcriptions"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("x-generation-id", "gen-paid-transcript")
+                        .set_body_string("{"),
+                )
+                .mount(&server)
+                .await;
+            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+            let error = client
+                .transcribe(&crate::openrouter::TranscriptionBody {
+                    model: "test/transcribe".into(),
+                    input_audio: crate::openrouter::InputAudio {
+                        data: "AAAA".into(),
+                        format: "wav".into(),
+                    },
+                    language: None,
+                    response_format: None,
+                    timestamp_granularities: vec![],
+                    temperature: None,
+                })
+                .await
+                .expect_err("invalid response");
+            let receipt = crate::billing::Receipt::from_error(&error);
+            if status == 200 {
+                let receipt = receipt.expect("unknown charge survives");
+                assert_eq!(receipt.cost, None);
+                assert_eq!(
+                    receipt.generation_id.as_deref(),
+                    Some("gen-paid-transcript")
+                );
+            } else {
+                assert!(receipt.is_none());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn speech_returns_bytes_mime_and_generation_id() {
@@ -91,6 +148,64 @@ mod tests {
         assert_eq!(result.mime, "audio/mpeg");
         assert_eq!(result.bytes, b"MP3");
         assert_eq!(result.generation_id.as_deref(), Some("gen-aud-3"));
+    }
+
+    #[tokio::test]
+    async fn speech_body_failures_preserve_unknown_billing_and_generation_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Reject an oversized declaration without allocating that body, then
+        // exercise a truncated body without a generation header.
+        for (length, generation_id) in [
+            (
+                crate::openrouter::MAX_MEDIA_BYTES + 1,
+                Some("gen-paid-audio"),
+            ),
+            (10, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nContent-Type: audio/mpeg\r\n{}Connection: close\r\n\r\nMP3",
+                generation_id
+                    .map(|id| format!("X-Generation-Id: {id}\r\n"))
+                    .unwrap_or_default()
+            );
+            let sender = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let client = OpenRouterClient::with_base_url(url, "test-key");
+            let error = client
+                .speech(&SpeechBody {
+                    model: "test/speech".into(),
+                    input: "hello".into(),
+                    voice: "alloy".into(),
+                    response_format: None,
+                    speed: None,
+                })
+                .await
+                .err()
+                .expect("body failure must propagate");
+            sender.await.unwrap();
+            let receipt = crate::billing::Receipt::from_error(&error)
+                .expect("successful headers establish a possible charge");
+            assert_eq!(receipt.cost, None);
+            assert_eq!(receipt.generation_id.as_deref(), generation_id);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to read speech audio bytes")
+            );
+            if length > crate::openrouter::MAX_MEDIA_BYTES {
+                assert!(error.to_string().contains("byte limit"));
+            }
+            let mut totals = crate::billing::Totals::default();
+            totals.add(receipt);
+            assert_eq!(totals.unknown, 1);
+        }
     }
 
     #[tokio::test]

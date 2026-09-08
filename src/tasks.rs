@@ -9,11 +9,12 @@
 //! per client session); any images already written stay on disk regardless.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::{sync::oneshot, task::JoinSet};
 
 /// What a task produces. Video reuses this same async registry.
 #[derive(Clone, Copy)]
@@ -61,6 +62,42 @@ pub struct TaskSnapshot {
 #[derive(Clone, Default)]
 pub struct TaskRegistry {
     inner: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    supervisor: Arc<Mutex<Supervisor>>,
+}
+
+#[derive(Default)]
+struct Supervisor {
+    jobs: JoinSet<()>,
+    closed: bool,
+}
+
+/// Owns admission while preparing and running a job. Drop always releases it.
+pub(crate) struct JobReservation {
+    pub(crate) id: String,
+    pub(crate) kind: TaskKind,
+    entries: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    armed: bool,
+}
+
+impl JobReservation {
+    fn finish(&mut self, result: Result<Value, String>) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(&self.id) {
+            entry.status = match result {
+                Ok(v) => Status::Completed(v),
+                Err(e) => Status::Failed(e),
+            };
+            entry.finished_at = Some(Instant::now());
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for JobReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.finish(Err("generation job cancelled or panicked".into()));
+        }
+    }
 }
 
 impl TaskRegistry {
@@ -68,10 +105,76 @@ impl TaskRegistry {
         Self::default()
     }
 
+    pub(crate) fn reserve(&self, kind: TaskKind) -> Option<JobReservation> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let supervisor = self.supervisor.lock().unwrap();
+        if supervisor.closed {
+            return None;
+        }
+        let id = format!(
+            "task-{}",
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        if !self.insert(&id, kind) {
+            return None;
+        }
+        Some(JobReservation {
+            id,
+            kind,
+            entries: self.inner.clone(),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn start<F>(
+        &self,
+        mut reservation: JobReservation,
+        run: F,
+    ) -> Option<oneshot::Receiver<()>>
+    where
+        F: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        let mut supervisor = self.supervisor.lock().unwrap();
+        if supervisor.closed {
+            return None;
+        }
+        while supervisor.jobs.try_join_next().is_some() {}
+        let (done, receiver) = oneshot::channel();
+        supervisor.jobs.spawn(async move {
+            reservation.finish(run.await);
+            let _ = done.send(());
+        });
+        Some(receiver)
+    }
+
+    pub(crate) fn close_admission(&self) {
+        self.supervisor.lock().unwrap().closed = true;
+    }
+
+    pub(crate) async fn shutdown(&self, grace: Duration) {
+        let mut jobs = {
+            let mut supervisor = self.supervisor.lock().unwrap();
+            supervisor.closed = true;
+            std::mem::take(&mut supervisor.jobs)
+        };
+        if tokio::time::timeout(grace, async { while jobs.join_next().await.is_some() {} })
+            .await
+            .is_err()
+        {
+            jobs.abort_all();
+            while jobs.join_next().await.is_some() {}
+        }
+    }
+
     /// Register a new pending task.
+    #[cfg(test)]
     pub async fn insert_pending(&self, id: &str, kind: TaskKind) -> bool {
+        self.insert(id, kind)
+    }
+
+    fn insert(&self, id: &str, kind: TaskKind) -> bool {
         let now = Instant::now();
-        let mut entries = self.inner.lock().await;
+        let mut entries = self.inner.lock().unwrap();
         if entries
             .values()
             .filter(|entry| matches!(entry.status, Status::Pending))
@@ -94,16 +197,18 @@ impl TaskRegistry {
     }
 
     /// Mark a task completed with its result.
+    #[cfg(test)]
     pub async fn complete(&self, id: &str, result: Value) {
-        if let Some(entry) = self.inner.lock().await.get_mut(id) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
             entry.status = Status::Completed(result);
             entry.finished_at = Some(Instant::now());
         }
     }
 
     /// Mark a task failed with an error message.
+    #[cfg(test)]
     pub async fn fail(&self, id: &str, error: String) {
-        if let Some(entry) = self.inner.lock().await.get_mut(id) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
             entry.status = Status::Failed(error);
             entry.finished_at = Some(Instant::now());
         }
@@ -117,7 +222,7 @@ impl TaskRegistry {
     /// for - so a finished job answered "unknown task_id" while its output sat
     /// on disk. The prune still runs on every call, just one step later.
     pub async fn snapshot(&self, id: &str) -> Option<TaskSnapshot> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().unwrap();
         let snap = guard.get(id).map(|entry| match &entry.status {
             Status::Pending => TaskSnapshot {
                 kind: entry.kind.as_str(),
@@ -239,19 +344,20 @@ mod tests {
     async fn polling_a_just_finished_task_does_not_evict_it() {
         let reg = TaskRegistry::new();
         // Construct an overfull legacy state directly; admission now prevents it.
-        let mut entries = reg.inner.lock().await;
-        for i in 0..=MAX_RETAINED_TASKS {
-            entries.insert(
-                format!("task-{i}"),
-                TaskEntry {
-                    kind: TaskKind::Video,
-                    status: Status::Pending,
-                    created_at: Instant::now(),
-                    finished_at: None,
-                },
-            );
+        {
+            let mut entries = reg.inner.lock().unwrap();
+            for i in 0..=MAX_RETAINED_TASKS {
+                entries.insert(
+                    format!("task-{i}"),
+                    TaskEntry {
+                        kind: TaskKind::Video,
+                        status: Status::Pending,
+                        created_at: Instant::now(),
+                        finished_at: None,
+                    },
+                );
+            }
         }
-        drop(entries);
         // Nothing is terminal yet, so the registry sits one over the bound.
         reg.complete("task-0", json!({"i": 0})).await;
 
@@ -286,5 +392,90 @@ mod audit_regression {
         assert!(registry.snapshot("excess").await.is_none());
         registry.complete("0", serde_json::json!({})).await;
         assert!(registry.insert_pending("next", TaskKind::Video).await);
+    }
+    #[tokio::test]
+    async fn dropping_reservation_marks_failure_and_reopens_capacity() {
+        let registry = TaskRegistry::new();
+        let mut reservations: Vec<_> = (0..MAX_PENDING_TASKS)
+            .map(|_| registry.reserve(TaskKind::Image).unwrap())
+            .collect();
+        assert!(registry.reserve(TaskKind::Image).is_none());
+        let released = reservations.pop().unwrap();
+        let id = released.id.clone();
+        drop(released);
+        let snapshot = registry.snapshot(&id).await.unwrap();
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.error.unwrap().contains("cancelled"));
+        assert!(registry.reserve(TaskKind::Video).is_some());
+    }
+
+    #[tokio::test]
+    async fn panicked_job_becomes_failed_and_can_be_drained() {
+        let registry = TaskRegistry::new();
+        let reservation = registry.reserve(TaskKind::Video).unwrap();
+        let id = reservation.id.clone();
+        let done = registry
+            .start(reservation, async { panic!("synthetic job panic") })
+            .unwrap();
+        assert!(done.await.is_err());
+        registry.shutdown(Duration::from_secs(1)).await;
+        let snapshot = registry.snapshot(&id).await.unwrap();
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.error.unwrap().contains("panicked"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_completed_work_before_grace_expires() {
+        let registry = TaskRegistry::new();
+        let reservation = registry.reserve(TaskKind::Image).unwrap();
+        let id = reservation.id.clone();
+        let done = registry
+            .start(reservation, async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(serde_json::json!({"saved": true}))
+            })
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        registry.shutdown(Duration::from_secs(10)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        done.await.unwrap();
+        let snapshot = registry.snapshot(&id).await.unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert_eq!(snapshot.result.unwrap()["saved"], true);
+        assert!(registry.reserve(TaskKind::Image).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_at_deadline_and_records_failure() {
+        let registry = TaskRegistry::new();
+        let reservation = registry.reserve(TaskKind::Video).unwrap();
+        let id = reservation.id.clone();
+        let done = registry.start(reservation, std::future::pending()).unwrap();
+        let started = tokio::time::Instant::now();
+        registry.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(done.await.is_err());
+        let snapshot = registry.snapshot(&id).await.unwrap();
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.error.unwrap().contains("cancelled"));
+        assert!(registry.reserve(TaskKind::Image).is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_admission_rejects_new_and_prepared_jobs() {
+        let registry = TaskRegistry::new();
+        let reservation = registry.reserve(TaskKind::Image).unwrap();
+        let id = reservation.id.clone();
+        registry.close_admission();
+        assert!(registry.reserve(TaskKind::Video).is_none());
+        assert!(
+            registry
+                .start(reservation, async {
+                    panic!("closed registry must not run this job")
+                })
+                .is_none()
+        );
+        assert_eq!(registry.snapshot(&id).await.unwrap().status, "failed");
+        registry.shutdown(Duration::from_secs(1)).await;
     }
 }

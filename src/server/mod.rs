@@ -37,6 +37,7 @@ mod test_support;
 pub struct OpenRouterServer {
     pub(crate) client: OpenRouterClient,
     pub(crate) tasks: TaskRegistry,
+    work: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) stats: UsageStats,
     /// Cache of per-model input modalities, used to gate `chat_completion` image
     /// inputs against what the target model supports.
@@ -45,10 +46,20 @@ pub struct OpenRouterServer {
 }
 
 impl OpenRouterServer {
+    pub(crate) fn admit_work(&self) -> Result<tokio::sync::OwnedSemaphorePermit, rmcp::ErrorData> {
+        self.work.clone().try_acquire_owned().map_err(|_| {
+            rmcp::ErrorData::internal_error(
+                "Too many synchronous calls; wait for one to finish before retrying.",
+                None,
+            )
+        })
+    }
+
     pub fn new(client: OpenRouterClient) -> Self {
         Self {
             client,
             tasks: TaskRegistry::new(),
+            work: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             stats: UsageStats::new(),
             model_caps: ModelCapsCache::new(),
             tool_router: Self::models_router()
@@ -94,9 +105,38 @@ impl ServerHandler for OpenRouterServer {
 /// Start the stdio MCP server and run until the client disconnects.
 pub async fn run() -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
-    let service = OpenRouterServer::new(client).serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    let server = OpenRouterServer::new(client);
+    let service = server.serve(stdio()).await?;
+    let grace = std::env::var("OPENROUTER_MCP_SHUTDOWN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+        .min(300);
+    supervise(service, std::time::Duration::from_secs(grace)).await
+}
+
+async fn supervise(
+    service: rmcp::service::RunningService<rmcp::RoleServer, OpenRouterServer>,
+    grace: std::time::Duration,
+) -> anyhow::Result<()> {
+    let tasks = service.service().tasks.clone();
+    let work = service.service().work.clone();
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    let outcome = tokio::select! {
+        result = &mut waiting => result.map(|_| ()).map_err(anyhow::Error::from),
+        signal = tokio::signal::ctrl_c() => {
+            tasks.close_admission();
+            work.close();
+            cancellation.cancel();
+            let result = waiting.await;
+            signal.map_err(anyhow::Error::from).and_then(|_| result.map(|_| ()).map_err(anyhow::Error::from))
+        }
+    };
+    work.close();
+    tasks.shutdown(grace).await;
+    outcome
 }
 
 #[cfg(test)]
@@ -120,5 +160,64 @@ mod tests {
         assert!(info.capabilities.prompts.is_none());
         assert!(info.capabilities.resources.is_none());
         assert!(info.instructions.is_some());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn synchronous_capacity_is_shared_and_reopens() {
+        let server = test_support::server_for("http://127.0.0.1:9".into());
+        let clone = server.clone();
+        let mut permits: Vec<_> = (0..8).map(|_| server.admit_work().unwrap()).collect();
+        assert!(clone.admit_work().is_err());
+        permits.pop();
+        assert!(clone.admit_work().is_ok());
+    }
+
+    #[tokio::test]
+    async fn transport_eof_drains_generation_jobs() {
+        let server = test_support::server_for("http://127.0.0.1:9".into());
+        let tasks = server.tasks.clone();
+        let reservation = tasks.reserve(crate::tasks::TaskKind::Image).unwrap();
+        let id = reservation.id.clone();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel();
+        let done = tasks
+            .start(reservation, async move {
+                finish_rx.await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(serde_json::json!({"saved":true}))
+            })
+            .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let service = tokio::spawn(async move {
+            let service = server.serve(server_io).await.unwrap();
+            supervise(service, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        assert!(response.contains("result"));
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drop(reader);
+        finish.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), service)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tasks.snapshot(&id).await.unwrap().status, "completed");
+        done.await.unwrap();
+        assert!(tasks.reserve(crate::tasks::TaskKind::Image).is_none());
     }
 }

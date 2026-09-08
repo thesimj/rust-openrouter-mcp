@@ -120,6 +120,7 @@ impl OpenRouterServer {
         args: GenerateAudioArgs,
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
+        let _work = self.admit_work()?;
         // No defaults: input and voice are the things agents forget.
         let mut missing: Vec<&str> = Vec::new();
         if args
@@ -197,18 +198,20 @@ impl OpenRouterServer {
                 if inline_previews {
                     let path = result.audio.path.clone();
                     let mime = result.audio.mime.clone();
-                    let small = std::fs::metadata(&path)
-                        .map(|m| m.len() <= MAX_INLINE_AUDIO_BYTES)
-                        .unwrap_or(false);
-                    if small {
-                        let read = tokio::task::spawn_blocking(move || std::fs::read(&path))
-                            .await
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                        if let Ok(bytes) = read {
+                    let block = crate::resources::run_blocking(move || {
+                        Ok(crate::resources::read_file_limited(
+                            std::path::Path::new(&path),
+                            MAX_INLINE_AUDIO_BYTES as usize,
+                        )
+                        .ok()
+                        .map(|bytes| {
                             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-                            blocks.push(ContentBlock::audio(data, mime));
-                        }
-                    }
+                            ContentBlock::audio(data, mime)
+                        }))
+                    })
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    blocks.extend(block);
                 }
                 Ok(CallToolResult::success(blocks))
             }
@@ -245,6 +248,7 @@ impl OpenRouterServer {
         &self,
         Parameters(args): Parameters<TranscribeAudioArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let _work = self.admit_work()?;
         let model = args.model.clone();
         let req = resolve_transcribe_request(args)
             .await

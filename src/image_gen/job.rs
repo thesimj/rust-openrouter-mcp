@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 use crate::image_io;
 use crate::manifest::{self, InputImageMeta, Manifest, VariantMeta};
 use crate::openrouter::OpenRouterClient;
+use crate::output::{base_stem, in_parent_of};
 
 use super::{GenContent, GenerateRequest, GeneratedImage, build_gen_content, generate_core};
 
@@ -42,44 +43,61 @@ pub async fn generate_variants(
     // One shared copy of the request and pre-built content; each task builds
     // its request body only once it holds a permit, so at most
     // MAX_CONCURRENT_VARIANTS copies of the reference images exist at a time.
-    let req = Arc::new(req.clone());
+    let req = Arc::new(GenerateRequest {
+        model: req.model.clone(),
+        prompt: String::new(), // GenContent already contains the assembled prompt.
+        aspect_ratio: req.aspect_ratio.clone(),
+        image_size: req.image_size.clone(),
+        seed: req.seed,
+        images: Vec::new(), // Normalized references live in GenContent.
+        max_image_dimension: req.max_image_dimension,
+        quality: req.quality.clone(),
+        output_format: req.output_format.clone(),
+        background: req.background.clone(),
+        output_compression: req.output_compression,
+    });
     let content = Arc::new(content);
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_VARIANTS));
-    let handles: Vec<_> = (0..variants)
-        .map(|i| {
-            let client = client.clone();
-            let req = Arc::clone(&req);
-            let content = Arc::clone(&content);
-            let permits = Arc::clone(&permits);
-            let seed = seed_for(i);
-            tokio::spawn(async move {
-                // The semaphore is never closed, so acquire cannot fail.
-                let _permit = permits.acquire().await.expect("semaphore closed");
-                let start = Instant::now();
-                let result = generate_core(&client, &req, seed, &content).await;
-                (seed, start.elapsed().as_millis(), result)
-            })
-        })
-        .collect();
-
-    let mut outcomes = Vec::with_capacity(variants);
-    for (i, handle) in handles.into_iter().enumerate() {
-        let outcome = match handle.await {
-            Ok((seed, duration_ms, result)) => VariantOutcome {
+    // Dropping this set aborts every outstanding variant, including tasks
+    // waiting for a permit, when the caller cancels the job.
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut indices = std::collections::HashMap::new();
+    for i in 0..variants {
+        let client = client.clone();
+        let req = Arc::clone(&req);
+        let content = Arc::clone(&content);
+        let permits = Arc::clone(&permits);
+        let seed = seed_for(i);
+        let handle = tasks.spawn(async move {
+            let _permit = permits.acquire().await.expect("semaphore closed");
+            let start = Instant::now();
+            let result = generate_core(&client, &req, seed, &content).await;
+            VariantOutcome {
                 index: i,
                 seed,
-                duration_ms,
+                duration_ms: start.elapsed().as_millis(),
                 result,
-            },
-            Err(e) => VariantOutcome {
-                index: i,
-                seed: seed_for(i),
-                duration_ms: 0,
-                result: Err(anyhow::anyhow!("variant task failed: {e}")),
-            },
-        };
-        outcomes.push(outcome);
+            }
+        });
+        indices.insert(handle.id(), i);
     }
+
+    let mut outcomes = Vec::with_capacity(variants);
+    while let Some(result) = tasks.join_next().await {
+        outcomes.push(match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let index = indices[&e.id()];
+                VariantOutcome {
+                    index,
+                    seed: seed_for(index),
+                    duration_ms: 0,
+                    result: Err(anyhow::anyhow!("variant task failed: {e}")),
+                }
+            }
+        });
+    }
+    outcomes.sort_by_key(|outcome| outcome.index);
     outcomes
 }
 
@@ -87,21 +105,6 @@ pub async fn generate_variants(
 /// extension. Multiple variants get a `-var-<seed>-<index>` suffix.
 /// Seeds use at least four digits, and indices use at least three digits.
 /// Without a seed, the suffix contains only the index.
-/// The file stem of `base`, or `"image"` if it has none.
-pub(crate) fn base_stem(base: &Path) -> String {
-    base.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_string())
-}
-
-/// Join `name` onto `base`'s parent directory (or use it bare when there is none).
-pub(crate) fn in_parent_of(base: &Path, name: String) -> PathBuf {
-    match base.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
 pub fn variant_output_path(
     base: &Path,
     seed: Option<u64>,
@@ -200,6 +203,103 @@ pub async fn run_job(
     .await
 }
 
+/// Delivery and receipt for one image, independent of batch aggregation.
+struct VariantDelivery {
+    meta: VariantMeta,
+    image: Option<ImageSummary>,
+    receipt: Option<crate::billing::Receipt>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+async fn deliver_variant(
+    req: &GenerateRequest,
+    base_output: &Path,
+    variants: usize,
+    outcome: VariantOutcome,
+) -> VariantDelivery {
+    let mut image = None;
+    let mut receipt_out = None;
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    let mut meta = VariantMeta {
+        index: outcome.index + 1,
+        seed: outcome.seed,
+        requested_aspect_ratio: req.aspect_ratio.clone(),
+        requested_image_size: req.image_size.clone(),
+        duration_ms: outcome.duration_ms,
+        ..Default::default()
+    };
+    match outcome.result {
+        Ok(img) => {
+            receipt_out = Some(crate::billing::Receipt {
+                cost: img.cost,
+                generation_id: img.generation_id.clone(),
+            });
+            meta.generation_id = img.generation_id.clone();
+            meta.provider = img.provider.clone();
+            meta.cost = img.cost;
+            let ext = image_io::extension_for(&img.mime);
+            let path = variant_output_path(base_output, outcome.seed, outcome.index, variants, ext);
+            // Isolate a write failure to this variant rather than aborting
+            // the whole batch (the image was generated and paid for).
+            match crate::output::write_bytes(&path, &img.bytes).await {
+                Ok(()) => {
+                    let check = image_io::check_dimensions(
+                        img.width,
+                        img.height,
+                        req.aspect_ratio.as_deref(),
+                        req.image_size.as_deref(),
+                    );
+                    for w in check.warnings.iter().chain(&img.warnings) {
+                        warnings.push(format!("variant {}: {w}", outcome.index + 1));
+                    }
+                    meta.path = Some(path.to_string_lossy().into_owned());
+                    meta.mime_type = Some(img.mime.clone());
+                    meta.width = Some(img.width);
+                    meta.height = Some(img.height);
+                    meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
+                    meta.actual_image_size = Some(check.actual_image_size.to_string());
+                    meta.generation_id = img.generation_id.clone();
+                    meta.provider = img.provider.clone();
+                    meta.cost = img.cost;
+                    meta.text = img.text.clone();
+                    image = Some(ImageSummary {
+                        path,
+                        seed: outcome.seed,
+                        width: img.width,
+                        height: img.height,
+                        actual_aspect_ratio: check.actual_aspect_ratio,
+                        actual_image_size: check.actual_image_size,
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("could not write {}: {e}", path.display());
+                    errors.push(format!("variant {}: {msg}", outcome.index + 1));
+                    meta.error = Some(msg);
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(receipt) = crate::billing::Receipt::from_error(&e) {
+                receipt_out = Some(receipt.clone());
+                meta.cost = receipt.cost;
+                meta.generation_id = receipt.generation_id.clone();
+            }
+            let msg = format!("{e:#}");
+            errors.push(format!("variant {}: {msg}", outcome.index + 1));
+            meta.error = Some(msg);
+        }
+    }
+    VariantDelivery {
+        meta,
+        image,
+        receipt: receipt_out,
+        warnings,
+        errors,
+    }
+}
+
 /// Persist outcomes independently from generation so delivery failures retain billing.
 async fn save_outcomes(
     req: &GenerateRequest,
@@ -216,77 +316,14 @@ async fn save_outcomes(
     let mut variant_metas = Vec::new();
 
     for outcome in outcomes {
-        let mut meta = VariantMeta {
-            index: outcome.index + 1,
-            seed: outcome.seed,
-            requested_aspect_ratio: req.aspect_ratio.clone(),
-            requested_image_size: req.image_size.clone(),
-            duration_ms: outcome.duration_ms,
-            ..Default::default()
-        };
-        match outcome.result {
-            Ok(img) => {
-                billing.add(&crate::billing::Receipt {
-                    cost: img.cost,
-                    generation_id: img.generation_id.clone(),
-                });
-                meta.generation_id = img.generation_id.clone();
-                meta.provider = img.provider.clone();
-                meta.cost = img.cost;
-                let ext = image_io::extension_for(&img.mime);
-                let path =
-                    variant_output_path(base_output, outcome.seed, outcome.index, variants, ext);
-                // Isolate a write failure to this variant rather than aborting
-                // the whole batch (the image was generated and paid for).
-                match crate::output::write_bytes(&path, &img.bytes).await {
-                    Ok(()) => {
-                        let check = image_io::check_dimensions(
-                            img.width,
-                            img.height,
-                            req.aspect_ratio.as_deref(),
-                            req.image_size.as_deref(),
-                        );
-                        for w in check.warnings.iter().chain(&img.warnings) {
-                            warnings.push(format!("variant {}: {w}", outcome.index + 1));
-                        }
-                        meta.path = Some(path.to_string_lossy().into_owned());
-                        meta.mime_type = Some(img.mime.clone());
-                        meta.width = Some(img.width);
-                        meta.height = Some(img.height);
-                        meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
-                        meta.actual_image_size = Some(check.actual_image_size.to_string());
-                        meta.generation_id = img.generation_id.clone();
-                        meta.provider = img.provider.clone();
-                        meta.cost = img.cost;
-                        meta.text = img.text.clone();
-                        images.push(ImageSummary {
-                            path,
-                            seed: outcome.seed,
-                            width: img.width,
-                            height: img.height,
-                            actual_aspect_ratio: check.actual_aspect_ratio,
-                            actual_image_size: check.actual_image_size,
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("could not write {}: {e}", path.display());
-                        errors.push(format!("variant {}: {msg}", outcome.index + 1));
-                        meta.error = Some(msg);
-                    }
-                }
-            }
-            Err(e) => {
-                if let Some(receipt) = crate::billing::Receipt::from_error(&e) {
-                    billing.add(receipt);
-                    meta.cost = receipt.cost;
-                    meta.generation_id = receipt.generation_id.clone();
-                }
-                let msg = format!("{e:#}");
-                errors.push(format!("variant {}: {msg}", outcome.index + 1));
-                meta.error = Some(msg);
-            }
+        let delivery = deliver_variant(req, base_output, variants, outcome).await;
+        if let Some(receipt) = delivery.receipt {
+            billing.add(&receipt);
         }
-        variant_metas.push(meta);
+        images.extend(delivery.image);
+        warnings.extend(delivery.warnings);
+        errors.extend(delivery.errors);
+        variant_metas.push(delivery.meta);
     }
 
     let manifest = Manifest {
@@ -443,7 +480,7 @@ mod audit_regression {
             cost,
             generation_id: Some(id.into()),
             provider: Some("test".into()),
-            warnings: vec![],
+            warnings: vec!["provider note".into()],
         };
         let results = vec![
             Ok(image(Some(0.25), "write-failed")),
@@ -477,11 +514,15 @@ mod audit_regression {
         assert_eq!(summary.billing.cost, 0.75);
         assert_eq!(summary.billing.unknown, 1);
         assert_eq!(summary.errors.len(), 3);
+        assert_eq!(summary.warnings, vec!["variant 2: provider note"]);
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["variants"][0]["cost"], 0.25);
         assert_eq!(manifest["variants"][0]["generation_id"], "write-failed");
         assert!(manifest["variants"][0]["error"].is_string());
+        assert!(manifest["variants"][0].get("path").is_none());
+        assert_eq!(manifest["variants"][0]["provider"], "test");
+        assert!(manifest["variants"][1]["path"].is_string());
         assert_eq!(manifest["variants"][2]["cost"], 0.5);
         assert_eq!(manifest["variants"][2]["generation_id"], "decode-failed");
     }
@@ -500,5 +541,91 @@ mod audit_regression {
             })
             .collect();
         assert_eq!(paths.len(), 16);
+    }
+    #[tokio::test]
+    async fn cancelling_variants_aborts_waiting_requests() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images"))
+            .respond_with(
+                ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let job = tokio::spawn(async move {
+            generate_variants(
+                &client,
+                &request(),
+                12,
+                GenContent {
+                    prompt: "test".into(),
+                    reference_urls: vec![],
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while server.received_requests().await.unwrap().len() < MAX_CONCURRENT_VARIANTS {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        job.abort();
+        assert!(matches!(job.await, Err(error) if error.is_cancelled()));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            MAX_CONCURRENT_VARIANTS
+        );
+    }
+
+    #[tokio::test]
+    async fn variant_completion_order_preserves_indices_seeds_and_receipts() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for index in 0..3 {
+            Mock::given(method("POST"))
+                .and(path("/images"))
+                .and(body_partial_json(serde_json::json!({"seed": 10 + index})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis((2 - index) * 20))
+                        .set_body_json(serde_json::json!({
+                            "id": format!("gen-{index}"),
+                            "data": [{"b64_json": "not an image"}],
+                            "usage": {"cost": 0.25}
+                        })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let mut req = request();
+        req.seed = Some(10);
+        let outcomes = generate_variants(
+            &client,
+            &req,
+            3,
+            GenContent {
+                prompt: "test".into(),
+                reference_urls: vec![],
+            },
+        )
+        .await;
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            assert_eq!(outcome.index, index);
+            assert_eq!(outcome.seed, Some(10 + index as u64));
+            let error = outcome.result.unwrap_err();
+            assert_eq!(
+                crate::billing::Receipt::from_error(&error).unwrap().cost,
+                Some(0.25)
+            );
+        }
     }
 }
