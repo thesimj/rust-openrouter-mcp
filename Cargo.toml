@@ -1,6 +1,6 @@
 [package]
 name = "openrouter-mcp"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 # Rust 1.88 supports the let-chains used here and the dependency MSRV.
 # CI checks all targets at this floor, including before release packaging.
