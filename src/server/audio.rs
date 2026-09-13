@@ -1,7 +1,6 @@
 //! The `generate_audio` text-to-speech tool and its argument struct.
 
 use anyhow::{Context, bail};
-use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -15,7 +14,7 @@ use serde_json::json;
 
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
-use crate::server::result::{MAX_INLINE_AUDIO_BYTES, client_wants_inline_previews};
+use crate::server::result::{client_wants_inline_previews, inline_audio_block};
 use crate::server::schema::{RequireFields, de_opt_f64, require_all, scalarize_nullable};
 
 use super::OpenRouterServer;
@@ -196,22 +195,10 @@ impl OpenRouterServer {
 
                 // Inline native AudioContent for sandboxed clients, under the cap.
                 if inline_previews {
-                    let path = result.audio.path.clone();
-                    let mime = result.audio.mime.clone();
-                    let block = crate::resources::run_blocking(move || {
-                        Ok(crate::resources::read_file_limited(
-                            std::path::Path::new(&path),
-                            MAX_INLINE_AUDIO_BYTES as usize,
-                        )
-                        .ok()
-                        .map(|bytes| {
-                            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-                            ContentBlock::audio(data, mime)
-                        }))
-                    })
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    blocks.extend(block);
+                    blocks.extend(
+                        inline_audio_block(result.audio.path.clone(), result.audio.mime.clone())
+                            .await?,
+                    );
                 }
                 Ok(CallToolResult::success(blocks))
             }

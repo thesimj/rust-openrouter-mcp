@@ -4,6 +4,7 @@
 
 mod client;
 mod dto;
+mod sse;
 pub(crate) use dto::*;
 
 use anyhow::{Context, Result};
@@ -106,6 +107,48 @@ impl BoundedResponse {
 
     async fn bytes(self) -> Result<Vec<u8>> {
         self.read(MAX_MEDIA_BYTES).await
+    }
+
+    /// Read a `text/event-stream` body, handing the `data` payload of every
+    /// event before the `[DONE]` sentinel to `on_payload` as it arrives, so a
+    /// caller can aggregate (or fail) without the whole body being buffered
+    /// first. `limit` bounds the raw bytes consumed, as [`read`](Self::read)
+    /// does. Returns whether the sentinel was seen: a body that ends cleanly
+    /// without it was cut short upstream, and what arrived may be incomplete.
+    async fn sse_each(
+        mut self,
+        limit: usize,
+        mut on_payload: impl FnMut(&str) -> Result<()>,
+    ) -> Result<bool> {
+        // `true` once the sentinel is seen; empty payloads carry nothing.
+        fn deliver(payload: &str, on_payload: &mut impl FnMut(&str) -> Result<()>) -> Result<bool> {
+            let payload = payload.trim();
+            if payload == sse::DONE {
+                return Ok(true);
+            }
+            if !payload.is_empty() {
+                on_payload(payload)?;
+            }
+            Ok(false)
+        }
+
+        let mut parser = sse::SseParser::default();
+        let mut consumed = 0usize;
+        while let Some(chunk) = self.response.chunk().await? {
+            consumed = consumed.saturating_add(chunk.len());
+            if consumed > limit {
+                anyhow::bail!("OpenRouter response exceeds the {limit}-byte limit");
+            }
+            for payload in parser.push(&chunk) {
+                if deliver(&payload, &mut on_payload)? {
+                    return Ok(true);
+                }
+            }
+        }
+        match parser.finish() {
+            Some(payload) => deliver(&payload, &mut on_payload),
+            None => Ok(false),
+        }
     }
 }
 
@@ -225,7 +268,7 @@ pub(in crate::openrouter) fn content_type(resp: &BoundedResponse, default: &str)
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 /// Bound an upstream error body to [`MAX_ERROR_BODY_CHARS`], marking a cut.
-fn truncate_error_body(mut body: String) -> String {
+pub(crate) fn truncate_error_body(mut body: String) -> String {
     if let Some((cut, _)) = body.char_indices().nth(MAX_ERROR_BODY_CHARS) {
         body.truncate(cut);
         body.push_str("... [truncated]");

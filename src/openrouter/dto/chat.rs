@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A chat-completions request. `image_config`/`seed` are omitted when `None`.
-/// `stream` is always sent as `false` (MCP tools return one complete result).
+/// A chat-completions request. `image_config`/`seed`/`audio` are omitted when
+/// `None`. `stream` is `false` for text/vision calls (one complete result) and
+/// `true` for audio output, which OpenRouter only delivers as a stream.
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -28,7 +29,20 @@ pub struct ChatRequest {
     /// `default_effort` from the models catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
+    /// Audio-output options (container format); only meaningful together with
+    /// `modalities: ["text", "audio"]`. Omitted when `None` so a provider that
+    /// has no such knob (Lyria returns MP3 regardless) never sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioConfig>,
     pub stream: bool,
+}
+
+/// The `audio` request block for audio-output chat models. OpenRouter documents
+/// `format` values such as `wav`, `mp3`, `flac`, `opus`, `pcm16`; which are
+/// honored varies by model.
+#[derive(Debug, Serialize)]
+pub struct AudioConfig {
+    pub format: String,
 }
 
 /// The `reasoning` request object. OpenRouter normalizes `effort` per provider
@@ -108,4 +122,68 @@ pub struct Usage {
     /// Actual cost in USD reported by OpenRouter, when available.
     #[serde(default)]
     pub cost: Option<f64>,
+}
+
+/// One `chat.completion.chunk` of a streamed completion. Only the fields the
+/// audio path aggregates are typed; everything else is ignored. Fields a
+/// provider may send as an explicit `null` are `Option`s: `#[serde(default)]`
+/// alone only covers a missing key.
+#[derive(Debug, Deserialize)]
+pub struct ChatChunk {
+    #[serde(default)]
+    pub id: Option<String>,
+    /// OpenRouter reports a mid-stream failure as a chunk carrying `error`
+    /// (with a `message`) instead of `choices`.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub choices: Option<Vec<ChunkChoice>>,
+    /// Present on the final chunk only, carrying the request's `cost`.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChunkChoice {
+    #[serde(default)]
+    pub delta: Option<Delta>,
+}
+
+/// The incremental assistant message. Music models put lyrics or
+/// `<instrumental>` in `content` and the audio itself in `audio.data`.
+#[derive(Debug, Default, Deserialize)]
+pub struct Delta {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub audio: Option<DeltaAudio>,
+}
+
+/// A streamed audio fragment: raw base64 (no `data:` prefix) plus, for speech
+/// models, the words spoken in it.
+#[derive(Debug, Deserialize)]
+pub struct DeltaAudio {
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub transcript: Option<String>,
+}
+
+/// A streamed audio-output completion, aggregated over all chunks. `audio` is
+/// every `delta.audio.data` fragment decoded as it arrived (see
+/// [`crate::image_io::Base64Assembler`] for why fragments are not concatenated
+/// first). `text` gathers `delta.content`, `transcript` gathers
+/// `delta.audio.transcript`.
+#[derive(Debug, Default)]
+pub struct ChatAudioResult {
+    pub audio: Vec<u8>,
+    pub text: String,
+    pub transcript: String,
+    /// The completion id (`gen-...`), also sent as `X-Generation-Id`.
+    pub generation_id: Option<String>,
+    /// From the final chunk's `usage.cost`, when reported.
+    pub cost: Option<f64>,
+    /// Whether the stream ended with its `[DONE]` sentinel. `false` means the
+    /// body closed cleanly before it, so `audio` may be cut short.
+    pub complete: bool,
 }

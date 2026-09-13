@@ -26,7 +26,7 @@ pub struct VideoInput {
 }
 
 /// Inputs for a single video generation (domain struct; the wire body is
-/// [`openrouter::VideoSubmitBody`]).
+/// [`crate::openrouter::VideoSubmitBody`]).
 #[derive(Debug, Clone)]
 pub struct VideoGenRequest {
     pub model: String,

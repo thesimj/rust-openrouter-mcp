@@ -280,10 +280,11 @@ in the server's `env`. See [Configuration](README.md#configuration).
 
 ## Verify the connection
 
-Most clients list discovered tools after connecting. You should see all 12:
+Most clients list discovered tools after connecting. You should see all 13:
 `list_models`, `describe_model`, `generate_image`, `generate_video`,
-`generate_audio`, `transcribe_audio`, `chat_completion`, `describe_image`,
-`get_result`, `get_account`, `get_usage_stats`, `reset_usage_stats`. Ask the
+`generate_audio`, `generate_music`, `transcribe_audio`, `chat_completion`,
+`describe_image`, `get_result`, `get_account`, `get_usage_stats`,
+`reset_usage_stats`. Ask the
 agent to *"list OpenRouter image models"* to confirm `list_models` runs.
 
 You can also sanity-check the binary by hand:

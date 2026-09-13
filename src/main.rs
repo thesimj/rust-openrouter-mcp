@@ -12,6 +12,7 @@ mod cli;
 mod image_gen;
 mod image_io;
 mod manifest;
+mod music_gen;
 mod openrouter;
 mod output;
 mod pricing;

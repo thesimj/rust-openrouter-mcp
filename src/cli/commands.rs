@@ -2,13 +2,13 @@
 
 use super::table::{primary_modality, render_sectioned_table};
 use super::{
-    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, TranscribeArgs, VideoArgs,
+    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, MusicArgs, TranscribeArgs, VideoArgs,
     parse_image_arg, resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
 use crate::openrouter::{ModelsQuery, OpenRouterClient};
 use crate::pricing::{models_to_json, video_price};
-use crate::{audio_gen, chat_gen, image_gen, openrouter, video_gen};
+use crate::{audio_gen, chat_gen, image_gen, music_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
 /// output paths (JSON and table).
@@ -238,11 +238,34 @@ pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
     let result = audio_gen::run_job(&client, &req, &args.output, &input_source).await?;
 
     eprintln!("voice: {}", result.audio.voice);
-    for warning in &result.warnings {
-        eprintln!("note: {warning}");
-    }
-    eprintln!("manifest: {}", result.manifest_path.display());
+    print_job_notes(&result.warnings, &[], &result.manifest_path);
     println!("{}", result.audio.path.display());
+    Ok(())
+}
+
+/// Generate music and save it, plus a sidecar manifest. Prints the saved path
+/// to stdout and the model's text / cost / manifest path to stderr. Mirrors the
+/// `generate_music` MCP tool.
+pub(crate) async fn run_music(args: MusicArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
+
+    let req = music_gen::MusicGenRequest {
+        model: args.model,
+        prompt,
+        format: args.format,
+        seed: args.seed,
+    };
+    let result = music_gen::run_job(&client, &req, &args.output, &prompt_source).await?;
+
+    if let Some(text) = &result.music.text {
+        eprintln!("text: {text}");
+    }
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    print_job_notes(&result.warnings, &[], &result.manifest_path);
+    println!("{}", result.music.path.display());
     Ok(())
 }
 

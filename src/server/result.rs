@@ -348,6 +348,28 @@ pub(crate) struct OpenRouterClientCtx {
     pub(crate) stats: UsageStats,
 }
 
+/// Read `path` (capped at [`MAX_INLINE_AUDIO_BYTES`]) and encode it as a
+/// native audio content block for sandboxed clients. `None` when the file is
+/// too large or unreadable - the path is still in the JSON either way. Shared
+/// by the speech and music tools.
+pub(crate) async fn inline_audio_block(
+    path: std::path::PathBuf,
+    mime: String,
+) -> Result<Option<ContentBlock>, ErrorData> {
+    crate::resources::run_blocking(move || {
+        Ok(
+            crate::resources::read_file_limited(&path, MAX_INLINE_AUDIO_BYTES as usize)
+                .ok()
+                .map(|bytes| {
+                    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    ContentBlock::audio(data, mime)
+                }),
+        )
+    })
+    .await
+    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

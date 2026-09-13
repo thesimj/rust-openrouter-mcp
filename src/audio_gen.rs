@@ -207,7 +207,7 @@ pub async fn transcribe(
 }
 
 /// Inputs for a single text-to-speech request (domain struct; the wire body is
-/// [`openrouter::SpeechBody`]).
+/// [`crate::openrouter::SpeechBody`]).
 #[derive(Debug, Clone)]
 pub struct SpeechGenRequest {
     pub model: String,

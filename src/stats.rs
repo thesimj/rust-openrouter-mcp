@@ -161,9 +161,10 @@ impl UsageStats {
         m.videos_generated += clips;
     }
 
-    /// Record one finished text-to-speech request. `cost` is typically `None`
-    /// (the speech endpoint returns no inline usage.cost), so it lands in
-    /// `unknown_cost_count`.
+    /// Record one finished audio generation: text-to-speech (`generate_audio`)
+    /// or music (`generate_music`). Speech passes `cost: None` (the speech
+    /// endpoint returns no inline usage.cost), which lands in
+    /// `unknown_cost_count`; music passes the stream's `usage.cost`.
     pub async fn record_audio(&self, model: &str, success: bool, cost: Option<f64>) {
         let mut s = self.inner.lock().await;
         s.requests_total += 1;

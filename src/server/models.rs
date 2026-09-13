@@ -31,9 +31,11 @@ pub(crate) struct ListModelsArgs {
     /// next; the default 20-result cap (unless all=true) is applied last.
     #[serde(default)]
     pub search: Option<String>,
-    /// Filter by output modalities. Comma-separated list of: text, image, audio,
-    /// embeddings, video, rerank, speech, transcription - or "all". Defaults to
-    /// text on the API when omitted (so pass "all" or a value to see others).
+    /// Filter by output modalities. Comma-separated list of: text, image, audio
+    /// (audio-output chat models, i.e. music such as google/lyria-3-*),
+    /// embeddings, video, rerank, speech (text-to-speech), transcription
+    /// (speech-to-text) - or "all". Defaults to text on the API when omitted
+    /// (so pass "all" or a value to see others).
     #[serde(default)]
     pub output_modalities: Option<String>,
     /// Filter by input modalities. Comma-separated list of: text, image, audio, file.
@@ -73,9 +75,10 @@ impl OpenRouterServer {
         (input/output modalities, context length) and pricing. Filtering and sorting \
         happen server-side: search by name (query), filter by output/input modalities \
         or supported parameters, sort by newest/most-popular/pricing/context, and set a \
-        minimum context length. Output modalities include text, image, audio, embeddings, \
-        video, rerank, speech, transcription (default is text only - pass \
-        output_modalities=\"all\" or a specific value to see the rest). Returns the \
+        minimum context length. Output modalities include text, image, audio (audio-output \
+        chat models - music such as google/lyria-3-*), embeddings, video, rerank, speech \
+        (text-to-speech), transcription (speech-to-text); the default is text only, so pass \
+        output_modalities=\"all\" or a specific value to see the rest. Returns the \
         first 20 models by default; set all=true for the complete list.",
         annotations(
             title = "List OpenRouter Models",
@@ -135,7 +138,9 @@ impl OpenRouterServer {
         models, also merges per-endpoint image capabilities under an \"image\" key \
         (supported_parameters, allowed_passthrough_parameters, pricing, supports_streaming from \
         /images/models/{author}/{slug}/endpoints) - best-effort, omitted if that model has no \
-        image endpoint. Fails if the id is unknown.",
+        image endpoint. For audio-output models whose token pricing is 0 (music, e.g. \
+        google/lyria-3-*), adds an \"audio_pricing_note\": they bill a flat fee per track \
+        that appears only in the description. Fails if the id is unknown.",
         annotations(
             title = "Describe OpenRouter Model",
             read_only_hint = true,
@@ -166,6 +171,19 @@ impl OpenRouterServer {
     }
 }
 
+/// Attached to an audio-output model whose token pricing is all zeros.
+const AUDIO_PRICING_NOTE: &str = "token pricing is 0 for this audio-output model: it bills a \
+    flat fee per generated track, stated only in its description (e.g. \"$0.04 per clip\"); \
+    the actual charge is reported after the call as usage.cost (generate_music returns it \
+    as cost_usd)";
+
+/// Whether the model record declares `modality` among its output modalities.
+fn outputs(detail: &Value, modality: &str) -> bool {
+    detail["architecture"]["output_modalities"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|v| v == modality))
+}
+
 /// Fetch model detail and preserve optional modality enrichment failures inline.
 async fn enriched_model_detail(
     client: &crate::openrouter::OpenRouterClient,
@@ -176,10 +194,7 @@ async fn enriched_model_detail(
     // Video models price via a separate SKU endpoint; the token-based
     // pricing on the main record is 0 and misleading. Merge the real
     // pricing_skus + supported resolutions/durations/sizes under "video".
-    let outputs_video = detail["architecture"]["output_modalities"]
-        .as_array()
-        .is_some_and(|m| m.iter().any(|v| v == "video"));
-    if outputs_video {
+    if outputs(&detail, "video") {
         match client.video_model_detail(model).await {
             Ok(Some(mut video)) => {
                 // pricing_skus is the video model's real pricing object.
@@ -202,10 +217,7 @@ async fn enriched_model_detail(
     // supported_parameters, allowed_passthrough_parameters, pricing,
     // supports_streaming) from the dedicated image-models endpoint, the
     // same best-effort way the video block above is merged.
-    let outputs_image = detail["architecture"]["output_modalities"]
-        .as_array()
-        .is_some_and(|m| m.iter().any(|v| v == "image"));
-    if outputs_image {
+    if outputs(&detail, "image") {
         match client.image_model_detail(model).await {
             Ok(Some(mut image)) => {
                 // Same human rendering the video block gets: image pricing
@@ -226,6 +238,14 @@ async fn enriched_model_detail(
                     Value::String(format!("could not fetch /images/models: {e:#}"));
             }
         }
+    }
+
+    // Audio-output chat models (music: google/lyria-3-*) have no dedicated
+    // pricing endpoint, and their token pricing is 0 while the real per-track
+    // price appears only in the description. Say so, so the zeros are not
+    // read as "free" (verified live 2026-09-13: a clip billed usage.cost 0.04).
+    if outputs(&detail, "audio") && crate::pricing::is_zero_priced(&detail["pricing"]) {
+        detail["audio_pricing_note"] = Value::String(AUDIO_PRICING_NOTE.to_string());
     }
 
     // Normalize every pricing block to human "$X/M tokens" form alongside
@@ -482,6 +502,55 @@ mod tests {
 
         let body = serde_json::to_string(&result).unwrap();
         assert!(body.contains("image_pricing_error"));
+    }
+
+    /// Lyria-style records price at 0 tokens while billing per track; the note
+    /// flags exactly those. A speech-style audio model with real per-token
+    /// audio prices gets no note.
+    #[tokio::test]
+    async fn describe_model_tool_flags_zero_priced_audio_output_models() {
+        for (id, pricing, expect_note) in [
+            (
+                "google/lyria-3-clip-preview",
+                json!({"prompt": "0", "completion": "0"}),
+                true,
+            ),
+            (
+                "openai/gpt-audio",
+                json!({"prompt": "0.0000025", "completion": "0.00001", "audio_output": "0.000064"}),
+                false,
+            ),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/models/{id}/endpoints")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {
+                        "id": id,
+                        "architecture": {"output_modalities": ["text", "audio"]},
+                        "pricing": pricing,
+                        "endpoints": [{"provider_name": "P", "pricing": pricing}]
+                    }
+                })))
+                .mount(&mock)
+                .await;
+            let result = server_for(mock.uri())
+                .describe_model(Parameters(DescribeModelArgs {
+                    model: id.to_string(),
+                }))
+                .await
+                .unwrap();
+            let detail = tool_result_json(&result);
+            let note = detail.get("audio_pricing_note").and_then(Value::as_str);
+            assert_eq!(note.is_some(), expect_note, "{id}: {detail}");
+            if let Some(note) = note {
+                assert!(note.contains("per generated track"), "{note}");
+                assert!(note.contains("cost_usd"), "{note}");
+            }
+            // No stray video/image enrichment was attempted for an audio model.
+            assert!(detail.get("video").is_none());
+            assert!(detail.get("image").is_none());
+        }
     }
 
     #[tokio::test]

@@ -183,6 +183,31 @@ pub struct AudioManifest {
     pub output: AudioOutputMeta,
 }
 
+/// The complete record for one music generation (streamed chat audio output).
+#[derive(Debug, Serialize)]
+pub struct MusicManifest {
+    pub endpoint: &'static str,
+    pub model: String,
+    pub prompt: String,
+    /// `inline`, `file`, or `stdin`.
+    pub prompt_source: String,
+    /// The requested `audio.format`, when one was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// What the model streamed as `content` (lyrics or `<instrumental>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// `usage.cost` from the final stream chunk, in USD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    pub created_at: String,
+    pub output: AudioOutputMeta,
+}
+
 /// Output details for the saved audio file (or its `error`).
 #[derive(Debug, Default, Serialize)]
 pub struct AudioOutputMeta {

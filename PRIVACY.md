@@ -16,17 +16,18 @@ of its own.
 
 `openrouter-mcp` communicates with exactly one third party - **OpenRouter** -
 and only to perform the tool call you (or your AI assistant) explicitly make.
-The 12 tools break down into a few classes:
+The 13 tools break down into a few classes:
 
 - **Model discovery** (`list_models`, `describe_model`): sends your query/
   filter parameters, or a model id, to OpenRouter's model-catalog and
   per-model/per-provider-endpoint routes.
 - **Chat and vision** (`chat_completion`, `describe_image`): sends your
   prompt, and any images you attach, to the chat/vision model you select.
-- **Image, video, and speech generation** (`generate_image`,
-  `generate_video`, `generate_audio`): sends your prompt and any local input
-  images to the model you select, via OpenRouter's dedicated `/images`,
-  `/videos`, and `/audio/speech` endpoints.
+- **Image, video, speech, and music generation** (`generate_image`,
+  `generate_video`, `generate_audio`, `generate_music`): sends your prompt and
+  any local input images to the model you select, via OpenRouter's dedicated
+  `/images`, `/videos`, and `/audio/speech` endpoints; music has no dedicated
+  endpoint and goes to `/chat/completions` as a streamed audio-output request.
 - **Transcription** (`transcribe_audio`): sends the audio you provide to the
   speech-to-text model you select.
 - **Account/key info** (`get_account`): reads your key's label, usage, and
@@ -63,7 +64,7 @@ OpenRouter's handling of this data is governed by OpenRouter's own
   stored by Claude Desktop in your operating system's secure keychain. When run
   from the CLI it is read from the `OPENROUTER_API_KEY` environment variable (or
   a local `.env` file you control).
-- **Generated images, video clips, audio files, and their manifests**:
+- **Generated images, video clips, speech and music files, and their manifests**:
   written to the path you specify, or, when you don't specify one,
   auto-named under `OPENROUTER_MCP_OUTPUT_DIR` if set, else
   `$HOME/Downloads/openrouter-mcp`, else the system temp directory. Always

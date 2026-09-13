@@ -37,6 +37,8 @@ enum Command {
     Video(VideoArgs),
     /// Generate speech (text-to-speech) and save it to disk.
     Audio(AudioArgs),
+    /// Generate music from a text prompt and save it to disk.
+    Music(MusicArgs),
     /// Transcribe a local audio file to text (speech-to-text).
     Transcribe(TranscribeArgs),
     /// Describe local image(s) with a vision-capable model.
@@ -205,6 +207,33 @@ pub(crate) struct AudioArgs {
     output: PathBuf,
 }
 
+/// CLI flags for `music`, mirroring the `generate_music` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct MusicArgs {
+    /// Music model id, e.g. google/lyria-3-clip-preview (30 s clip) or
+    /// google/lyria-3-pro-preview (full song).
+    #[arg(short, long)]
+    model: String,
+    /// Musical description (genre, mood, tempo, instruments, lyrics). Use
+    /// --prompt-file to read it from a file/stdin instead.
+    #[arg(short, long)]
+    prompt: Option<String>,
+    /// Read the prompt from a file (use '-' for stdin).
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Requested container, sent as audio.format (wav, mp3, flac, opus, pcm16).
+    /// Model-specific: Lyria ignores it and returns MP3. The saved extension
+    /// follows the bytes returned.
+    #[arg(long)]
+    format: Option<String>,
+    /// Seed for reproducible-ish generation (model support varies).
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Output path (extension corrected to the returned container, e.g. .mp3).
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
 /// CLI flags for `transcribe`, mirroring the `transcribe_audio` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct TranscribeArgs {
@@ -301,6 +330,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Image(args)) => commands::run_image(args).await,
         Some(Command::Video(args)) => commands::run_video(args).await,
         Some(Command::Audio(args)) => commands::run_audio(args).await,
+        Some(Command::Music(args)) => commands::run_music(args).await,
         Some(Command::Transcribe(args)) => commands::run_transcribe(args).await,
         Some(Command::Describe(args)) => commands::run_describe(args).await,
         Some(Command::Chat(args)) => commands::run_chat(args).await,

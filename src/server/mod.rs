@@ -24,6 +24,7 @@ mod caps;
 mod chat;
 mod image;
 mod models;
+mod music;
 mod naming;
 mod result;
 mod schema;
@@ -66,6 +67,7 @@ impl OpenRouterServer {
                 + Self::image_router()
                 + Self::video_router()
                 + Self::audio_router()
+                + Self::music_router()
                 + Self::chat_router()
                 + Self::account_router(),
         }
@@ -75,7 +77,7 @@ impl OpenRouterServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OpenRouterServer {
     /// Advertises the protocol version rmcp treats as current
-    /// ([`ProtocolVersion::default`], i.e. `LATEST`). rmcp 3.0 also knows
+    /// ([`rmcp::model::ProtocolVersion::default`], i.e. `LATEST`). rmcp 3.0 also knows
     /// `2026-07-28` (stateless lifecycle, MRTR, tasks extension) but does not
     /// default to it: over stdio those changes buy us nothing, and naming a
     /// version ahead of what clients speak only risks a failed handshake.
@@ -87,8 +89,11 @@ impl ServerHandler for OpenRouterServer {
                 their capabilities, and pricing, then `generate_image` to create \
                 images, `generate_video` to create videos (slow, async: it returns \
                 status \"pending\" with a task_id - poll `get_result` until \
-                \"completed\"), `generate_audio` for text-to-speech and \
-                `transcribe_audio` for speech-to-text (both synchronous). \
+                \"completed\"), `generate_audio` for text-to-speech, \
+                `generate_music` for music with an audio-output model such as \
+                google/lyria-3-clip-preview (find them with list_models \
+                output_modalities=\"audio\"), and `transcribe_audio` for speech-to-text \
+                (all three synchronous). \
                 If `generate_image` or `generate_video` returns status \"pending\" with \
                 a task_id, poll `get_result` until it is \"completed\". \
                 `get_usage_stats` reports this process's spend and counts.",

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct ModelsQuery {
     /// Free-text search by model name or slug (`q`).
     pub q: Option<String>,
-    /// Comma list of output modalities: text, image, audio, embeddings, all.
+    /// Comma list of output modalities: text, image, audio, embeddings, video,
+    /// rerank, speech, transcription - or all. (`music` is not a value: music
+    /// models are the `audio` ones.)
     pub output_modalities: Option<String>,
     /// Comma list of input modalities: text, image, audio, file.
     pub input_modalities: Option<String>,

@@ -246,9 +246,48 @@ pub(crate) fn models_to_json(models: &[Model]) -> Value {
     v
 }
 
+/// Whether `pricing` expresses no price at all: every price (a decimal string
+/// as OpenRouter sends them, or a bare number) is zero, or the object is empty
+/// or absent. The non-price members are ignored: `discount` (a fraction) and
+/// `overrides` (an object). Audio-output chat models such as Lyria report 0
+/// token prices while billing a flat fee per track, so zero here means "not
+/// expressed in this object", not "free".
+pub(crate) fn is_zero_priced(pricing: &Value) -> bool {
+    let Some(map) = pricing.as_object() else {
+        return true;
+    };
+    map.iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "discount" | "overrides"))
+        .all(|(_, v)| match v {
+            Value::String(s) => s.trim().parse::<f64>().is_ok_and(|n| n == 0.0),
+            Value::Number(n) => n.as_f64().is_some_and(|n| n == 0.0),
+            _ => true,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_zero_priced_only_when_every_price_string_is_zero() {
+        use serde_json::json;
+        assert!(is_zero_priced(&json!({"prompt": "0", "completion": "0"})));
+        assert!(is_zero_priced(
+            &json!({"prompt": "0", "completion": "0.0", "discount": 0.25, "overrides": {}})
+        ));
+        // A bare number is a price too, even though OpenRouter sends strings.
+        assert!(!is_zero_priced(&json!({"prompt": 0.0000025})));
+        assert!(is_zero_priced(&json!({"prompt": 0, "completion": 0.0})));
+        assert!(is_zero_priced(&json!({})));
+        assert!(is_zero_priced(&Value::Null));
+        assert!(!is_zero_priced(
+            &json!({"prompt": "0", "audio_output": "0.000064"})
+        ));
+        // A sentinel ("varies") is a statement about price, not an absence of one.
+        assert!(!is_zero_priced(&json!({"prompt": "-1"})));
+        assert!(!is_zero_priced(&json!({"prompt": "n/a"})));
+    }
 
     #[test]
     fn per_million_formats_prices_and_sentinels() {

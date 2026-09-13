@@ -192,6 +192,58 @@ const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPu
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
+/// Reassemble bytes from base64 fragments that arrive one at a time (a
+/// streamed `delta.audio.data`), without assuming how the sender split them.
+/// A fragment that ends in `=` padding was encoded on its own and is decoded
+/// on its own - padding cannot appear mid-string, so concatenating it with the
+/// next fragment would fail. An unpadded fragment may be an arbitrary cut of
+/// one long encoding, so only whole 4-character groups are decoded and the
+/// remainder waits for the next fragment. Decoding as fragments arrive also
+/// keeps the buffered form at the size of the bytes, not 4/3 of it.
+#[derive(Debug, Default)]
+pub struct Base64Assembler {
+    /// Characters not yet decodable: fewer than one whole group.
+    pending: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl Base64Assembler {
+    /// Append one fragment (whitespace ignored) and decode what is decodable.
+    pub fn push(&mut self, fragment: &str) -> Result<()> {
+        let fragment = compact_base64(fragment);
+        self.pending.extend_from_slice(fragment.as_bytes());
+        // A padded fragment is self-contained once it is whole groups; a cut
+        // inside the padding run ("Mg=" then "=") waits for the rest of it.
+        let decodable = if fragment.ends_with('=') && self.pending.len().is_multiple_of(4) {
+            self.pending.len()
+        } else {
+            self.pending.len() / 4 * 4
+        };
+        if decodable > 0 {
+            self.decode_pending(decodable)?;
+        }
+        Ok(())
+    }
+
+    /// Decode whatever remains (a final partial group, padding optional) and
+    /// return every byte assembled so far.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if !self.pending.is_empty() {
+            self.decode_pending(self.pending.len())?;
+        }
+        Ok(self.bytes)
+    }
+
+    fn decode_pending(&mut self, len: usize) -> Result<()> {
+        let decoded = LENIENT_BASE64
+            .decode(&self.pending[..len])
+            .context("failed to base64-decode data")?;
+        self.bytes.extend_from_slice(&decoded);
+        self.pending.drain(..len);
+        Ok(())
+    }
+}
+
 /// `data` with ASCII whitespace removed, borrowed when there was none.
 pub fn compact_base64(data: &str) -> std::borrow::Cow<'_, str> {
     let data = data.trim();
@@ -425,6 +477,41 @@ mod tests {
             compact_base64("QUJD"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn base64_assembler_handles_padded_fragments_and_arbitrary_cuts() {
+        // Independently encoded fragments, each padded: the concatenation
+        // "SUQzAwAAAAAvMg==AAAA" is not valid base64, but the bytes are.
+        let mut a = Base64Assembler::default();
+        a.push("SUQzAwAAAAAvMg==").unwrap();
+        a.push("AAAA").unwrap();
+        a.push("/w==").unwrap();
+        assert_eq!(
+            a.finish().unwrap(),
+            b"ID3\x03\x00\x00\x00\x00/2\x00\x00\x00\xff"
+        );
+
+        // One long encoding cut at arbitrary (non-group) positions.
+        let whole = "SUQzAwAAAAAvMg==";
+        for cut in 0..whole.len() {
+            let mut a = Base64Assembler::default();
+            a.push(&whole[..cut]).unwrap();
+            a.push(&whole[cut..]).unwrap();
+            assert_eq!(
+                a.finish().unwrap(),
+                b"ID3\x03\x00\x00\x00\x00/2",
+                "cut {cut}"
+            );
+        }
+
+        // Whitespace and a missing final padding are tolerated; garbage is not.
+        let mut a = Base64Assembler::default();
+        a.push(" QUJD\n").unwrap();
+        a.push("RA").unwrap();
+        assert_eq!(a.finish().unwrap(), b"ABCD");
+        assert_eq!(Base64Assembler::default().finish().unwrap(), b"");
+        assert!(Base64Assembler::default().push("!!!!").is_err());
     }
 
     #[test]

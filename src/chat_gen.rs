@@ -89,6 +89,7 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
             .map(|effort| Reasoning {
                 effort: effort.to_string(),
             }),
+        audio: None,
         stream: false,
     };
 

@@ -10,8 +10,9 @@
 
 MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
 single Rust binary. Discover models, generate and edit images (with parallel
-variants and a sidecar manifest), describe images with a vision model, and track
-per-process usage - all behind one `openrouter-mcp` executable.
+variants and a sidecar manifest), generate video, speech, and music, transcribe
+audio, describe images with a vision model, and track per-process usage - all
+behind one `openrouter-mcp` executable.
 
 ## Features
 
@@ -52,6 +53,17 @@ per-process usage - all behind one `openrouter-mcp` executable.
   Retries never submit another generation request.
 - **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
+- **Music generation** - `generate_music`: text-to-music with an OpenRouter
+  music model (Google Lyria 3: `google/lyria-3-clip-preview` for a 30-second
+  clip, `google/lyria-3-pro-preview` for a full song). OpenRouter has no
+  dedicated music endpoint: music models are chat models whose
+  `output_modalities` include `audio`, so the server streams
+  `/api/v1/chat/completions` with `modalities: ["text", "audio"]`, decodes the
+  streamed audio, and saves it with the extension its bytes call for (Lyria
+  returns MP3 and ignores a requested `format`). Synchronous (a clip takes about 10-25 s). The catalog lists
+  0 token pricing for these models; the real per-track price is only in the
+  model description ($0.04 per clip, $0.08 per song) and comes back as
+  `cost_usd`. Find them with `list_models` + `output_modalities="audio"`.
 - **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
   model; audio by local `path` or inline `base64`, optional language hint.
 - **Image description** - `describe_image`: image -> detailed text via any
@@ -165,7 +177,7 @@ All environment variables read by the server/CLI:
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
-| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image`/`generate_video`/`generate_audio` (and `get_result`) embed inline previews - base64 image previews, video `file://` resource links, and inline audio blocks: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
+| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image`/`generate_video`/`generate_audio`/`generate_music` (and `get_result`) embed inline previews - base64 image previews, video `file://` resource links, and inline audio blocks: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
 | `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
 | `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `4096`; larger values are reduced to `4096`. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
@@ -179,7 +191,7 @@ All environment variables read by the server/CLI:
 A few of these warrant extra detail.
 
 `OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image`,
-`generate_video`, `generate_audio`, and `get_result` embed the generated
+`generate_video`, `generate_audio`, `generate_music`, and `get_result` embed the generated
 media **inline** in the tool result (base64 images, video `file://` resource
 links, or inline audio blocks), in addition to saving it to disk:
 
@@ -199,7 +211,7 @@ path returned instead). Video links contain no inline bytes and grant no filesys
 The task registry accepts at most 32 pending image/video jobs per process.
 Image jobs reserve capacity before fetching or decoding inputs. Finished or cancelled jobs release their pending slots.
 Each image job allows four concurrent variant requests. Cancelling a job aborts its remaining variant tasks.
-Eight synchronous chat, description, speech, or transcription calls may run per server.
+Eight synchronous chat, description, speech, music, or transcription calls may run per server.
 Input preparation, DNS, and preview encoding share four blocking workers.
 Four image/video preview calls may run concurrently. Further preview calls return paths without inline media.
 
@@ -251,10 +263,11 @@ block is optional.
 | Tool | Kind | Description |
 | --- | --- | --- |
 | `list_models` | read-only | List models with capabilities and pricing (server-side filters, local search; human-readable `$X/M tokens` pricing; tiered/time-window `overrides` are passed through raw and rendered in `pricing_human` when a model has them). |
-| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, and (for image models) per-endpoint image capabilities merged under an `image` key. |
+| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, (for image models) per-endpoint image capabilities merged under an `image` key, and (for zero-priced audio-output models such as Lyria) an `audio_pricing_note` pointing at the per-track price in the description. |
 | `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64`. Optional `quality` (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) pass through to the provider. **No defaults** for `model`, `prompt`, `aspect_ratio`, `image_size` - all four are required by the schema, not just prose; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video with an OpenRouter video model; async, poll by `task_id`. Required: `model`, `prompt`, `duration`, `with_audio` (renamed from `generate_audio` in 0.6.0). |
 | `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. |
+| `generate_music` | write | Text-to-music with an OpenRouter music model (Google Lyria 3) via streamed `/api/v1/chat/completions` audio output; synchronous; saves the track to disk (extension from the returned bytes, MP3 for Lyria), returns the model's text (lyrics or `<instrumental>`), `cost_usd`, the manifest path, and a `warnings` entry if the stream ended before its `[DONE]` sentinel (the track may be cut short). Required: `model`, `prompt`; optional `format` (audio.format passthrough), `seed`, `output`. Find models with `list_models` + `output_modalities="audio"`. |
 | `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, local 25 MiB limit for files and inline data), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), and `temperature`; returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
 | `chat_completion` | read-only | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Optionally attach `images` for a vision model (best-effort gated on the model's declared image-input support). |
 | `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. |
@@ -270,7 +283,7 @@ the full per-variant detail lives in the manifest on disk.
 ## CLI usage
 
 The same binary is a CLI. Subcommands: `models`, `image`, `video`, `audio`,
-`transcribe`, `describe`, `chat`, `key`, `mcp`.
+`music`, `transcribe`, `describe`, `chat`, `key`, `mcp`.
 
 Show info about the API key in use:
 
@@ -351,6 +364,15 @@ Generate speech (text-to-speech):
 openrouter-mcp audio \
   --model hexgrad/kokoro-82m --voice af_heart \
   --input "Hello from OpenRouter." --output ./out/hello.mp3
+```
+
+Generate music (text-to-music; the extension follows the returned bytes):
+
+```bash
+openrouter-mcp music \
+  --model google/lyria-3-clip-preview \
+  --prompt "warm lo-fi hip hop loop, soft piano, vinyl crackle, 80 bpm" \
+  --output ./out/loop.mp3
 ```
 
 Transcribe audio (speech-to-text):

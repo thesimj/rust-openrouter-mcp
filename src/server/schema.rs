@@ -218,6 +218,7 @@ mod tests {
     use crate::server::chat::ChatCompletionArgs;
     use crate::server::image::{DescribeImageArgs, GenerateImageArgs, ImageInput};
     use crate::server::models::ListModelsArgs;
+    use crate::server::music::GenerateMusicArgs;
     use crate::server::video::GenerateVideoArgs;
     use rmcp::handler::server::common::schema_for_type;
     use schemars::JsonSchema;
@@ -289,6 +290,9 @@ mod tests {
         assert!(audio.contains(&"input".to_string()), "{audio:?}");
         assert!(audio.contains(&"voice".to_string()), "{audio:?}");
 
+        let music = required_fields::<GenerateMusicArgs>();
+        assert!(music.contains(&"prompt".to_string()), "{music:?}");
+
         let image = required_fields::<GenerateImageArgs>();
         assert!(image.contains(&"aspect_ratio".to_string()), "{image:?}");
         assert!(image.contains(&"image_size".to_string()), "{image:?}");
@@ -347,6 +351,7 @@ mod tests {
         );
         assert_eq!(prop_type::<GenerateVideoArgs>("duration"), json!("integer"));
         assert_eq!(prop_type::<GenerateAudioArgs>("speed"), json!("number"));
+        assert_eq!(prop_type::<GenerateMusicArgs>("seed"), json!("integer"));
         // Nested $defs type must opt in too, or its optional fields keep the union.
         assert_eq!(prop_type::<ImageInput>("label"), json!("string"));
     }

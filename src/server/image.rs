@@ -329,8 +329,8 @@ pub(crate) struct GenerateImageArgs {
     #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
     /// Number of variants to generate in parallel (1-16, seed-stepped). Default 1.
-    /// With >1, files are named <output>-var-<seed>-<index> (seed zero-padded to
-    /// 4 digits, index to 3), or -var-<index> when no seed is set; one manifest
+    /// With >1, files are named `<output>-var-<seed>-<index>` (seed zero-padded to
+    /// 4 digits, index to 3), or `-var-<index>` when no seed is set; one manifest
     /// covers all variants.
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 1, max = 16))]

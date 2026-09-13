@@ -22,6 +22,7 @@ pub(crate) enum MediaKind {
     Image,
     Video,
     Audio,
+    Music,
 }
 
 impl MediaKind {
@@ -30,6 +31,7 @@ impl MediaKind {
             MediaKind::Image => "img",
             MediaKind::Video => "vid",
             MediaKind::Audio => "aud",
+            MediaKind::Music => "mus",
         }
     }
 }
@@ -189,6 +191,21 @@ mod tests {
             at(0),
         );
         assert!(n.starts_with("aud_20260617-172245_gpt-4o-mini-tts_alloy_mp3_seed1_"));
+    }
+
+    #[test]
+    fn music_has_its_own_prefix() {
+        let n = auto_base_name(
+            MediaKind::Music,
+            "google/lyria-3-clip-preview",
+            &["mp3"],
+            None,
+            at(0),
+        );
+        assert!(
+            n.starts_with("mus_20260617-172245_lyria-3-clip-preview_mp3_"),
+            "{n}"
+        );
     }
 
     #[test]
