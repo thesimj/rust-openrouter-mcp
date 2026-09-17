@@ -194,8 +194,17 @@ pub(crate) struct AudioArgs {
     #[arg(long)]
     input_file: Option<PathBuf>,
     /// Voice id, valid only for the chosen model (e.g. af_heart for kokoro).
+    /// Most models have no default voice; omit only for voice-cloning models
+    /// driven by --voice-reference.
     #[arg(long)]
-    voice: String,
+    voice: Option<String>,
+    /// Local audio sample whose voice to clone (wav, mp3, flac, m4a, ogg, webm,
+    /// aac; 15 MiB decoded max), sent as input_references.
+    #[arg(long, value_name = "PATH")]
+    voice_reference: Option<PathBuf>,
+    /// Transcript of the --voice-reference sample (max 10000 characters).
+    #[arg(long, requires = "voice_reference")]
+    voice_reference_text: Option<String>,
     /// Output audio format: mp3 (default) or pcm.
     #[arg(long)]
     response_format: Option<String>,
@@ -205,6 +214,8 @@ pub(crate) struct AudioArgs {
     /// Output path (extension corrected to the returned format, e.g. .mp3).
     #[arg(short, long)]
     output: PathBuf,
+    #[command(flatten)]
+    provider: ProviderFlags,
 }
 
 /// CLI flags for `music`, mirroring the `generate_music` MCP tool.
@@ -451,6 +462,89 @@ mod tests {
         assert_eq!(parse_image_arg("./plain.png").label, None);
         assert_eq!(parse_image_arg("=/leading.png").label, None);
         assert_eq!(parse_image_arg("trailing=").label, None);
+    }
+
+    /// `audio` mirrors generate_audio: `--voice` is optional (voice-cloning
+    /// models take none), the cloning sample comes from `--voice-reference`
+    /// with an optional `--voice-reference-text` that is meaningless without
+    /// it, and `--provider` carries the same block the tool takes.
+    #[test]
+    fn audio_flags_make_voice_optional_and_take_a_voice_reference() {
+        use crate::server::provider::ProviderOptionsArgs;
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "audio",
+            "-m",
+            "fish-audio/s1",
+            "-i",
+            "hello",
+            "-o",
+            "out.mp3",
+            "--voice-reference",
+            "sample.wav",
+            "--voice-reference-text",
+            "the sample words",
+            "--provider",
+            "{\"options\":{\"openai\":{\"instructions\":\"cheerful\"}}}",
+        ])
+        .unwrap();
+        let Some(Command::Audio(args)) = cli.command else {
+            panic!("expected audio")
+        };
+        assert_eq!(args.voice, None);
+        assert_eq!(args.voice_reference, Some(PathBuf::from("sample.wav")));
+        assert_eq!(
+            args.voice_reference_text.as_deref(),
+            Some("the sample words")
+        );
+        let block = args
+            .provider
+            .parse::<ProviderOptionsArgs>()
+            .unwrap()
+            .into_options()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block.options["openai"],
+            serde_json::json!({"instructions": "cheerful"})
+        );
+
+        // The classic form still parses, with the voice carried through.
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "audio",
+            "-m",
+            "hexgrad/kokoro-82m",
+            "-i",
+            "hi",
+            "-o",
+            "out.mp3",
+            "--voice",
+            "af_heart",
+        ])
+        .unwrap();
+        let Some(Command::Audio(args)) = cli.command else {
+            panic!("expected audio")
+        };
+        assert_eq!(args.voice.as_deref(), Some("af_heart"));
+        assert_eq!(args.voice_reference, None);
+
+        // A transcript without a sample is rejected at parse time.
+        assert!(
+            Cli::try_parse_from([
+                "openrouter-mcp",
+                "audio",
+                "-m",
+                "m",
+                "-i",
+                "hi",
+                "-o",
+                "out.mp3",
+                "--voice-reference-text",
+                "words",
+            ])
+            .is_err()
+        );
     }
 
     /// `--provider` takes the same JSON block the MCP tool takes and goes

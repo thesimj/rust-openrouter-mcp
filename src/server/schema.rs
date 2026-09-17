@@ -489,7 +489,9 @@ mod tests {
 
         let audio = required_fields::<GenerateAudioArgs>();
         assert!(audio.contains(&"input".to_string()), "{audio:?}");
-        assert!(audio.contains(&"voice".to_string()), "{audio:?}");
+        // `voice` is provider-dependent (voice-cloning models take none), so it
+        // must NOT be advertised as required even though most models need it.
+        assert!(!audio.contains(&"voice".to_string()), "{audio:?}");
 
         let music = required_fields::<GenerateMusicArgs>();
         assert!(music.contains(&"prompt".to_string()), "{music:?}");

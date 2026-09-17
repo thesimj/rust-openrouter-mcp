@@ -175,10 +175,19 @@ pub struct AudioManifest {
     pub input: String,
     /// `inline`, `file`, or `stdin`.
     pub input_source: String,
-    pub voice: String,
+    /// The voice id sent, when one was (voice-cloning models take none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// True when a voice-cloning `input_references` sample was sent. The
+    /// sample itself is not recorded (it can be megabytes of base64).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub voice_reference: bool,
     pub response_format: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
+    /// The `provider` block sent, when one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderOptions>,
     pub created_at: String,
     pub output: AudioOutputMeta,
 }
