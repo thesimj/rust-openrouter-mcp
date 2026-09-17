@@ -6,6 +6,7 @@ mod chat;
 mod images;
 mod key;
 mod models;
+mod provider;
 mod speech;
 mod video;
 
@@ -13,5 +14,6 @@ pub(crate) use chat::*;
 pub(crate) use images::*;
 pub(crate) use key::*;
 pub(crate) use models::*;
+pub(crate) use provider::*;
 pub(crate) use speech::*;
 pub(crate) use video::*;
