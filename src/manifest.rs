@@ -113,8 +113,10 @@ pub struct VideoManifest {
     pub generation_id: Option<String>,
     pub cost: Option<f64>,
     pub model: String,
-    pub prompt: String,
-    /// `inline`, `file`, or `stdin`.
+    /// Absent for image-only requests (a frame or reference and no text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// `inline`, `file`, `stdin`, or `none`.
     pub prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u32>,
@@ -131,7 +133,21 @@ pub struct VideoManifest {
     pub max_image_dimension: u32,
     pub created_at: String,
     pub frame_images: Vec<FrameImageMeta>,
+    /// Reference image sources (local paths).
     pub input_references: Vec<String>,
+    /// Reference audio sources (URLs or local paths), as given.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_audio: Vec<String>,
+    /// Reference video sources (URLs or local paths), as given.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_videos: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creativity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upscale_factor: Option<f64>,
+    /// The `provider` block sent with the job (options-only for `/videos`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderOptions>,
     pub clips: Vec<VideoClipMeta>,
 }
 

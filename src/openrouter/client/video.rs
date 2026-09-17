@@ -125,7 +125,7 @@ mod tests {
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let body = VideoSubmitBody {
             model: "google/veo-3.1".to_string(),
-            prompt: "a dog".to_string(),
+            prompt: Some("a dog".to_string()),
             duration: Some(4),
             resolution: None,
             aspect_ratio: Some("16:9".to_string()),
@@ -134,6 +134,9 @@ mod tests {
             input_references: vec![],
             generate_audio: Some(false),
             seed: None,
+            creativity: None,
+            upscale_factor: None,
+            provider: None,
         };
         let resp = client.submit_video(&body).await.unwrap();
         assert_eq!(resp.id, "vid-1");
@@ -151,7 +154,7 @@ mod tests {
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let body = VideoSubmitBody {
             model: "m".to_string(),
-            prompt: "p".to_string(),
+            prompt: Some("p".to_string()),
             duration: None,
             resolution: None,
             aspect_ratio: None,
@@ -160,6 +163,9 @@ mod tests {
             input_references: vec![],
             generate_audio: None,
             seed: None,
+            creativity: None,
+            upscale_factor: None,
+            provider: None,
         };
         let err = client.submit_video(&body).await.unwrap_err();
         assert!(err.to_string().contains("unsupported"));

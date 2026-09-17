@@ -76,14 +76,20 @@ pub async fn run_job(
     base_output: &Path,
     prompt_source: &str,
 ) -> Result<VideoJobSummary> {
+    // Invariants upstream only rejects after accepting (and billing) the job.
+    req.validate()?;
     let mut warnings = Vec::new();
 
     // frame_images wins over input_references (image-to-video) - warn if both.
     let use_frames = !req.frames.is_empty();
-    if use_frames && !req.references.is_empty() {
+    let has_references = !req.references.is_empty()
+        || !req.reference_audio.is_empty()
+        || !req.reference_videos.is_empty();
+    if use_frames && has_references {
         warnings.push(
-            "both frame_images and reference_images were given; sending only \
-             frame_images (image-to-video) and ignoring reference_images"
+            "both frame_images and references (reference_images/reference_audio/\
+             reference_videos) were given; sending only frame_images (image-to-video) \
+             and ignoring every reference"
                 .to_string(),
         );
     }
@@ -121,9 +127,13 @@ pub async fn run_job(
         }
     }
 
-    // References are only sent when no frames are present.
+    // References are only sent when no frames are present. Order: images,
+    // audio, videos. Local audio/video files are inlined as data URLs; URLs
+    // pass through.
     let mut input_references = Vec::new();
     let mut reference_meta = Vec::new();
+    let mut audio_meta = Vec::new();
+    let mut video_meta = Vec::new();
     if !use_frames {
         let ref_inputs = unlabeled(req.references.clone());
         let ref_prepared =
@@ -134,11 +144,28 @@ pub async fn run_job(
             }));
             reference_meta.push(p.to_string_lossy().into_owned());
         }
+        for source in &req.reference_audio {
+            input_references.push(InputReference::audio(
+                super::resolve_media_reference(source)
+                    .await
+                    .with_context(|| format!("reference_audio {source}"))?,
+            ));
+            audio_meta.push(source.clone());
+        }
+        for source in &req.reference_videos {
+            input_references.push(InputReference::video(
+                super::resolve_media_reference(source)
+                    .await
+                    .with_context(|| format!("reference_videos {source}"))?,
+            ));
+            video_meta.push(source.clone());
+        }
     }
 
+    let prompt = req.prompt_text().map(str::to_string);
     let body = VideoSubmitBody {
         model: req.model.clone(),
-        prompt: req.prompt.clone(),
+        prompt: prompt.clone(),
         duration: req.duration,
         resolution: req.resolution.clone(),
         aspect_ratio: req.aspect_ratio.clone(),
@@ -147,6 +174,9 @@ pub async fn run_job(
         input_references,
         generate_audio: req.generate_audio,
         seed: req.seed,
+        creativity: req.creativity,
+        upscale_factor: req.upscale_factor,
+        provider: req.provider.clone(),
     };
 
     let submitted = client.submit_video(&body).await?;
@@ -157,7 +187,7 @@ pub async fn run_job(
         generation_id: None,
         cost: None,
         model: req.model.clone(),
-        prompt: req.prompt.clone(),
+        prompt,
         prompt_source: prompt_source.to_string(),
         duration: req.duration,
         resolution: req.resolution.clone(),
@@ -169,6 +199,11 @@ pub async fn run_job(
         created_at: chrono::Utc::now().to_rfc3339(),
         frame_images: frame_meta,
         input_references: reference_meta,
+        reference_audio: audio_meta,
+        reference_videos: video_meta,
+        creativity: req.creativity,
+        upscale_factor: req.upscale_factor,
+        provider: req.provider.clone(),
         clips: Vec::new(),
     };
     let mpath = manifest::path(base_output);
@@ -506,7 +541,7 @@ mod tests {
     fn text_to_video_request(model: &str) -> VideoGenRequest {
         VideoGenRequest {
             model: model.to_string(),
-            prompt: "a cat surfing".to_string(),
+            prompt: Some("a cat surfing".to_string()),
             duration: Some(4),
             resolution: Some("720p".to_string()),
             aspect_ratio: Some("16:9".to_string()),
@@ -515,6 +550,11 @@ mod tests {
             seed: Some(7),
             frames: vec![],
             references: vec![],
+            reference_audio: vec![],
+            reference_videos: vec![],
+            creativity: None,
+            upscale_factor: None,
+            provider: None,
             max_image_dimension: 800,
             poll_interval_secs: 1,
             poll_timeout_secs: 30,
@@ -630,6 +670,227 @@ mod tests {
         assert_eq!(std::fs::read(&v.path).unwrap(), b"FAKE-MP4-BYTES");
     }
 
+    /// Mount a submit mock that requires `expected` in the body, a poll that
+    /// completes at once with one clip, and that clip's download.
+    async fn mount_completed_job(server: &MockServer, job: &str, expected: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .and(body_partial_json(expected))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "id": job, "status": "pending" })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/videos/{job}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": job,
+                "status": "completed",
+                "unsigned_urls": ["https://cdn/clip-0.mp4"],
+                "usage": { "cost": 0.5 }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/videos/{job}/content")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp4")
+                    .set_body_bytes(fake_mp4(&[b"vide"])),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// The JSON body of the single POST /videos the mock received.
+    async fn submitted_body(server: &MockServer) -> serde_json::Value {
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .collect();
+        assert_eq!(posts.len(), 1, "exactly one submission");
+        serde_json::from_slice(&posts[0].body).unwrap()
+    }
+
+    /// A tiny valid PNG on disk, for frame inputs that go through the image
+    /// pipeline (which decodes them).
+    fn write_png(path: &Path) {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 120, 200, 255]));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
+    }
+
+    /// `provider.options` (opaque, unchanged), `creativity` and `upscale_factor`
+    /// reach the wire under their documented names, and the manifest records the
+    /// provider block.
+    #[tokio::test]
+    async fn run_job_forwards_provider_options_creativity_and_upscale_factor() {
+        let server = MockServer::start().await;
+        mount_completed_job(
+            &server,
+            "vid-opts",
+            json!({
+                "provider": { "options": { "google-vertex": { "negativePrompt": "blurry" } } },
+                "creativity": 5,
+                "upscale_factor": 2.0
+            }),
+        )
+        .await;
+        let mut options = std::collections::BTreeMap::new();
+        options.insert(
+            "google-vertex".to_string(),
+            json!({ "negativePrompt": "blurry" }),
+        );
+        let req = VideoGenRequest {
+            creativity: Some(5),
+            upscale_factor: Some(2.0),
+            provider: Some(crate::openrouter::ProviderOptions { options }),
+            ..text_to_video_request("google/veo-3.1")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("clip.mp4");
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&summary.manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["provider"],
+            json!({ "options": { "google-vertex": { "negativePrompt": "blurry" } } })
+        );
+        assert_eq!(manifest["creativity"], 5);
+        assert_eq!(manifest["upscale_factor"], 2.0);
+    }
+
+    /// Audio and video references become `audio_url` / `video_url` content parts:
+    /// a URL passes through untouched, a local file becomes a data URL with the
+    /// MIME taken from its extension. Order: images, audio, videos.
+    #[tokio::test]
+    async fn run_job_sends_audio_and_video_references_as_typed_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let beat = dir.path().join("beat.mp3");
+        std::fs::write(&beat, b"ABC").unwrap();
+        let clip = dir.path().join("ref.mp4");
+        std::fs::write(&clip, b"ABC").unwrap();
+
+        let server = MockServer::start().await;
+        mount_completed_job(
+            &server,
+            "vid-refs",
+            json!({
+                "input_references": [
+                    { "type": "audio_url", "audio_url": { "url": "https://cdn/song.mp3" } },
+                    { "type": "audio_url", "audio_url": { "url": "data:audio/mpeg;base64,QUJD" } },
+                    { "type": "video_url", "video_url": { "url": "data:video/mp4;base64,QUJD" } }
+                ]
+            }),
+        )
+        .await;
+        let req = VideoGenRequest {
+            reference_audio: vec![
+                "https://cdn/song.mp3".to_string(),
+                beat.to_string_lossy().into_owned(),
+            ],
+            reference_videos: vec![clip.to_string_lossy().into_owned()],
+            ..text_to_video_request("bytedance/seedance-2.0")
+        };
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let summary = run_job(&client, &req, &dir.path().join("out.mp4"), "test")
+            .await
+            .unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        let body = submitted_body(&server).await;
+        assert_eq!(body["input_references"].as_array().unwrap().len(), 3);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&summary.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["reference_audio"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            manifest["reference_videos"],
+            json!([clip.to_string_lossy()])
+        );
+    }
+
+    /// Image-only models take no prompt: a frame-only request sends no `prompt`
+    /// key at all. Frames still win over every reference kind, with the warning.
+    #[tokio::test]
+    async fn run_job_sends_no_prompt_for_a_frame_only_request_and_frames_win_over_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("first.png");
+        write_png(&frame);
+
+        let server = MockServer::start().await;
+        mount_completed_job(&server, "vid-frame", json!({ "model": "test/i2v" })).await;
+        let req = VideoGenRequest {
+            prompt: None,
+            aspect_ratio: None,
+            frames: vec![super::super::VideoInput {
+                path: frame.clone(),
+                frame_type: "first_frame".to_string(),
+            }],
+            reference_audio: vec!["https://cdn/song.mp3".to_string()],
+            ..text_to_video_request("test/i2v")
+        };
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let summary = run_job(&client, &req, &dir.path().join("out.mp4"), "test")
+            .await
+            .unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        let body = submitted_body(&server).await;
+        assert!(body.get("prompt").is_none(), "sent: {body}");
+        assert_eq!(body["frame_images"].as_array().unwrap().len(), 1);
+        assert!(body.get("input_references").is_none(), "sent: {body}");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("reference") && w.contains("ignoring")),
+            "{:?}",
+            summary.warnings
+        );
+    }
+
+    /// Both invariants are checked before any HTTP call: a prompt is required
+    /// unless a frame or reference is present, and upscale_factor must be > 0.
+    #[tokio::test]
+    async fn run_job_rejects_missing_prompt_and_bad_upscale_factor_before_submit() {
+        let server = MockServer::start().await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.mp4");
+
+        let no_prompt = VideoGenRequest {
+            prompt: None,
+            ..text_to_video_request("m")
+        };
+        let err = run_job(&client, &no_prompt, &base, "test")
+            .await
+            .err()
+            .expect("rejected")
+            .to_string();
+        assert!(err.contains("prompt"), "got: {err}");
+
+        for bad in [0.0, -1.5] {
+            let req = VideoGenRequest {
+                upscale_factor: Some(bad),
+                ..text_to_video_request("m")
+            };
+            let err = run_job(&client, &req, &base, "test")
+                .await
+                .err()
+                .expect("rejected")
+                .to_string();
+            assert!(err.contains("upscale_factor"), "got: {err}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     /// grok-imagine-video returns an AAC track even for with_audio=false: the
     /// job must warn about the flag being ignored, not just flip has_audio.
     #[tokio::test]
@@ -742,7 +1003,7 @@ mod audit_regression {
     fn request() -> VideoGenRequest {
         VideoGenRequest {
             model: "test/video".into(),
-            prompt: "test".into(),
+            prompt: Some("test".into()),
             duration: Some(5),
             resolution: None,
             aspect_ratio: None,
@@ -751,6 +1012,11 @@ mod audit_regression {
             seed: None,
             frames: vec![],
             references: vec![],
+            reference_audio: vec![],
+            reference_videos: vec![],
+            creativity: None,
+            upscale_factor: None,
+            provider: None,
             max_image_dimension: 800,
             poll_interval_secs: 1,
             poll_timeout_secs: 5,
@@ -763,7 +1029,7 @@ mod audit_regression {
             generation_id: None,
             cost: None,
             model: "test/video".into(),
-            prompt: "test".into(),
+            prompt: Some("test".into()),
             prompt_source: "test".into(),
             duration: Some(5),
             resolution: None,
@@ -775,6 +1041,11 @@ mod audit_regression {
             created_at: "test".into(),
             frame_images: vec![],
             input_references: vec![],
+            reference_audio: vec![],
+            reference_videos: vec![],
+            creativity: None,
+            upscale_factor: None,
+            provider: None,
             clips: vec![],
         }
     }

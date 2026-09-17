@@ -504,6 +504,9 @@ mod tests {
         // aspect_ratio is conditional (only required for text-to-video without a
         // frame), so it must stay OUT of the unconditional schema required list.
         assert!(!video.contains(&"aspect_ratio".to_string()), "{video:?}");
+        // prompt is conditional too: image-only models take none, so it is only
+        // required at runtime when no frame and no reference is present.
+        assert!(!video.contains(&"prompt".to_string()), "{video:?}");
     }
 
     /// `describe_image.images` must declare `minItems: 1` - the prose already
@@ -551,6 +554,14 @@ mod tests {
             json!("boolean")
         );
         assert_eq!(prop_type::<GenerateVideoArgs>("duration"), json!("integer"));
+        assert_eq!(
+            prop_type::<GenerateVideoArgs>("creativity"),
+            json!("integer")
+        );
+        assert_eq!(
+            prop_type::<GenerateVideoArgs>("upscale_factor"),
+            json!("number")
+        );
         assert_eq!(prop_type::<GenerateAudioArgs>("speed"), json!("number"));
         assert_eq!(prop_type::<GenerateMusicArgs>("seed"), json!("integer"));
         // Nested $defs type must opt in too, or its optional fields keep the union.
