@@ -222,10 +222,28 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate speech and save it, plus a sidecar manifest.
+/// Generate speech and save it, plus a sidecar manifest. Mirrors the
+/// `generate_audio` MCP tool, including the optional voice-cloning reference.
 pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let (input, input_source) = resolve_prompt(args.input, args.input_file)?;
+    // clap guarantees --voice-reference-text only appears with --voice-reference.
+    let voice_reference = match args.voice_reference {
+        Some(path) => {
+            let (data, format) = audio_gen::read_audio_file(&path, None).await?;
+            Some(audio_gen::VoiceReference::new(
+                &data,
+                Some(&format),
+                args.voice_reference_text.as_deref(),
+            )?)
+        }
+        None => None,
+    };
 
     let req = audio_gen::SpeechGenRequest {
         model: args.model,
@@ -233,11 +251,15 @@ pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
         voice: args.voice,
         response_format: args.response_format,
         speed: args.speed,
+        voice_reference,
+        provider,
     };
 
     let result = audio_gen::run_job(&client, &req, &args.output, &input_source).await?;
 
-    eprintln!("voice: {}", result.audio.voice);
+    if let Some(voice) = &result.audio.voice {
+        eprintln!("voice: {voice}");
+    }
     print_job_notes(&result.warnings, &[], &result.manifest_path);
     println!("{}", result.audio.path.display());
     Ok(())

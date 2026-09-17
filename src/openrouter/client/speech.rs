@@ -138,9 +138,11 @@ mod tests {
         let body = SpeechBody {
             model: "openai/gpt-4o-mini-tts".to_string(),
             input: "hi".to_string(),
-            voice: "alloy".to_string(),
+            voice: Some("alloy".to_string()),
             response_format: Some("mp3".to_string()),
             speed: None,
+            input_references: vec![],
+            provider: None,
         };
         let result = match client.speech(&body).await {
             Ok(r) => r,
@@ -183,9 +185,11 @@ mod tests {
                 .speech(&SpeechBody {
                     model: "test/speech".into(),
                     input: "hello".into(),
-                    voice: "alloy".into(),
+                    voice: Some("alloy".into()),
                     response_format: None,
                     speed: None,
+                    input_references: vec![],
+                    provider: None,
                 })
                 .await
                 .err()
@@ -222,9 +226,11 @@ mod tests {
         let body = SpeechBody {
             model: "m".to_string(),
             input: "x".to_string(),
-            voice: "z".to_string(),
+            voice: Some("z".to_string()),
             response_format: None,
             speed: None,
+            input_references: vec![],
+            provider: None,
         };
         let err = match client.speech(&body).await {
             Err(e) => e,
