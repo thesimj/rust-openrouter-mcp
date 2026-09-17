@@ -280,12 +280,20 @@ in the server's `env`. See [Configuration](README.md#configuration).
 
 ## Verify the connection
 
-Most clients list discovered tools after connecting. You should see all 13:
+Most clients list discovered tools after connecting. You should see all 16:
 `list_models`, `describe_model`, `generate_image`, `generate_video`,
 `generate_audio`, `generate_music`, `transcribe_audio`, `chat_completion`,
-`describe_image`, `get_result`, `get_account`, `get_usage_stats`,
-`reset_usage_stats`. Ask the
+`describe_image`, `embed_text`, `rerank_documents`, `get_generation`,
+`get_result`, `get_account`, `get_usage_stats`, `reset_usage_stats`. Ask the
 agent to *"list OpenRouter image models"* to confirm `list_models` runs.
+
+Every generation tool takes an optional `provider` object. Its shape depends on
+the endpoint: routing keys (`order`, `only`, `ignore`, `allow_fallbacks`,
+`sort`, plus `require_parameters`/`zdr` on chat, embeddings and rerank) and,
+on `generate_image`, `generate_audio`, `transcribe_audio` and `generate_video`,
+a `provider.options` map keyed by provider slug for that provider's own
+parameters (e.g. `{"options": {"deepgram": {"diarize": true}}}`). Check
+`describe_model` for each endpoint's `allowed_passthrough_parameters` first.
 
 You can also sanity-check the binary by hand:
 ```bash

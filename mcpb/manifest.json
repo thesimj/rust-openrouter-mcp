@@ -2,9 +2,9 @@
   "manifest_version": "0.2",
   "name": "openrouter-mcp",
   "display_name": "OpenRouter - Models & Media",
-  "version": "0.9.0",
-  "description": "Discover OpenRouter models and generate images, video, speech, and music (and describe images) from Claude.",
-  "long_description": "A single Rust binary that exposes OpenRouter to Claude over MCP. Discover models with their capabilities and pricing, generate and edit images (with parallel seed-stepped variants and a sidecar manifest), generate video (text-to-video / image-to-video, async with poll-by-task_id), generate speech (text-to-speech), generate music (Google Lyria 3 via streamed audio output, with the per-track cost reported), transcribe audio, describe images (path/url/base64) with a vision model, send a prompt to any chat/text model, and track per-process usage. Bring your own OpenRouter API key.",
+  "version": "0.10.0",
+  "description": "Discover OpenRouter models and generate images, video, speech, and music, transcribe audio, embed and rerank text, and describe images from Claude.",
+  "long_description": "A single Rust binary that exposes OpenRouter to Claude over MCP. Discover models with their capabilities and pricing (server-side filters for category, provider, price, region, benchmarks), generate and edit images (with parallel seed-stepped variants and a sidecar manifest), generate video (text-to-video / image-to-video with audio and video references, async with poll-by-task_id), generate speech (text-to-speech, including stateless voice cloning), generate music (Google Lyria 3 via streamed audio output, with the per-track cost reported), transcribe audio (with provider options such as speaker diarization), embed text and rerank documents, describe images (path/url/base64) with a vision model, send a prompt with images, files, audio or video to any chat/text model (structured JSON output, web search, provider routing), look up the cost record of any request by its generation id, and track per-process usage. Every tool takes a `provider` object for routing and per-provider passthrough options. Bring your own OpenRouter API key.",
   "author": {
     "name": "Nick Bubelich",
     "url": "https://github.com/thesimj"
@@ -20,6 +20,8 @@
     "video-generation",
     "text-to-speech",
     "music-generation",
+    "embeddings",
+    "rerank",
     "vision",
     "models",
     "llm"
@@ -43,35 +45,47 @@
   "tools": [
     {
       "name": "list_models",
-      "description": "List available OpenRouter models with capabilities and pricing; filter and sort server-side."
+      "description": "List available OpenRouter models with capabilities and pricing; filter server-side by modality, category, provider, author, price, region, zdr, age and benchmark index, sort, and page with limit/offset."
     },
     {
       "name": "describe_model",
-      "description": "Get the full detail for a single model by id: description, architecture, context, benchmarks, and per-provider endpoints (pricing, uptime, supported parameters)."
+      "description": "Get the full detail for a single model by id: description, architecture, context, benchmarks, and per-provider endpoints (pricing, uptime, supported parameters, allowed_passthrough_parameters for provider options)."
     },
     {
       "name": "generate_image",
-      "description": "Generate or edit an image with an OpenRouter image model and save it to disk (parallel variants; input images by path, url, or base64/data-URL)."
+      "description": "Generate or edit an image with an OpenRouter image model and save it to disk (parallel variants; input images by path, url, or base64/data-URL; size as WIDTHxHEIGHT or aspect_ratio + image_size; provider routing and per-provider options)."
     },
     {
       "name": "generate_video",
-      "description": "Generate a video from a prompt (text-to-video) or from first/last frames (image-to-video) with an OpenRouter video model; runs async, poll get_result by task_id."
+      "description": "Generate a video from a prompt (text-to-video), from first/last frames (image-to-video, prompt optional), or from reference images/audio/video with an OpenRouter video model; upscaling and per-provider options; runs async, poll get_result by task_id."
     },
     {
       "name": "generate_audio",
-      "description": "Generate speech (text-to-speech) from text with an OpenRouter TTS model and save it to disk."
+      "description": "Generate speech (text-to-speech) from text with an OpenRouter TTS model and save it to disk; voice is provider-dependent and optional, voice cloning via a reference sample, per-provider options."
     },
     {
       "name": "generate_music",
-      "description": "Generate music from a text prompt with an OpenRouter music model (Google Lyria 3) and save the track to disk; synchronous, reports the per-track cost."
+      "description": "Generate music from a text prompt with an OpenRouter music model (Google Lyria 3) and save the track to disk; synchronous, reports the per-track cost; optional provider routing."
     },
     {
       "name": "transcribe_audio",
-      "description": "Transcribe speech to text (speech-to-text) from a local audio file with an OpenRouter STT model."
+      "description": "Transcribe speech to text (speech-to-text) from a local audio file with an OpenRouter STT model; per-provider options such as speaker diarization."
     },
     {
       "name": "chat_completion",
-      "description": "Send a prompt to any OpenRouter chat/text model and return its text reply; useful to route a sub-task to a different model. Optionally attach images for a vision-capable model (best-effort gated on the model's declared image-input support)."
+      "description": "Send a prompt to any OpenRouter chat/text model and return its text reply; useful to route a sub-task to a different model. Attach images, files (PDF), audio or video for a multimodal model; sampling controls, JSON schema / JSON mode output, web search, reasoning controls, provider routing."
+    },
+    {
+      "name": "embed_text",
+      "description": "Embed one or more texts with an OpenRouter embeddings model and return the float vectors with usage and cost."
+    },
+    {
+      "name": "rerank_documents",
+      "description": "Rerank candidate documents against a query with an OpenRouter rerank model; returns them best-first with relevance scores."
+    },
+    {
+      "name": "get_generation",
+      "description": "Look up OpenRouter's stored record of one request by its generation_id: actual cost, provider, native token counts, latency."
     },
     {
       "name": "get_result",
@@ -79,7 +93,7 @@
     },
     {
       "name": "describe_image",
-      "description": "Describe or answer questions about image(s) (by path, url, or base64/data-URL) with a vision-capable model."
+      "description": "Describe or answer questions about image(s) (by path, url, or base64/data-URL) with a vision-capable model; optional system, temperature, max_tokens, reasoning effort and provider routing."
     },
     {
       "name": "get_account",

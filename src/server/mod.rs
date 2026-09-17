@@ -97,7 +97,17 @@ impl ServerHandler for OpenRouterServer {
                 `generate_music` for music with an audio-output model such as \
                 google/lyria-3-clip-preview (find them with list_models \
                 output_modalities=\"audio\"), and `transcribe_audio` for speech-to-text \
-                (all three synchronous). \
+                (all three synchronous). `chat_completion` sends a prompt (with \
+                optional images, files, audio, video) to any chat model; `embed_text` \
+                returns embedding vectors and `rerank_documents` ranks documents \
+                against a query. Every tool takes a `provider` object: routing \
+                (order/only/ignore/allow_fallbacks/sort) on chat, images, embeddings \
+                and rerank, and per-provider passthrough `provider.options` keyed by \
+                provider slug on images, speech, transcription and video - \
+                `describe_model` lists each endpoint's allowed_passthrough_parameters, \
+                so check it before passing options. Every result carries a \
+                generation_id; `get_generation` returns OpenRouter's stored cost and \
+                latency record for it. \
                 If `generate_image` or `generate_video` returns status \"pending\" with \
                 a task_id, poll `get_result` until it is \"completed\". \
                 `get_usage_stats` reports this process's spend and counts.",
