@@ -51,10 +51,11 @@ pub(crate) struct GenerateMusicArgs {
     /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
-    /// Provider routing: {"order": [...], "only": [...], "ignore": [...],
-    /// "allow_fallbacks", "require_parameters", "zdr", "sort", "sort_partition"}.
-    /// Music is a chat completion, so this takes routing fields only - there
-    /// is no per-provider `options` passthrough.
+    /// Provider block for this request: routing only, as {"order": [...],
+    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
+    /// "zdr", "sort", "sort_partition"}. Music is a chat completion, so there is
+    /// no per-provider `options` passthrough (describe_model's
+    /// allowed_passthrough_parameters do not apply here).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }

@@ -143,10 +143,11 @@ pub(crate) struct ChatCompletionArgs {
     /// response (`reasoning.exclude`).
     #[serde(default, deserialize_with = "de_opt_bool")]
     pub reasoning_exclude: Option<bool>,
-    /// Provider routing: {"order": [...], "only": [...], "ignore": [...],
-    /// "allow_fallbacks", "require_parameters", "zdr", "sort", "sort_partition"}.
-    /// Chat completions take routing only - there is no per-provider `options`
-    /// passthrough on this endpoint.
+    /// Provider block for this request: routing only, as {"order": [...],
+    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
+    /// "zdr", "sort", "sort_partition"}. Chat completions have no per-provider
+    /// `options` passthrough (describe_model's allowed_passthrough_parameters
+    /// do not apply here).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }

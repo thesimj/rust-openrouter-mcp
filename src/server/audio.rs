@@ -55,8 +55,10 @@ pub(crate) struct TranscribeAudioArgs {
     /// Sampling temperature (select providers only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
-    /// Provider-specific passthrough: {"options": {"<provider-slug>": {...}}}.
-    /// Only the slug that serves the request is forwarded. Speaker diarization:
+    /// Provider block for this request: per-provider passthrough only, as
+    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
+    /// request is forwarded. Speaker diarization:
     /// {"options": {"deepgram": {"diarize": true}}} or
     /// {"options": {"azure": {"diarization": {"enabled": true}}}}; with
     /// response_format="verbose_json" the segments/words then carry a "speaker"
@@ -109,12 +111,13 @@ pub(crate) struct GenerateAudioArgs {
     /// improves cloning fidelity on models that use it. Needs a sample.
     #[serde(default)]
     pub voice_reference_text: Option<String>,
-    /// Provider-specific passthrough: {"options": {"<provider-slug>": {...}}}.
-    /// Only the slug that serves the request is forwarded. Examples: OpenAI
-    /// speaking-style instructions {"options": {"openai": {"instructions":
-    /// "speak like a calm narrator"}}}; Azure style {"options": {"azure":
-    /// {"style": "cheerful", "styledegree": 1.0}}}. Routing fields are ignored
-    /// by this endpoint.
+    /// Provider block for this request: per-provider passthrough only, as
+    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
+    /// request is forwarded. Examples: OpenAI speaking-style instructions
+    /// {"options": {"openai": {"instructions": "speak like a calm narrator"}}};
+    /// Azure style {"options": {"azure": {"style": "cheerful", "styledegree": 1.0}}}.
+    /// Routing fields are ignored by this endpoint.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderOptionsArgs,
     /// Output file path (extension corrected to the returned format, e.g. .mp3).

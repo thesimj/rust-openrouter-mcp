@@ -189,12 +189,12 @@ pub(crate) struct GenerateImageArgs {
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 0, max = 100))]
     pub output_compression: Option<u32>,
-    /// Provider routing and per-provider passthrough for the Images API:
-    /// {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks": bool,
+    /// Provider block for this request: routing plus per-provider passthrough,
+    /// as {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks": bool,
     /// "sort": "price"|"throughput"|"latency"|"exacto", "sort_partition":
     /// "model"|"none", "options": {"<provider-slug>": {...}}}. `options` is
-    /// keyed by provider slug and holds that provider's own parameters -
-    /// describe_model lists each endpoint's `allowed_passthrough_parameters` -
+    /// keyed by provider slug and holds that provider's own parameters;
+    /// describe_model lists each endpoint's allowed_passthrough_parameters,
     /// e.g. {"options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}}.
     /// Only the slug that serves the request is forwarded.
     #[serde(default, deserialize_with = "de_lenient")]
@@ -235,9 +235,11 @@ pub(crate) struct DescribeImageArgs {
     /// Optional maximum number of tokens to generate.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_tokens: Option<u64>,
-    /// Provider routing: {"order": [...], "only": [...], "ignore": [...],
-    /// "allow_fallbacks", "require_parameters", "zdr", "sort", "sort_partition"}.
-    /// Routing fields only - chat completions have no per-provider `options`.
+    /// Provider block for this request: routing only, as {"order": [...],
+    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
+    /// "zdr", "sort", "sort_partition"}. Chat completions have no per-provider
+    /// `options` passthrough (describe_model's allowed_passthrough_parameters
+    /// do not apply here).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }

@@ -37,10 +37,12 @@ pub(crate) struct EmbedTextArgs {
     /// Voyage). Omit when the model does not distinguish.
     #[serde(default)]
     pub input_type: Option<String>,
-    /// Provider routing: {"order": [slugs], "only": [slugs], "ignore": [slugs],
-    /// "allow_fallbacks": bool, "require_parameters": bool, "zdr": bool,
-    /// "sort": "price"|"throughput"|"latency"|"exacto", "sort_partition":
-    /// "model"|"none"}. This endpoint has no per-provider passthrough options.
+    /// Provider block for this request: routing only, as {"order": [slugs],
+    /// "only": [slugs], "ignore": [slugs], "allow_fallbacks": bool,
+    /// "require_parameters": bool, "zdr": bool, "sort":
+    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none"}.
+    /// This endpoint has no per-provider `options` passthrough (describe_model's
+    /// allowed_passthrough_parameters do not apply here).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -61,10 +63,12 @@ pub(crate) struct RerankDocumentsArgs {
     /// Return only the best N documents. Omit for every document, ranked.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub top_n: Option<u32>,
-    /// Provider routing: {"order": [slugs], "only": [slugs], "ignore": [slugs],
-    /// "allow_fallbacks": bool, "require_parameters": bool, "zdr": bool,
-    /// "sort": "price"|"throughput"|"latency"|"exacto", "sort_partition":
-    /// "model"|"none"}. This endpoint has no per-provider passthrough options.
+    /// Provider block for this request: routing only, as {"order": [slugs],
+    /// "only": [slugs], "ignore": [slugs], "allow_fallbacks": bool,
+    /// "require_parameters": bool, "zdr": bool, "sort":
+    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none"}.
+    /// This endpoint has no per-provider `options` passthrough (describe_model's
+    /// allowed_passthrough_parameters do not apply here).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }

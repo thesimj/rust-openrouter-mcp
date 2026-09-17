@@ -102,12 +102,12 @@ pub(crate) struct GenerateVideoArgs {
     /// Upscaling models only: output scale factor, must be > 0 (e.g. 2 for 2x).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub upscale_factor: Option<f64>,
-    /// Provider-specific passthrough: {"options": {"<provider-slug>": {...}}},
-    /// sent opaque and unchanged. OpenRouter's docs show BOTH
-    /// {"google-vertex": {"negativePrompt": "..."}} and
-    /// {"google-vertex": {"parameters": {"negativePrompt": "..."}}} - pass the
-    /// shape your provider expects; describe_model lists each endpoint's
-    /// allowed_passthrough_parameters. Routing fields are ignored by this endpoint.
+    /// Provider block for this request: per-provider passthrough only, as
+    /// {"options": {"<provider-slug>": {...}}}, sent opaque and unchanged;
+    /// describe_model lists each endpoint's allowed_passthrough_parameters.
+    /// OpenRouter's docs show BOTH {"google-vertex": {"negativePrompt": "..."}}
+    /// and {"google-vertex": {"parameters": {"negativePrompt": "..."}}} - pass
+    /// the shape your provider expects. Routing fields are ignored by this endpoint.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderOptionsArgs,
     /// Longest-side cap (px) for input frame/reference images (default 1536, max 4096).
