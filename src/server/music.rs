@@ -13,15 +13,18 @@ use serde_json::json;
 
 use crate::music_gen::{self, MusicGenRequest};
 use crate::server::naming;
+use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::{
     attach_warnings_errors, client_wants_inline_previews, inline_audio_block,
 };
-use crate::server::schema::{RequireFields, de_opt_uint, require_all, scalarize_nullable};
+use crate::server::schema::{
+    RequireFields, de_lenient, de_opt_uint, require_all, scalarize_nullable,
+};
 
 use super::OpenRouterServer;
 
 /// Arguments for the `generate_music` tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 #[schemars(transform = RequireFields(&["prompt"]))]
 pub(crate) struct GenerateMusicArgs {
@@ -48,6 +51,13 @@ pub(crate) struct GenerateMusicArgs {
     /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
+    /// Provider block for this request: routing only, as {"order": [...],
+    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
+    /// "zdr", "sort", "sort_partition"}. Music is a chat completion, so there is
+    /// no per-provider `options` passthrough (describe_model's
+    /// allowed_passthrough_parameters do not apply here).
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderRoutingArgs,
 }
 
 #[tool_router(router = music_router, vis = "pub(crate)")]
@@ -112,6 +122,7 @@ impl OpenRouterServer {
             prompt: prompt.unwrap_or_default().to_string(),
             format: args.format,
             seed: args.seed,
+            provider: args.provider.into_routing()?,
         };
         // The filename token is the requested format when there is one, run
         // through the same normalization run_job applies to the wire value so
@@ -196,7 +207,57 @@ mod tests {
             format: None,
             seed: Some(3),
             output: Some(output.to_string_lossy().into_owned()),
+            provider: Default::default(),
         }
+    }
+
+    /// Music is a chat call: `provider` goes out as the routing block, is
+    /// recorded in the manifest, and an invalid block is rejected before any
+    /// HTTP call.
+    #[tokio::test]
+    async fn generate_music_forwards_provider_routing_and_records_it() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "provider": {"order": ["google-vertex"], "allow_fallbacks": false}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(LYRIA_STREAM),
+            )
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-music-provider/track.mp3");
+        let args: GenerateMusicArgs = serde_json::from_value(serde_json::json!({
+            "model": "google/lyria-3-clip-preview",
+            "prompt": "warm lo-fi loop",
+            "output": out.to_string_lossy(),
+            "provider": {"order": ["google-vertex"], "allow_fallbacks": "false"}
+        }))
+        .unwrap();
+        let res = server.run_generate_music(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(v["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["provider"],
+            serde_json::json!({"order": ["google-vertex"], "allow_fallbacks": false})
+        );
+
+        let bad: GenerateMusicArgs = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "x", "provider": {"sort": "cheapest"}
+        }))
+        .unwrap();
+        let err = server_for("http://127.0.0.1:9".to_string())
+            .run_generate_music(bad, false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("sort"), "got: {}", err.message);
     }
 
     async fn lyria_mock() -> MockServer {

@@ -13,7 +13,8 @@ use crate::openrouter::{
 impl OpenRouterClient {
     /// `POST /api/v1/chat/completions` - used for text and vision (describe)
     /// calls. On a non-2xx status the upstream error body is surfaced verbatim
-    /// (OpenRouter wraps provider errors there).
+    /// (OpenRouter wraps provider errors there). The result's `id` is the
+    /// generation id: the `X-Generation-Id` header when present, else the body's.
     pub async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatCompletion> {
         let rb = self
             .http
@@ -25,11 +26,13 @@ impl OpenRouterClient {
             cost: None,
             generation_id: generation_id(&response),
         };
-        response
+        let mut completion: ChatCompletion = response
             .json()
             .await
             .context("failed to decode OpenRouter /chat/completions response")
-            .map_err(|error| receipt.attach(error))
+            .map_err(|error| receipt.clone().attach(error))?;
+        completion.id = receipt.generation_id.or(completion.id);
+        Ok(completion)
     }
 
     /// `POST /api/v1/chat/completions` with `stream: true` for an audio-output
@@ -132,15 +135,7 @@ mod tests {
             let error = client
                 .chat_completion(&ChatRequest {
                     model: "test/chat".into(),
-                    messages: vec![],
-                    modalities: None,
-                    image_config: None,
-                    seed: None,
-                    temperature: None,
-                    max_tokens: None,
-                    reasoning: None,
-                    audio: None,
-                    stream: false,
+                    ..Default::default()
                 })
                 .await
                 .expect_err("invalid response");
@@ -155,6 +150,47 @@ mod tests {
         }
     }
 
+    /// The generation id rides on the result so callers can close the cost
+    /// loop with `get_generation`: the `X-Generation-Id` header wins, the body
+    /// `id` stands in when the header is missing, and nothing invents one.
+    #[tokio::test]
+    async fn chat_completion_carries_the_generation_id_from_the_header_or_the_body() {
+        for (header, body_id, expected) in [
+            (Some("gen-header"), Some("gen-body"), Some("gen-header")),
+            (None, Some("gen-body"), Some("gen-body")),
+            (Some("gen-header"), None, Some("gen-header")),
+            (None, None, None),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = serde_json::json!({"choices": [{"message": {"content": "ok"}}]});
+            if let Some(id) = body_id {
+                body["id"] = serde_json::json!(id);
+            }
+            let mut template = ResponseTemplate::new(200).set_body_json(body);
+            if let Some(h) = header {
+                template = template.insert_header("x-generation-id", h);
+            }
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+            let completion = client
+                .chat_completion(&ChatRequest {
+                    model: "test/chat".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                completion.id.as_deref(),
+                expected,
+                "{header:?} / {body_id:?}"
+            );
+        }
+    }
+
     fn audio_request(model: &str) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
@@ -163,13 +199,8 @@ mod tests {
                 content: crate::openrouter::Content::Text("lo-fi loop".to_string()),
             }],
             modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            image_config: None,
-            seed: None,
-            temperature: None,
-            max_tokens: None,
-            reasoning: None,
-            audio: None,
             stream: true,
+            ..Default::default()
         }
     }
 

@@ -130,6 +130,8 @@ async fn generate_image_sends_request_and_decodes_response() {
         output_format: None,
         background: None,
         output_compression: None,
+        size: None,
+        provider: None,
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!((img.width, img.height), (1, 1));
@@ -165,6 +167,8 @@ async fn generate_image_maps_half_k_resolution() {
         output_format: None,
         background: None,
         output_compression: None,
+        size: None,
+        provider: None,
     };
     assert!(generate_image(&client, &req).await.is_ok());
 }
@@ -193,6 +197,8 @@ async fn generate_image_surfaces_provider_error() {
         output_format: None,
         background: None,
         output_compression: None,
+        size: None,
+        provider: None,
     };
     let err = generate_image(&client, &req).await.unwrap_err();
     assert!(err.to_string().contains("Internal Server Error"));
@@ -223,7 +229,7 @@ async fn describe_image_sends_image_and_returns_text() {
             None,
         )],
         max_image_dimension: 800,
-        reasoning_effort: None,
+        ..Default::default()
     };
     let result = describe_image(&client, &req).await.unwrap();
     assert_eq!(result.text, "A small green lizard.");
@@ -274,6 +280,7 @@ async fn captured_describe_body(
         )],
         max_image_dimension,
         reasoning_effort: reasoning_effort.map(str::to_string),
+        ..Default::default()
     };
     describe_image(&client, &req).await.unwrap();
     server.received_requests().await.unwrap()[0]
@@ -345,9 +352,50 @@ async fn describe_image_requires_an_image() {
         prompt: "p".to_string(),
         images: vec![],
         max_image_dimension: 800,
-        reasoning_effort: None,
+        ..Default::default()
     };
     assert!(describe_image(&client, &req).await.is_err());
+}
+
+/// The knobs `describe_image` used to hardcode to `None` now reach the wire:
+/// a system message ahead of the user turn, temperature, max_tokens, and
+/// the provider routing block.
+#[tokio::test]
+async fn describe_image_forwards_system_sampling_and_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "messages": [{ "role": "system", "content": "be brief" }, { "role": "user" }],
+            "temperature": 0.2,
+            "max_tokens": 50,
+            "provider": { "only": ["google-vertex"] }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let req = DescribeRequest {
+        model: "google/gemini-2.5-flash".to_string(),
+        prompt: "What is this?".to_string(),
+        images: vec![InputImage::from_path(
+            temp_png("openrouter-mcp-test-describe-knobs.png"),
+            None,
+        )],
+        max_image_dimension: 800,
+        system: Some("be brief".to_string()),
+        temperature: Some(0.2),
+        max_tokens: Some(50),
+        provider: Some(crate::openrouter::ProviderRouting {
+            only: vec!["google-vertex".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    describe_image(&client, &req).await.unwrap();
 }
 
 #[tokio::test]
@@ -377,6 +425,8 @@ async fn generate_image_honors_declared_media_type_for_vector() {
         output_format: None,
         background: None,
         output_compression: None,
+        size: None,
+        provider: None,
     };
     let img = generate_image(&client, &req).await.unwrap();
     // media_type is trusted over sniffing, and SVG dimensions come from the viewBox.
@@ -416,6 +466,8 @@ async fn generate_image_treats_image_jpg_as_an_alias_of_image_jpeg_no_warning() 
         output_format: None,
         background: None,
         output_compression: None,
+        size: None,
+        provider: None,
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!(img.mime, "image/jpeg");
@@ -452,8 +504,82 @@ async fn generate_image_passes_through_quality_format_background_compression() {
         output_format: Some("webp".to_string()),
         background: Some("transparent".to_string()),
         output_compression: Some(80),
+        size: None,
+        provider: None,
     };
     assert!(generate_image(&client, &req).await.is_ok());
+}
+
+/// The `/images` `provider` block (routing subset + `options` keyed by slug)
+/// and `size` reach the wire nested exactly as OpenRouter documents them.
+#[tokio::test]
+async fn generate_image_sends_provider_and_size() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images"))
+        .and(body_partial_json(json!({
+            "size": "2048x2048",
+            "provider": {
+                "order": ["black-forest-labs"],
+                "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "b64_json": PNG_1X1_B64 }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let mut options = std::collections::BTreeMap::new();
+    options.insert(
+        "black-forest-labs".to_string(),
+        json!({"steps": 28, "guidance": 3.5}),
+    );
+    let req = GenerateRequest {
+        model: "black-forest-labs/flux.2-pro".to_string(),
+        prompt: "p".to_string(),
+        aspect_ratio: None,
+        image_size: None,
+        seed: None,
+        images: vec![],
+        max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
+        size: Some("2048x2048".to_string()),
+        provider: Some(crate::openrouter::ImageProvider {
+            order: vec!["black-forest-labs".to_string()],
+            options,
+            ..Default::default()
+        }),
+    };
+    assert!(generate_image(&client, &req).await.is_ok());
+    let body: serde_json::Value =
+        serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+    // Unset routing fields are omitted, not sent as null/empty.
+    assert!(body["provider"].get("only").is_none(), "got: {body}");
+    assert!(body["provider"].get("sort").is_none(), "got: {body}");
+    assert!(body.get("resolution").is_none(), "got: {body}");
+}
+
+/// A pixel-form `size` together with `image_size` or `aspect_ratio` is the
+/// combination OpenRouter rejects with 400; the shared check refuses it locally
+/// and names the conflict. Tier-form sizes and lone pixel sizes pass.
+#[test]
+fn size_conflict_check_rejects_pixels_plus_tier_or_ratio() {
+    let err = check_size_conflict(Some("2048x2048"), Some("1K"), None).unwrap_err();
+    assert!(err.to_string().contains("size"), "got: {err}");
+    assert!(err.to_string().contains("image_size"), "got: {err}");
+    assert!(err.to_string().contains("400"), "got: {err}");
+    let err = check_size_conflict(Some("1024X768"), None, Some("4:3")).unwrap_err();
+    assert!(err.to_string().contains("aspect_ratio"), "got: {err}");
+
+    assert!(check_size_conflict(Some("2048x2048"), None, None).is_ok());
+    assert!(check_size_conflict(Some("2K"), Some("2K"), Some("1:1")).is_ok());
+    assert!(check_size_conflict(None, Some("1K"), Some("1:1")).is_ok());
+    assert!(check_size_conflict(Some("  "), Some("1K"), Some("1:1")).is_ok());
 }
 
 #[test]

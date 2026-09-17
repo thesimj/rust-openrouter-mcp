@@ -30,6 +30,13 @@ pub struct Manifest {
     pub background: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_compression: Option<u32>,
+    /// Requested `size` ("WIDTHxHEIGHT" pixels or a tier), when one was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// The `provider` block sent with the request (routing + passthrough
+    /// options), when one was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ImageProvider>,
     pub created_at: String,
     pub input_images: Vec<InputImageMeta>,
     pub variants: Vec<VariantMeta>,
@@ -113,8 +120,10 @@ pub struct VideoManifest {
     pub generation_id: Option<String>,
     pub cost: Option<f64>,
     pub model: String,
-    pub prompt: String,
-    /// `inline`, `file`, or `stdin`.
+    /// Absent for image-only requests (a frame or reference and no text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// `inline`, `file`, `stdin`, or `none`.
     pub prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u32>,
@@ -131,7 +140,21 @@ pub struct VideoManifest {
     pub max_image_dimension: u32,
     pub created_at: String,
     pub frame_images: Vec<FrameImageMeta>,
+    /// Reference image sources (local paths).
     pub input_references: Vec<String>,
+    /// Reference audio sources (URLs or local paths), as given.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_audio: Vec<String>,
+    /// Reference video sources (URLs or local paths), as given.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_videos: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creativity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upscale_factor: Option<f64>,
+    /// The `provider` block sent with the job (options-only for `/videos`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderOptions>,
     pub clips: Vec<VideoClipMeta>,
 }
 
@@ -175,10 +198,19 @@ pub struct AudioManifest {
     pub input: String,
     /// `inline`, `file`, or `stdin`.
     pub input_source: String,
-    pub voice: String,
+    /// The voice id sent, when one was (voice-cloning models take none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// True when a voice-cloning `input_references` sample was sent. The
+    /// sample itself is not recorded (it can be megabytes of base64).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub voice_reference: bool,
     pub response_format: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
+    /// The `provider` block sent, when one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderOptions>,
     pub created_at: String,
     pub output: AudioOutputMeta,
 }
@@ -196,6 +228,9 @@ pub struct MusicManifest {
     pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// The provider routing block sent, when one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderRouting>,
     /// What the model streamed as `content` (lyrics or `<instrumental>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,

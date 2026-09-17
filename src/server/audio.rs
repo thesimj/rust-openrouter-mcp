@@ -1,6 +1,6 @@
 //! The `generate_audio` text-to-speech tool and its argument struct.
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -14,10 +14,14 @@ use serde_json::json;
 
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
+use crate::server::provider::ProviderOptionsArgs;
 use crate::server::result::{client_wants_inline_previews, inline_audio_block};
-use crate::server::schema::{RequireFields, de_opt_f64, require_all, scalarize_nullable};
+use crate::server::schema::{
+    RequireFields, de_lenient, de_opt_f64, require_all, scalarize_nullable,
+};
 
 use super::OpenRouterServer;
+use super::media;
 
 /// Arguments for the `transcribe_audio` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,12 +56,23 @@ pub(crate) struct TranscribeAudioArgs {
     /// Sampling temperature (select providers only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
+    /// Provider block for this request: per-provider passthrough only, as
+    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
+    /// request is forwarded. Speaker diarization:
+    /// {"options": {"deepgram": {"diarize": true}}} or
+    /// {"options": {"azure": {"diarization": {"enabled": true}}}}; with
+    /// response_format="verbose_json" the segments/words then carry a "speaker"
+    /// index. Groq takes vocabulary hints as {"options": {"groq": {"prompt": "..."}}}.
+    /// Routing fields are ignored by this endpoint.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderOptionsArgs,
 }
 
 /// Arguments for the `generate_audio` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-#[schemars(transform = RequireFields(&["input", "voice"]))]
+#[schemars(transform = RequireFields(&["input"]))]
 pub(crate) struct GenerateAudioArgs {
     /// TTS model id, e.g. "hexgrad/kokoro-82m". Voice ids are model-specific, so
     /// pair this with a voice the model actually declares - `list_models` with
@@ -66,8 +81,10 @@ pub(crate) struct GenerateAudioArgs {
     /// REQUIRED (no default): the text to synthesize.
     #[serde(default)]
     pub input: Option<String>,
-    /// REQUIRED (no default): voice id, valid only for the chosen model
-    /// (e.g. "af_heart" for hexgrad/kokoro-82m).
+    /// Voice id, valid only for the chosen model (e.g. "af_heart" for
+    /// hexgrad/kokoro-82m). Provider-dependent: most TTS models have NO default
+    /// voice and fail without one, so pass it unless the model clones a voice
+    /// from `voice_reference` instead (e.g. fish-audio).
     #[serde(default)]
     pub voice: Option<String>,
     /// Output audio format: "mp3" (default) or "pcm".
@@ -76,6 +93,27 @@ pub(crate) struct GenerateAudioArgs {
     /// Playback speed (select models only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub speed: Option<f64>,
+    /// Stateless voice cloning: the audio sample whose voice to imitate, as
+    /// {"path": "<local file>"} (wav, mp3, flac, m4a, ogg, webm, aac; format
+    /// inferred from the extension) or {"base64": "<base64 or data: URL>",
+    /// "format"?: "wav"} (15 MiB decoded max; the format is optional and
+    /// omitted from the request when unknown). Omit for no cloning. Sent as
+    /// `input_references`; needs no `voice`.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub voice_reference: media::AudioInput,
+    /// Transcript of the voice reference sample (max 10000 characters);
+    /// improves cloning fidelity on models that use it. Needs `voice_reference`.
+    #[serde(default)]
+    pub voice_reference_text: Option<String>,
+    /// Provider block for this request: per-provider passthrough only, as
+    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
+    /// request is forwarded. Examples: OpenAI speaking-style instructions
+    /// {"options": {"openai": {"instructions": "speak like a calm narrator"}}};
+    /// Azure style {"options": {"azure": {"style": "cheerful", "styledegree": 1.0}}}.
+    /// Routing fields are ignored by this endpoint.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderOptionsArgs,
     /// Output file path (extension corrected to the returned format, e.g. .mp3).
     /// Optional: when omitted, an auto-named file is written under
     /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
@@ -89,10 +127,19 @@ impl OpenRouterServer {
         description = "Generate speech (text-to-speech) with an OpenRouter TTS model (e.g. \
         hexgrad/kokoro-82m with voice af_heart) and save the audio to `output`. This is a \
         synchronous call that waits for the provider response. No defaults for the required fields: \
-        model, input (the text), and voice must all be specified, or the call fails naming what is \
-        missing. Voice ids are model-specific and are not interchangeable between models - \
-        call list_models with output_modalities=speech to see each model's supported_voices. \
-        `output` is optional - omit it for an auto-named file under \
+        model and input (the text) must be specified, or the call fails naming what is missing. \
+        `voice` is provider-dependent: most TTS models have no default voice and fail without \
+        one, so pass it unless the model clones a voice instead. Voice ids are model-specific and \
+        are not interchangeable between models - call list_models with output_modalities=speech \
+        to see each model's supported_voices. Stateless voice cloning (e.g. fish-audio models): \
+        pass the sample as `voice_reference` ({\"path\": ...} for a local file, or \
+        {\"base64\": ..., \"format\"?: ...} for inline data or a data: URL; 15 MiB decoded max), \
+        optionally with `voice_reference_text` (its transcript, max 10000 characters); it is \
+        sent as `input_references` and needs no `voice`. Provider-specific \
+        settings go in `provider.options` keyed by provider slug, e.g. \
+        {\"openai\": {\"instructions\": \"speak like a calm narrator\"}} for OpenAI speaking-style \
+        instructions or {\"azure\": {\"style\": \"cheerful\", \"styledegree\": 1.0}} for Azure \
+        styles. `output` is optional - omit it for an auto-named file under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp). Returns the saved file path in JSON; for sandboxed clients it also returns a \
         native inline audio content block when the file is small enough. response_format defaults \
         to mp3 so the extension is deterministic.",
@@ -120,7 +167,9 @@ impl OpenRouterServer {
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        // No defaults: input and voice are the things agents forget.
+        // No defaults: input is the thing agents forget. `voice` is optional
+        // because it is provider-dependent (cloning models take none); a model
+        // that needs one rejects the request upstream with its own message.
         let mut missing: Vec<&str> = Vec::new();
         if args
             .input
@@ -131,30 +180,24 @@ impl OpenRouterServer {
         {
             missing.push("input (the text to synthesize)");
         }
-        if args
-            .voice
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        {
-            missing.push(
-                "voice (model-specific voice id, e.g. \"af_heart\" for hexgrad/kokoro-82m; \
-                 see supported_voices in list_models)",
-            );
-        }
         require_all("generate_audio", "speech", &missing)?;
+
+        let provider = args.provider.into_options()?;
+        let voice_reference =
+            resolve_voice_reference(args.voice_reference, args.voice_reference_text).await?;
 
         let model = args.model.clone();
         let req = SpeechGenRequest {
             model: args.model,
             input: args.input.unwrap_or_default(),
-            voice: args.voice.unwrap_or_default(),
+            voice: args.voice,
             response_format: args.response_format,
             speed: args.speed,
+            voice_reference,
+            provider,
         };
-        // Same normalization run_job applies to the wire value, so the
-        // auto-filename token never diverges from what is actually sent.
+        // Same normalization run_job applies to the wire values, so the
+        // auto-filename tokens never diverge from what is actually sent.
         let fmt = req
             .response_format
             .as_deref()
@@ -162,12 +205,18 @@ impl OpenRouterServer {
             .filter(|s| !s.is_empty())
             .map(str::to_ascii_lowercase)
             .unwrap_or_else(|| "mp3".to_string());
-        let fmt = fmt.as_str();
+        let mut tokens: Vec<&str> = Vec::new();
+        if let Some(voice) = req.voice.as_deref().map(str::trim)
+            && !voice.is_empty()
+        {
+            tokens.push(voice);
+        }
+        tokens.push(fmt.as_str());
         let output = naming::resolve_output_base(
             args.output,
             naming::MediaKind::Audio,
             &model,
-            &[req.voice.as_str(), fmt],
+            &tokens,
             None,
         );
 
@@ -221,7 +270,10 @@ impl OpenRouterServer {
         response object (language, duration, segments, words, ...) instead - this needs an \
         OpenAI-compatible provider; other providers reject it with a 400. \
         timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
-        an OpenAI-compatible provider. Discover \
+        an OpenAI-compatible provider. Provider-specific settings go in `provider.options` keyed \
+        by provider slug - e.g. speaker diarization with {\"deepgram\": {\"diarize\": true}} or \
+        {\"azure\": {\"diarization\": {\"enabled\": true}}}; when the provider diarizes, \
+        verbose_json segments and words carry a \"speaker\" index. Discover \
         STT models with list_models using output_modalities=\"transcription\" - they are not in \
         the default model list. To create speech from text instead, use generate_audio.",
         annotations(
@@ -263,35 +315,21 @@ impl OpenRouterServer {
 
 /// Resolve `transcribe_audio` arguments to a [`audio_gen::TranscribeRequest`]:
 /// exactly one source, base64 decoded from a `data:` URL when given as one, and
-/// the format taken from the argument, the data URL, or the file extension.
+/// the format taken from the argument, the data URL, or the file extension -
+/// through the same [`media::load_audio_input`] the chat `audio` parts use.
 async fn resolve_transcribe_request(
     args: TranscribeAudioArgs,
 ) -> anyhow::Result<audio_gen::TranscribeRequest> {
-    let path = args.path.filter(|s| !s.trim().is_empty());
-    let inline = args.base64.filter(|s| !s.trim().is_empty());
-    let (data, format) = match (path, inline) {
-        (Some(p), None) => {
-            audio_gen::read_audio_file(std::path::Path::new(&p), args.format.as_deref()).await?
-        }
-        (None, Some(b64)) => {
-            // Tolerate a `data:audio/mp3;base64,...` URL: upstream wants the raw
-            // bytes, and the subtype is a usable format when none was passed.
-            let (from_url, data) = if b64.trim().starts_with("data:") {
-                let (mime, data) = crate::image_io::split_data_url(&b64)?;
-                (
-                    mime.rsplit('/').next().map(str::to_string),
-                    data.trim().to_string(),
-                )
-            } else {
-                (None, b64.trim().to_string())
-            };
-            let format = args.format.or(from_url).context(
-                "base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)",
-            )?;
-            (data, format)
-        }
-        _ => bail!("transcribe_audio needs exactly one of: path or base64"),
+    let source = media::AudioInput {
+        path: args.path,
+        base64: args.base64,
+        format: args.format,
     };
+    let (data, format) = media::load_audio_input(source)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let format = format
+        .context("base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)")?;
 
     Ok(audio_gen::TranscribeRequest {
         model: args.model,
@@ -301,7 +339,38 @@ async fn resolve_transcribe_request(
         response_format: args.response_format,
         timestamp_granularities: args.timestamp_granularities,
         temperature: args.temperature,
+        provider: args
+            .provider
+            .into_options()
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?,
     })
+}
+
+/// Resolve the `voice_reference` object (plus `voice_reference_text`) of
+/// `generate_audio` to a validated [`audio_gen::VoiceReference`], or `None`
+/// when the object is empty. The sample is loaded like any other audio input
+/// ([`media::load_audio_input`]); its format may stay unknown for inline data
+/// (the endpoint does not require it) and [`audio_gen::VoiceReference::new`]
+/// applies the 15 MiB / 10000-character caps. Shared with the CLI.
+pub(crate) async fn resolve_voice_reference(
+    reference: media::AudioInput,
+    text: Option<String>,
+) -> Result<Option<audio_gen::VoiceReference>, ErrorData> {
+    let text = text.filter(|t| !t.trim().is_empty());
+    if reference.is_empty() {
+        if text.is_some() {
+            return Err(ErrorData::invalid_params(
+                "voice_reference_text needs a sample: pass voice_reference with exactly one \
+                 of path or base64",
+                None,
+            ));
+        }
+        return Ok(None);
+    }
+    let (data, format) = media::load_audio_input(reference).await?;
+    audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref())
+        .map(Some)
+        .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))
 }
 
 #[cfg(test)]
@@ -311,8 +380,23 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[tokio::test]
-    async fn generate_audio_synthesizes_and_returns_path_json() {
+    /// The classic generate_audio call: text + voice, everything else unset.
+    fn speech_args(out: &std::path::Path) -> GenerateAudioArgs {
+        GenerateAudioArgs {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: Some("hello".to_string()),
+            voice: Some("alloy".to_string()),
+            response_format: None,
+            speed: None,
+            voice_reference: Default::default(),
+            voice_reference_text: None,
+            provider: Default::default(),
+            output: Some(out.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// A mock speech endpoint that returns a tiny MP3 for any body.
+    async fn mock_speech() -> MockServer {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/audio/speech"))
@@ -323,17 +407,15 @@ mod tests {
             )
             .mount(&mock)
             .await;
+        mock
+    }
 
+    #[tokio::test]
+    async fn generate_audio_synthesizes_and_returns_path_json() {
+        let mock = mock_speech().await;
         let server = server_for(mock.uri());
         let out = std::env::temp_dir().join("openrouter-mcp-audio-tool/voice.mp3");
-        let args = GenerateAudioArgs {
-            model: "openai/gpt-4o-mini-tts".to_string(),
-            input: Some("hello".to_string()),
-            voice: Some("alloy".to_string()),
-            response_format: None,
-            speed: None,
-            output: Some(out.to_string_lossy().into_owned()),
-        };
+        let args = speech_args(&out);
         // inline_previews=false -> JSON only, no embedded audio block.
         let res = server.run_generate_audio(args, false).await.unwrap();
         let v = tool_result_json(&res);
@@ -350,27 +432,10 @@ mod tests {
 
     #[tokio::test]
     async fn generate_audio_embeds_inline_audio_block_for_sandboxed_clients() {
-        let mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/audio/speech"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "audio/mpeg")
-                    .set_body_bytes(b"ID3-FAKE".to_vec()),
-            )
-            .mount(&mock)
-            .await;
-
+        let mock = mock_speech().await;
         let server = server_for(mock.uri());
         let out = std::env::temp_dir().join("openrouter-mcp-audio-inline/voice.mp3");
-        let args = GenerateAudioArgs {
-            model: "openai/gpt-4o-mini-tts".to_string(),
-            input: Some("hello".to_string()),
-            voice: Some("alloy".to_string()),
-            response_format: None,
-            speed: None,
-            output: Some(out.to_string_lossy().into_owned()),
-        };
+        let args = speech_args(&out);
         // inline_previews=true (a sandboxed client like Claude Desktop): the
         // small file is embedded as a native audio content block alongside JSON.
         let res = server.run_generate_audio(args, true).await.unwrap();
@@ -416,6 +481,7 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
@@ -441,6 +507,7 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             })
         };
 
@@ -516,6 +583,7 @@ mod tests {
                 response_format: Some("verbose_json".to_string()),
                 timestamp_granularities: vec!["word".to_string(), "segment".to_string()],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
@@ -561,6 +629,7 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
@@ -568,21 +637,267 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "from disk");
     }
 
+    /// The diarization recipe from the tool description reaches the wire as
+    /// `provider.options.<slug>`, nested exactly as OpenRouter documents it.
     #[tokio::test]
-    async fn generate_audio_requires_input_and_voice() {
+    async fn transcribe_audio_forwards_provider_options_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "deepgram/nova-3",
+                "provider": { "options": { "deepgram": { "diarize": true } } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello there",
+                "segments": [{"id": 0, "text": "hello there", "speaker": 0}]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        // Deserialized the way a client sends it, so the nested object goes
+        // through the lenient path rather than a hand-built struct.
+        let args: TranscribeAudioArgs = serde_json::from_value(serde_json::json!({
+            "model": "deepgram/nova-3",
+            "base64": "data:audio/mp3;base64,QUJD",
+            "provider": { "options": { "deepgram": { "diarize": true } } }
+        }))
+        .unwrap();
+        let res = server.transcribe_audio(Parameters(args)).await.unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["content"][0]["text"], "hello there");
+    }
+
+    /// The shared fixture later phases reuse produces exactly the block it
+    /// promises, and an invalid block is rejected before any HTTP call.
+    #[tokio::test]
+    async fn transcribe_audio_uses_the_shared_provider_fixture_and_rejects_bad_options() {
+        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "provider": expected }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })),
+            )
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let args = |provider| TranscribeAudioArgs {
+            model: "m".to_string(),
+            path: None,
+            base64: Some("data:audio/mp3;base64,QUJD".to_string()),
+            format: None,
+            language: None,
+            response_format: None,
+            timestamp_granularities: vec![],
+            temperature: None,
+            provider,
+        };
+        server
+            .transcribe_audio(Parameters(args(provider)))
+            .await
+            .unwrap();
+
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("deepgram".to_string(), serde_json::json!("diarize"));
+        let err = server
+            .transcribe_audio(Parameters(args(
+                crate::server::provider::ProviderOptionsArgs { options },
+            )))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("deepgram"), "got: {}", err.message);
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generate_audio_requires_input_but_not_voice() {
         // Validation runs before any HTTP call.
         let server = server_for("http://127.0.0.1:9".to_string());
-        let args = GenerateAudioArgs {
-            model: "m".to_string(),
-            input: None,
-            voice: Some("  ".to_string()), // blank-after-trim counts as missing
-            response_format: None,
-            speed: None,
-            output: Some("out.mp3".to_string()),
-        };
+        let mut args = speech_args(std::path::Path::new("out.mp3"));
+        args.input = None;
+        args.voice = Some("  ".to_string()); // blank voice is simply "no voice"
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert!(err.message.contains("input"));
-        assert!(err.message.contains("voice"));
+        assert!(!err.message.contains("voice"), "got: {}", err.message);
         assert!(err.message.contains("no defaults"));
+    }
+
+    /// The `provider.options` recipe from the tool description reaches the
+    /// wire under `provider`, via the shared fixture every options-only tool uses.
+    #[tokio::test]
+    async fn generate_audio_forwards_provider_options_to_the_wire() {
+        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "voice": "alloy", "provider": expected }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-provider/voice.mp3");
+        let mut args = speech_args(&out);
+        args.provider = provider;
+        let res = server.run_generate_audio(args, false).await.unwrap();
+        assert_eq!(tool_result_json(&res)["ok"], true);
+
+        // An invalid block is rejected as invalid params before any HTTP call.
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("openai".to_string(), serde_json::json!("cheerful"));
+        let mut args = speech_args(&out);
+        args.provider = crate::server::provider::ProviderOptionsArgs { options };
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("openai"), "got: {}", err.message);
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Stateless voice cloning: a base64 sample (data URL tolerated, its
+    /// subtype supplying the format) plus a transcript become the two
+    /// `input_references` parts, and no `voice` is sent when none is given.
+    #[tokio::test]
+    async fn generate_audio_sends_a_voice_reference_without_a_voice() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "fish-audio/s1",
+                "input": "hello",
+                "input_references": [
+                    {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}},
+                    {"type": "text", "text": "the sample words"}
+                ]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-clone/voice.mp3");
+        // Deserialized the way a client sends it: no voice key at all.
+        let args: GenerateAudioArgs = serde_json::from_value(serde_json::json!({
+            "model": "fish-audio/s1",
+            "input": "hello",
+            "voice_reference": {"base64": "data:audio/wav;base64,QUJD"},
+            "voice_reference_text": "the sample words",
+            "output": out.to_string_lossy(),
+        }))
+        .unwrap();
+        let res = server.run_generate_audio(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["ok"], true);
+        assert!(v["audio"]["voice"].is_null(), "got: {v}");
+
+        let sent: serde_json::Value = mock.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(sent.get("voice").is_none(), "sent: {sent}");
+    }
+
+    /// A reference read from disk infers its format from the extension, like
+    /// transcribe_audio (`voice_reference.format` would override it). The
+    /// nested object arrives the way a stringifying client sends it.
+    #[tokio::test]
+    async fn generate_audio_reads_a_voice_reference_file() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "input_references": [
+                    {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "flac"}}
+                ]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let file = std::env::temp_dir().join("openrouter-mcp-voice-ref.flac");
+        std::fs::write(&file, b"ABC").unwrap();
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-clone-file/voice.mp3");
+        let mut args = speech_args(&out);
+        args.voice_reference = serde_json::from_value(serde_json::json!({
+            "path": file.to_string_lossy()
+        }))
+        .unwrap();
+        server.run_generate_audio(args, false).await.unwrap();
+        // Exactly one part: no transcript was given, so no text part is sent.
+        let sent: serde_json::Value = mock.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert_eq!(sent["input_references"].as_array().unwrap().len(), 1);
+    }
+
+    /// Reference validation is a caller error (invalid params), caught before
+    /// any HTTP call: an over-long transcript, two sources, a transcript or
+    /// format with no sample, and inline data with no usable format is fine.
+    #[tokio::test]
+    async fn generate_audio_rejects_bad_voice_references_as_invalid_params() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let out = std::path::Path::new("out.mp3");
+
+        let mut args = speech_args(out);
+        args.voice_reference.base64 = Some("QUJD".to_string());
+        args.voice_reference_text = Some("x".repeat(10_001));
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("10000"), "got: {}", err.message);
+
+        let mut args = speech_args(out);
+        args.voice_reference.base64 = Some("QUJD".to_string());
+        args.voice_reference.path = Some("sample.wav".to_string());
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("exactly one of"),
+            "got: {}",
+            err.message
+        );
+
+        let mut args = speech_args(out);
+        args.voice_reference_text = Some("orphan transcript".to_string());
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("voice_reference"),
+            "got: {}",
+            err.message
+        );
+
+        // A format with no sample is a malformed reference, not an absent one.
+        let mut args = speech_args(out);
+        args.voice_reference.format = Some("wav".to_string());
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("exactly one of"),
+            "got: {}",
+            err.message
+        );
+
+        let mut args = speech_args(out);
+        args.voice_reference.base64 = Some("not base64!".to_string());
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }

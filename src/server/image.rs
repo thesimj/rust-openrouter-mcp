@@ -1,9 +1,6 @@
 //! Image tools (`generate_image`, `describe_image`), their argument structs, the
 //! shared `ImageInput` type, and the image-job result builder.
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-
-use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -17,24 +14,17 @@ use serde_json::json;
 
 use crate::image_gen::{self, GenerateRequest};
 use crate::server::naming;
+use crate::server::provider::{ImageProviderArgs, ProviderRoutingArgs};
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
 use crate::server::schema::{
-    AtLeastOneOf, RequireFields, de_opt_uint, require_all, scalarize_nullable,
+    AtLeastOneOf, de_lenient, de_opt_f64, de_opt_uint, require_all, scalarize_nullable,
 };
 use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
-
-/// Hard ceiling for images fetched from third-party URLs. Input images are
-/// downscaled to the resolved dimension cap before use, so accepting
-/// arbitrarily large source bodies only increases memory pressure.
-const MAX_REMOTE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-
-/// Total deadline for one remote-image fetch, sized against the ceiling above:
-/// 20 MB inside 30s is ~5 Mbit/s, slower than any host worth waiting for.
-const REMOTE_IMAGE_TIMEOUT_SECS: u64 = 30;
+use super::media;
 
 /// An input image for editing / image-to-image / vision. Exactly one of
 /// `path`, `url`, or `base64` must be set. Order is preserved.
@@ -56,218 +46,41 @@ pub(crate) struct ImageInput {
     pub label: Option<String>,
 }
 
-/// Decode an inline `base64`/data-URL argument to raw bytes.
-fn decode_inline(data: &str) -> Result<Vec<u8>, ErrorData> {
-    let data = data.trim();
-    let payload = if data.starts_with("data:") {
-        data.split_once(',').map(|(_, body)| body).unwrap_or(data)
-    } else {
-        data
-    };
-    if payload.len() > crate::resources::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-        return Err(ErrorData::invalid_params(
-            "inline image exceeds 20 MiB",
-            None,
-        ));
-    }
-    let bytes = if data.starts_with("data:") {
-        crate::image_io::parse_data_url(data)
-            .map(|(_mime, bytes)| bytes)
-            .map_err(|e| ErrorData::invalid_params(format!("invalid data URL: {e}"), None))
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| ErrorData::invalid_params(format!("invalid base64 image data: {e}"), None))
-    }?;
-    if bytes.len() > crate::resources::MAX_IMAGE_BYTES {
-        return Err(ErrorData::invalid_params(
-            "inline image exceeds 20 MiB",
-            None,
-        ));
-    }
-    Ok(bytes)
-}
-
-/// True for IPs a fetched URL must never reach (SSRF guard): loopback, private
-/// (RFC1918), CGNAT (100.64/10), link-local (incl. cloud metadata 169.254.169.254),
-/// unspecified, broadcast, documentation, multicast, and IPv6 ULA/link-local.
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                || o[0] == 0
-                || o[0] >= 240
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(v4));
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-        }
-    }
-}
-
-/// Fetch an image URL's bytes with a plain client. Deliberately does NOT use the
-/// OpenRouter-authenticated client, so the API key is never sent to a
-/// third-party URL. SSRF-hardened: only http/https; the host is resolved and
-/// rejected if it points at a private/loopback/link-local address; redirects are
-/// disabled; and the connection is pinned to the validated IP so DNS can't be
-/// rebound between the check and the request.
-async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
-    let invalid = |msg: String| ErrorData::invalid_params(msg, None);
-
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| invalid(format!("invalid image url: {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid(format!("image url must be http(s): {url}")));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| invalid("image url has no host".to_string()))?
-        .to_string();
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS);
-
-    // Resolve off the async runtime, then refuse internal/private targets.
-    let lookup = host.clone();
-    let addrs: Vec<SocketAddr> = tokio::time::timeout_at(
-        deadline,
-        crate::resources::run_blocking(move || {
-            Ok((lookup.as_str(), port)
-                .to_socket_addrs()?
-                .collect::<Vec<_>>())
-        }),
-    )
-    .await
-    .map_err(|_| invalid("image URL DNS lookup timed out".to_string()))?
-    .map_err(|e| invalid(format!("could not resolve image url host: {e}")))?;
-
-    if addrs.is_empty() {
-        return Err(invalid("image url host did not resolve".to_string()));
-    }
-    if addrs.iter().any(|a| is_blocked_ip(a.ip())) {
-        return Err(invalid(
-            "image url resolves to a private/loopback/link-local address; refused".to_string(),
-        ));
-    }
-
-    // Pin to the validated IP (no second DNS lookup -> no rebinding) and forbid
-    // redirects (a 30x could otherwise bounce to an internal host).
-    //
-    // A total deadline is right here, unlike the shared OpenRouter client: this
-    // fetches a URL the *model* supplied, and the body is capped at
-    // MAX_REMOTE_IMAGE_BYTES, so there is no legitimate slow-but-large transfer
-    // to protect. Without it, a host that accepts and then dribbles bytes hangs
-    // the tool call forever - the size cap never trips on a drip.
-    //
-    // `no_gzip` because enabling reqwest's `gzip` feature turns auto-decompression
-    // on for every client in the process. Decoded responses lose Content-Length,
-    // which would silently kill the early size check below; image bytes are
-    // already compressed, so there is nothing to win here anyway.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .tls_backend_rustls()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, addrs[0])
-        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
-        .no_gzip()
-        .build()
-        .map_err(|e| ErrorData::internal_error(format!("http client build failed: {e}"), None))?;
-
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| invalid(format!("could not fetch image url: {e}")))?;
-    if resp.status().is_redirection() {
-        return Err(invalid(
-            "image url returned a redirect; refused (SSRF guard)".to_string(),
-        ));
-    }
-    let mut resp = resp
-        .error_for_status()
-        .map_err(|e| invalid(format!("image url returned an error: {e}")))?;
-    let content_length = resp.content_length();
-    if let Some(length) = content_length
-        && length > MAX_REMOTE_IMAGE_BYTES
-    {
-        return Err(invalid(format!(
-            "image url body is too large ({length} bytes; maximum is {MAX_REMOTE_IMAGE_BYTES})"
-        )));
-    }
-
-    // Enforce the limit while streaming as Content-Length may be absent or
-    // inaccurate. `Response::bytes()` would buffer an unbounded body first.
-    let capacity = content_length.unwrap_or(0).min(MAX_REMOTE_IMAGE_BYTES) as usize;
-    let mut bytes = Vec::with_capacity(capacity);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        ErrorData::internal_error(format!("could not read image url body: {e}"), None)
-    })? {
-        let next_len = bytes.len().saturating_add(chunk.len());
-        if next_len as u64 > MAX_REMOTE_IMAGE_BYTES {
-            return Err(invalid(format!(
-                "image url body exceeds the {MAX_REMOTE_IMAGE_BYTES}-byte maximum"
-            )));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
 /// Validate that an image spec carries exactly one source (path/url/base64),
 /// cheaply and without any network fetch. Lets a caller (e.g. `chat_completion`)
 /// surface a malformed-image error before running the network-bound model-
 /// capability gate.
 pub(crate) fn check_image_input(img: &ImageInput) -> Result<(), ErrorData> {
-    let count = [&img.path, &img.url, &img.base64]
-        .iter()
-        .filter(|o| o.as_ref().is_some_and(|s| !s.trim().is_empty()))
-        .count();
-    if count != 1 {
-        return Err(ErrorData::invalid_params(
-            "each image needs exactly one of: path, url, or base64".to_string(),
-            None,
-        ));
-    }
-    Ok(())
+    media::check_exactly_one(
+        media::InputKind::Image,
+        img.path.as_deref(),
+        img.url.as_deref(),
+        img.base64.as_deref(),
+    )
 }
 
-/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`],
-/// fetching URLs and decoding base64/data-URL inputs. Requires exactly one source.
+/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`]
+/// through the shared source resolver: a path stays lazy (read in
+/// `prepare_inputs`), URLs are fetched (SSRF-guarded) and base64/data-URL
+/// inputs decoded, both capped at 20 MiB. Requires exactly one source.
 async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, ErrorData> {
-    check_image_input(&img)?;
     let label = img.label;
-    if let Some(p) = img.path.filter(|s| !s.trim().is_empty()) {
-        Ok(image_gen::InputImage::from_path(p, label))
-    } else if let Some(b64) = img.base64.filter(|s| !s.trim().is_empty()) {
-        let bytes = crate::resources::run_blocking(move || {
-            decode_inline(&b64).map_err(|e| anyhow::anyhow!(e.to_string()))
-        })
-        .await
-        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(image_gen::InputImage::inline(bytes, "inline", label))
-    } else {
-        let url = img.url.unwrap();
-        let bytes = fetch_url(&url).await?;
-        Ok(image_gen::InputImage::inline(bytes, url, label))
-    }
+    let resolved = media::resolve_source(
+        media::InputKind::Image,
+        img.path,
+        img.url,
+        img.base64,
+        crate::resources::MAX_IMAGE_BYTES,
+        true,
+    )
+    .await?;
+    Ok(match resolved {
+        media::Resolved::Path(p) => image_gen::InputImage::from_path(p, label),
+        media::Resolved::Bytes(b) => image_gen::InputImage::inline(b.bytes, b.name, label),
+        media::Resolved::Url(_) => {
+            return Err(ErrorData::internal_error("image url was not fetched", None));
+        }
+    })
 }
 
 /// Resolve a list of tool-level [`ImageInput`]s to generator inputs, in order.
@@ -299,22 +112,36 @@ pub(crate) async fn resolve_image_inputs(
 }
 
 /// Arguments for the `generate_image` tool.
+///
+/// `aspect_ratio` and `image_size` are required unless `size` is given, so
+/// they are conditional like `generate_video.aspect_ratio` and stay out of the
+/// schema's unconditional `required` list; `run_generate` enforces the rule.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-#[schemars(transform = RequireFields(&["aspect_ratio", "image_size"]))]
 pub(crate) struct GenerateImageArgs {
     /// Image model id, e.g. "google/gemini-3.1-flash-image-preview".
     pub model: String,
     /// Prompt text describing the image to generate (or the edit to apply).
     pub prompt: String,
-    /// REQUIRED (no default): aspect ratio, e.g. "1:1", "16:9", "9:16"
-    /// (maps to image_config.aspect_ratio).
+    /// REQUIRED unless `size` is given (no default): aspect ratio, e.g. "1:1",
+    /// "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "2.35:1", "5:2",
+    /// "9:19.5", "19.5:9", "9:20", "20:9" (maps to the Images API
+    /// `aspect_ratio`). Provider support varies. Cannot be combined with a
+    /// pixel-form `size`.
     #[serde(default)]
     pub aspect_ratio: Option<String>,
-    /// REQUIRED (no default): resolution TIER (not pixel dimensions), e.g.
-    /// "1K", "2K", "4K" (maps to image_config.image_size).
+    /// REQUIRED unless `size` is given (no default): resolution TIER (not
+    /// pixel dimensions), e.g. "512" (or "0.5K"), "1K", "2K", "4K" (maps to
+    /// the Images API `resolution`). Cannot be combined with a pixel-form
+    /// `size`.
     #[serde(default)]
     pub image_size: Option<String>,
+    /// Output size as "WIDTHxHEIGHT" pixels (e.g. "2048x2048") or a tier
+    /// (e.g. "2K"). Alternative to aspect_ratio + image_size: a pixel-form
+    /// size together with either of them is rejected locally, because
+    /// OpenRouter returns 400 for that combination. Provider support varies.
+    #[serde(default)]
+    pub size: Option<String>,
     /// Seed for reproducible-ish generation (provider support varies).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub seed: Option<u64>,
@@ -346,7 +173,8 @@ pub(crate) struct GenerateImageArgs {
     /// (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
-    /// Output quality: "auto", "low", "medium", or "high". Provider support varies.
+    /// Output quality: "auto", "low", "medium", "high", "xhigh", or "max".
+    /// Provider support varies.
     #[serde(default)]
     pub quality: Option<String>,
     /// Output file format: "png", "jpeg", "webp", or "svg". Provider support
@@ -361,6 +189,16 @@ pub(crate) struct GenerateImageArgs {
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 0, max = 100))]
     pub output_compression: Option<u32>,
+    /// Provider block for this request: routing plus per-provider passthrough,
+    /// as {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks": bool,
+    /// "sort": "price"|"throughput"|"latency"|"exacto", "sort_partition":
+    /// "model"|"none", "options": {"<provider-slug>": {...}}}. `options` is
+    /// keyed by provider slug and holds that provider's own parameters;
+    /// describe_model lists each endpoint's allowed_passthrough_parameters,
+    /// e.g. {"options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}}.
+    /// Only the slug that serves the request is forwarded.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ImageProviderArgs,
 }
 
 /// Arguments for the `describe_image` tool.
@@ -388,6 +226,22 @@ pub(crate) struct DescribeImageArgs {
     /// charts, diagrams and dense text benefit from "high".
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional system instruction prepended as a system message.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Optional sampling temperature.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub temperature: Option<f64>,
+    /// Optional maximum number of tokens to generate.
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub max_tokens: Option<u64>,
+    /// Provider block for this request: routing only, as {"order": [...],
+    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
+    /// "zdr", "sort", "sort_partition"}. Chat completions have no per-provider
+    /// `options` passthrough (describe_model's allowed_passthrough_parameters
+    /// do not apply here).
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderRoutingArgs,
 }
 
 /// Build the lean per-job result object for an image job (paths, dims, requested
@@ -437,19 +291,26 @@ impl OpenRouterServer {
         local path, an http(s) url, or base64/data-URL (order preserved; optional per-image \
         label) - the prompt becomes the edit instruction. \
         Set variants>1 to generate several in parallel (seed-stepped). Optional `quality` \
-        (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` \
+        (auto/low/medium/high/xhigh/max), `output_format` (png/jpeg/webp/svg), `background` \
         (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) are passed \
         straight through to the provider - support for each varies by model, and whatever \
         format actually comes back is what gets saved (the extension always matches the real \
-        result, not the request). Returns a compact \
+        result, not the request). Provider routing and provider-specific parameters go in \
+        `provider`: routing keys order/only/ignore/allow_fallbacks/sort, and `provider.options` \
+        keyed by provider slug with that provider's own parameters - describe_model lists each \
+        endpoint's `allowed_passthrough_parameters` - e.g. \
+        {\"options\": {\"black-forest-labs\": {\"steps\": 28, \"guidance\": 3.5}}}. Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
         warnings. Works with any OpenRouter image model (Nano Banana, Grok, \
         Seedream, FLUX, GPT Image, Recraft, ...) via the dedicated image endpoint. No defaults \
-        for the required fields: model, prompt, aspect_ratio and image_size must all be \
-        specified, or the call fails with an error naming what is missing (every other \
-        param - seed, images, max_image_dimension, variants, wait_seconds, output, quality, \
-        output_format, background, output_compression - is optional). To analyze or caption \
+        for the required fields: model, prompt, and either `size` (\"WIDTHxHEIGHT\" pixels \
+        such as \"2048x2048\", or a tier) or both aspect_ratio and image_size must be \
+        specified, or the call fails with an error naming what is missing; a pixel-form `size` \
+        combined with aspect_ratio or image_size is rejected locally because OpenRouter \
+        returns 400 for it. Every other param - seed, images (max 16), max_image_dimension, \
+        variants, wait_seconds, output, quality, output_format, background, \
+        output_compression, provider - is optional. To analyze or caption \
         an existing image instead of creating one, use describe_image.",
         annotations(
             title = "Generate Image",
@@ -481,26 +342,38 @@ impl OpenRouterServer {
         let args = GenerateImageArgs {
             aspect_ratio: non_blank(args.aspect_ratio),
             image_size: non_blank(args.image_size),
+            size: non_blank(args.size),
             quality: non_blank(args.quality),
             output_format: non_blank(args.output_format),
             background: non_blank(args.background),
             ..args
         };
-        // No defaults: the agent must choose these explicitly.
-        let mut missing: Vec<&str> = Vec::new();
-        if args.aspect_ratio.is_none() {
-            missing.push("aspect_ratio (e.g. \"1:1\", \"16:9\", \"9:16\")");
+        // No defaults: the agent must choose the output geometry explicitly -
+        // either `size` alone, or aspect_ratio + image_size.
+        if args.size.is_none() {
+            let mut missing: Vec<&str> = Vec::new();
+            if args.aspect_ratio.is_none() {
+                missing.push("aspect_ratio (e.g. \"1:1\", \"16:9\", \"9:16\")");
+            }
+            if args.image_size.is_none() {
+                missing.push("image_size (e.g. \"1K\", \"2K\", \"4K\")");
+            }
+            require_all("generate_image", "image", &missing)?;
         }
-        if args.image_size.is_none() {
-            missing.push("image_size (e.g. \"1K\", \"2K\", \"4K\")");
-        }
-        require_all("generate_image", "image", &missing)?;
+        image_gen::check_size_conflict(
+            args.size.as_deref(),
+            args.image_size.as_deref(),
+            args.aspect_ratio.as_deref(),
+        )
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let provider = args.provider.into_image_provider()?;
 
         let Some(reservation) = self.tasks.reserve(TaskKind::Image) else {
             return Ok(Self::admission_error());
         };
         let aspect_ratio = args.aspect_ratio.clone();
         let image_size = args.image_size.clone();
+        let size = args.size.clone();
         let images = resolve_image_inputs(args.images).await?;
         let req = GenerateRequest {
             model: args.model.clone(),
@@ -516,6 +389,8 @@ impl OpenRouterServer {
             // The schema range is advisory only (rmcp does not validate), so
             // clamp here the way variants/wait_seconds already do.
             output_compression: args.output_compression.map(|c| c.min(100)),
+            size: args.size,
+            provider,
         };
 
         let variants = args.variants.unwrap_or(1).clamp(1, 16);
@@ -528,6 +403,9 @@ impl OpenRouterServer {
             config.push(a);
         }
         if let Some(s) = &image_size {
+            config.push(s);
+        }
+        if let Some(s) = &size {
             config.push(s);
         }
         let base = naming::resolve_output_base(
@@ -579,7 +457,13 @@ impl OpenRouterServer {
         model (image input, text output, e.g. google/gemini-2.5-flash, anthropic/claude-sonnet-4.6, \
         or openai/gpt-5.4). Pass one or more images (each a local path, an http(s) url, or \
         base64/data-URL) and an optional prompt/question (defaults to a detailed description); \
-        returns the model's text. Images are downscaled before sending. \
+        returns the model's text as the first content block, then a JSON block with the \
+        generation_id (for get_generation) and, when present, reasoning, finish_reason and \
+        token counts - the same shape chat_completion returns. Images are downscaled before \
+        sending. Optional `system`, \
+        `temperature`, `max_tokens` and `reasoning_effort` are passed through; `provider` \
+        takes routing fields only (order, only, ignore, allow_fallbacks, require_parameters, \
+        zdr, sort) - there is no per-provider `options` passthrough on chat completions. \
         To create or edit an image instead, use generate_image.",
         annotations(
             title = "Describe Image",
@@ -600,6 +484,7 @@ impl OpenRouterServer {
             ));
         }
         let model = args.model.clone();
+        let provider = args.provider.into_routing()?;
         let req = image_gen::DescribeRequest {
             model: args.model,
             prompt: args
@@ -608,13 +493,19 @@ impl OpenRouterServer {
             images: resolve_image_inputs(args.images).await?,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
             reasoning_effort: args.reasoning_effort,
+            system: args.system,
+            temperature: args.temperature,
+            max_tokens: args.max_tokens,
+            provider,
         };
         match image_gen::describe_image(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    result.text,
-                )]))
+                let mut blocks = vec![ContentBlock::text(result.text.clone())];
+                if let Some(meta) = super::chat::result_meta(&result) {
+                    blocks.push(ContentBlock::text(meta));
+                }
+                Ok(CallToolResult::success(blocks))
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;
@@ -628,96 +519,10 @@ impl OpenRouterServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_gen::ImageSource;
     use crate::server::test_support::{server_for, tool_result_json, valid_png_b64};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn img_input(path: Option<&str>, url: Option<&str>, base64: Option<&str>) -> ImageInput {
-        ImageInput {
-            path: path.map(str::to_string),
-            url: url.map(str::to_string),
-            base64: base64.map(str::to_string),
-            label: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_image_input_decodes_base64_and_data_url() {
-        // Raw base64 -> inline bytes.
-        let resolved = resolve_image_input(img_input(None, None, Some(&valid_png_b64())))
-            .await
-            .unwrap();
-        match resolved.source {
-            ImageSource::Inline { bytes, .. } => assert!(!bytes.is_empty()),
-            _ => panic!("expected inline bytes from base64"),
-        }
-
-        // A full data: URL also decodes to inline bytes.
-        let data_url = format!("data:image/png;base64,{}", valid_png_b64());
-        let resolved = resolve_image_input(img_input(None, None, Some(&data_url)))
-            .await
-            .unwrap();
-        assert!(matches!(resolved.source, ImageSource::Inline { .. }));
-    }
-
-    #[tokio::test]
-    async fn resolve_image_input_keeps_path_and_rejects_bad_input() {
-        let resolved = resolve_image_input(img_input(Some("/tmp/a.png"), None, None))
-            .await
-            .unwrap();
-        assert!(matches!(resolved.source, ImageSource::Path(_)));
-
-        // No source -> error.
-        let err = resolve_image_input(img_input(None, None, None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("exactly one of"));
-
-        // Two sources -> error.
-        let err = resolve_image_input(img_input(Some("/tmp/a.png"), None, Some("x")))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("exactly one of"));
-
-        // Non-http url -> rejected (never sent anywhere).
-        let err = resolve_image_input(img_input(None, Some("file:///etc/passwd"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("http"));
-    }
-
-    #[test]
-    fn is_blocked_ip_blocks_internal_allows_public() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-        // Blocked: loopback, private, link-local (incl. cloud metadata), CGNAT.
-        assert!(is_blocked_ip(Ipv4Addr::new(127, 0, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(10, 0, 0, 5).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(192, 168, 1, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(172, 16, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(169, 254, 169, 254).into())); // metadata
-        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into())); // CGNAT
-        assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
-        // Allowed: public addresses.
-        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
-        assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
-    }
-
-    #[tokio::test]
-    async fn fetch_url_refuses_loopback_and_metadata_targets() {
-        // SSRF guard: a loopback URL is refused before any connection.
-        let err = resolve_image_input(img_input(None, Some("http://127.0.0.1:9/pic.png"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("private/loopback"));
-
-        // The cloud metadata endpoint is link-local and likewise refused.
-        let err = resolve_image_input(img_input(None, Some("http://169.254.169.254/latest"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("private/loopback"));
-    }
 
     #[tokio::test]
     async fn generate_image_runs_async_and_get_result_fetches_it() {
@@ -750,6 +555,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         // Fast mock completes within the wait window -> inline completed result.
         // inline_previews=true mirrors a Claude Desktop client.
@@ -819,6 +626,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));
@@ -844,6 +653,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
@@ -884,6 +695,8 @@ mod tests {
             output_format: Some("webp".to_string()),
             background: Some("opaque".to_string()),
             output_compression: Some(50),
+            size: None,
+            provider: Default::default(),
         };
         let res = server.run_generate(args, false).await.unwrap();
         let v = tool_result_json(&res);
@@ -902,6 +715,197 @@ mod tests {
                 .any(|w| w.as_str().unwrap().contains("image/webp")
                     && w.as_str().unwrap().contains("image/png")),
             "got: {warnings:?}"
+        );
+    }
+
+    /// The `/images` `provider` block (routing subset + `options` keyed by
+    /// slug) and `size` reach the wire nested exactly as OpenRouter documents
+    /// them, deserialized the way a client sends them (lenient nested object).
+    /// With `size` given, `aspect_ratio` and `image_size` are not required.
+    #[tokio::test]
+    async fn generate_image_forwards_provider_and_size_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "black-forest-labs/flux.2-pro",
+                "size": "2048x2048",
+                "provider": {
+                    "order": ["black-forest-labs"],
+                    "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "b64_json": valid_png_b64() }]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-provider-test.png");
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "black-forest-labs/flux.2-pro",
+            "prompt": "p",
+            "size": "2048x2048",
+            "wait_seconds": 30,
+            "output": out.to_string_lossy(),
+            "provider": {
+                "order": ["black-forest-labs"],
+                "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+            }
+        }))
+        .unwrap();
+        let res = server.run_generate(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["status"], "completed", "got: {v}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(body.get("resolution").is_none(), "got: {body}");
+        assert!(body.get("aspect_ratio").is_none(), "got: {body}");
+        // The manifest records the provider block that was sent.
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(v["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["size"], "2048x2048");
+        assert_eq!(manifest["provider"]["order"], json!(["black-forest-labs"]));
+    }
+
+    /// A pixel-form `size` together with `image_size` or `aspect_ratio` is the
+    /// combination OpenRouter rejects with 400; it is refused locally as
+    /// invalid_params before any HTTP call, naming the conflict.
+    #[tokio::test]
+    async fn generate_image_rejects_pixel_size_combined_with_tier_or_ratio() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args = |size: &str, image_size: Option<&str>, aspect_ratio: Option<&str>| {
+            serde_json::from_value::<GenerateImageArgs>(json!({
+                "model": "m", "prompt": "p", "output": "out.png",
+                "size": size, "image_size": image_size, "aspect_ratio": aspect_ratio,
+            }))
+            .unwrap()
+        };
+        let err = server
+            .run_generate(args("2048x2048", Some("2K"), None), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("size"), "got: {}", err.message);
+        assert!(err.message.contains("image_size"), "got: {}", err.message);
+        assert!(err.message.contains("400"), "got: {}", err.message);
+
+        let err = server
+            .run_generate(args("1024x768", None, Some("4:3")), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
+    }
+
+    /// Without `size`, aspect_ratio and image_size stay required (unchanged
+    /// semantics); a blank `size` counts as absent.
+    #[tokio::test]
+    async fn generate_image_blank_size_keeps_ratio_and_tier_required() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "output": "out.png", "size": "  ",
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
+        assert!(err.message.contains("image_size"), "got: {}", err.message);
+    }
+
+    /// More than 16 input images is refused as invalid_params at the tool
+    /// boundary, before any source is decoded or fetched.
+    #[tokio::test]
+    async fn generate_image_rejects_more_than_16_input_images() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let images: Vec<_> = (0..17).map(|_| json!({"base64": "invalid!"})).collect();
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "aspect_ratio": "1:1", "image_size": "1K",
+            "output": "out.png", "images": images,
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("16"), "got: {}", err.message);
+    }
+
+    /// An invalid provider block (a scalar where a per-slug object is due) is
+    /// rejected before any HTTP call.
+    #[tokio::test]
+    async fn generate_image_rejects_bad_provider_options_before_http() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "aspect_ratio": "1:1", "image_size": "1K",
+            "output": "out.png", "provider": {"options": {"acme": true}},
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("acme"), "got: {}", err.message);
+    }
+
+    /// `describe_image` no longer hardcodes system/temperature/max_tokens to
+    /// `None`: they and the provider routing block reach the wire, arriving the
+    /// way a client sends them (lenient nested object).
+    #[tokio::test]
+    async fn describe_image_forwards_system_sampling_and_provider() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "messages": [{"role": "system", "content": "be brief"}, {"role": "user"}],
+                "temperature": 0.2,
+                "max_tokens": 50,
+                "provider": {"order": ["google-vertex"], "zdr": true}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-desc")
+                    .set_body_json(json!({
+                        "choices": [{"message": {"content": "a square"}}],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 2}
+                    })),
+            )
+            .mount(&mock)
+            .await;
+        let args: DescribeImageArgs = serde_json::from_value(json!({
+            "model": "google/gemini-2.5-flash",
+            "images": [{"base64": valid_png_b64()}],
+            "system": "be brief",
+            "temperature": "0.2",
+            "max_tokens": 50,
+            "provider": {"order": ["google-vertex"], "zdr": "true"}
+        }))
+        .unwrap();
+        let res = server_for(mock.uri())
+            .describe_image(rmcp::handler::server::wrapper::Parameters(args))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["content"][0]["text"], "a square");
+        // Same second block as chat_completion: the generation id (for
+        // get_generation) and the token counts.
+        let meta: serde_json::Value =
+            serde_json::from_str(v["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["generation_id"], "gen-desc");
+        assert_eq!(meta["usage"]["prompt_tokens"], 9);
+
+        // An invalid routing block is rejected before any HTTP call.
+        let bad: DescribeImageArgs = serde_json::from_value(json!({
+            "model": "m", "images": [{"base64": valid_png_b64()}],
+            "provider": {"sort_partition": "model"}
+        }))
+        .unwrap();
+        let err = server_for("http://127.0.0.1:9".to_string())
+            .describe_image(rmcp::handler::server::wrapper::Parameters(bad))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("sort_partition"),
+            "got: {}",
+            err.message
         );
     }
 

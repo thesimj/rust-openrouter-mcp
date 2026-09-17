@@ -562,8 +562,7 @@ mod tests {
                 context_length: None,
                 architecture: None,
                 pricing: None,
-                reasoning: None,
-                supported_voices: None,
+                ..Default::default()
             })
             .collect()
     }

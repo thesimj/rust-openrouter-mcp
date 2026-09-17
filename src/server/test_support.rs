@@ -30,3 +30,18 @@ pub(crate) fn valid_png_b64() -> String {
         .unwrap();
     base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
 }
+
+/// A `provider` block for the options-only endpoints (speech, transcription,
+/// video) plus the exact JSON it must produce on the wire, so each tool's
+/// wiremock test asserts `{"provider": <expected>}` with `body_partial_json`.
+pub(crate) fn provider_options_fixture() -> (
+    crate::server::provider::ProviderOptionsArgs,
+    serde_json::Value,
+) {
+    let mut options = std::collections::BTreeMap::new();
+    options.insert("acme".to_string(), serde_json::json!({"k": 1}));
+    (
+        crate::server::provider::ProviderOptionsArgs { options },
+        serde_json::json!({"options": {"acme": {"k": 1}}}),
+    )
+}

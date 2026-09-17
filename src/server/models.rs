@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::openrouter::{ModelsQuery, apply_filters};
 use crate::pricing::{attach_pricing_human, humanize_pricing, models_to_json};
-use crate::server::schema::{de_bool, de_opt_uint, scalarize_nullable};
+use crate::server::schema::{de_bool, de_opt_bool, de_opt_f64, de_opt_uint, scalarize_nullable};
 
 use super::OpenRouterServer;
 
@@ -25,9 +25,9 @@ pub(crate) struct ListModelsArgs {
     #[serde(default)]
     pub query: Option<String>,
     /// Local case-insensitive filter across id, name, and description
-    /// (e.g. "openai"). Order of operations: the server-side query/
-    /// output_modalities/input_modalities/supported_parameters/sort/min_context
-    /// filters run first (one API call); this local filter narrows that result
+    /// (e.g. "openai"). Order of operations: every server-side filter (query,
+    /// modalities, category, providers, price/index bounds, sort, limit/offset,
+    /// ...) runs first (one API call); this local filter narrows that result
     /// next; the default 20-result cap (unless all=true) is applied last.
     #[serde(default)]
     pub search: Option<String>,
@@ -46,17 +46,135 @@ pub(crate) struct ListModelsArgs {
     #[serde(default)]
     pub supported_parameters: Option<String>,
     /// Sort order: pricing-low-to-high, pricing-high-to-low, context-high-to-low,
-    /// throughput-high-to-low, latency-low-to-high, most-popular, top-weekly, newest.
+    /// throughput-high-to-low, latency-low-to-high, most-popular, top-weekly, newest,
+    /// intelligence-high-to-low, coding-high-to-low, agentic-high-to-low,
+    /// design-arena-elo-high-to-low (benchmark sorts place unscored models last).
     /// Defaults to "top-weekly" (most used this week) when omitted.
     #[serde(default)]
     pub sort: Option<String>,
     /// Minimum context length in tokens; models with less are excluded.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub min_context: Option<u64>,
+    /// Use-case category. One of: programming, roleplay, marketing, marketing/seo,
+    /// technology, science, translation, legal, finance, health, trivia, academia.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Only models hosted by these providers. Comma-separated provider names,
+    /// e.g. "OpenAI,Anthropic".
+    #[serde(default)]
+    pub providers: Option<String>,
+    /// Only models by these authors. Comma-separated author slugs, e.g.
+    /// "openai,anthropic".
+    #[serde(default)]
+    pub model_authors: Option<String>,
+    /// Architecture / model family, e.g. "GPT", "Claude", "Gemini", "Llama".
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// Minimum prompt (input) price in $ per million tokens.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_price: Option<f64>,
+    /// Maximum prompt (input) price in $ per million tokens.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_price: Option<f64>,
+    /// Minimum completion (output) price in $ per million tokens.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_output_price: Option<f64>,
+    /// Maximum completion (output) price in $ per million tokens.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_output_price: Option<f64>,
+    /// true = only models with zero-data-retention endpoints. false/omitted =
+    /// no ZDR filter (the API has no "exclude ZDR" mode).
+    #[serde(default, deserialize_with = "de_opt_bool")]
+    pub zdr: Option<bool>,
+    /// Data region of the model's endpoints: "eu" or "us".
+    #[serde(default)]
+    pub region: Option<String>,
+    /// true = only distillable models, false = exclude them, omitted = no filter.
+    #[serde(default, deserialize_with = "de_opt_bool")]
+    pub distillable: Option<bool>,
+    /// Minimum model age in days since it was added.
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub min_age_days: Option<u64>,
+    /// Maximum model age in days since it was added (e.g. 30 = released this month).
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub max_age_days: Option<u64>,
+    /// Server-side page size, 1..=1000 (API default 500; with limit and offset
+    /// both omitted the API returns the full list). The header line reports the
+    /// server's total_count so you can page with offset. The local 20-row cap
+    /// still applies unless all=true.
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub limit: Option<u64>,
+    /// Server-side records to skip (pair with limit to page).
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub offset: Option<u64>,
+    /// Minimum Artificial Analysis intelligence index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_intelligence_index: Option<f64>,
+    /// Maximum Artificial Analysis intelligence index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_intelligence_index: Option<f64>,
+    /// Minimum Artificial Analysis coding index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_coding_index: Option<f64>,
+    /// Maximum Artificial Analysis coding index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_coding_index: Option<f64>,
+    /// Minimum Artificial Analysis agentic index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_agentic_index: Option<f64>,
+    /// Maximum Artificial Analysis agentic index.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_agentic_index: Option<f64>,
+    /// Minimum tool-calling success rate as a fraction in [0, 1] (0.9 = 90% of
+    /// requests finish with a tool_calls finish reason).
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub min_tool_success_rate: Option<f64>,
+    /// Maximum tool-calling success rate as a fraction in [0, 1].
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub max_tool_success_rate: Option<f64>,
     /// Return all matching models. By default only the first 20 are returned to
     /// keep the result compact; set true to get the complete list.
     #[serde(default, deserialize_with = "de_bool")]
     pub all: bool,
+}
+
+impl ListModelsArgs {
+    /// The wire query for these args. Field names match one-to-one; the only
+    /// normalization is the `top-weekly` default sort.
+    fn into_query(self) -> ModelsQuery {
+        ModelsQuery {
+            q: self.query,
+            output_modalities: self.output_modalities,
+            input_modalities: self.input_modalities,
+            supported_parameters: self.supported_parameters,
+            // Default to most-used-this-week when the caller doesn't specify a sort.
+            sort: Some(self.sort.unwrap_or_else(|| "top-weekly".to_string())),
+            context: self.min_context,
+            category: self.category,
+            providers: self.providers,
+            model_authors: self.model_authors,
+            arch: self.arch,
+            min_price: self.min_price,
+            max_price: self.max_price,
+            min_output_price: self.min_output_price,
+            max_output_price: self.max_output_price,
+            zdr: self.zdr,
+            region: self.region,
+            distillable: self.distillable,
+            min_age_days: self.min_age_days,
+            max_age_days: self.max_age_days,
+            limit: self.limit,
+            offset: self.offset,
+            min_intelligence_index: self.min_intelligence_index,
+            max_intelligence_index: self.max_intelligence_index,
+            min_coding_index: self.min_coding_index,
+            max_coding_index: self.max_coding_index,
+            min_agentic_index: self.min_agentic_index,
+            max_agentic_index: self.max_agentic_index,
+            min_tool_success_rate: self.min_tool_success_rate,
+            max_tool_success_rate: self.max_tool_success_rate,
+        }
+    }
 }
 
 /// Arguments for the `describe_model` tool.
@@ -72,14 +190,21 @@ pub(crate) struct DescribeModelArgs {
 impl OpenRouterServer {
     #[tool(
         description = "List available OpenRouter models with their capabilities \
-        (input/output modalities, context length) and pricing. Filtering and sorting \
-        happen server-side: search by name (query), filter by output/input modalities \
-        or supported parameters, sort by newest/most-popular/pricing/context, and set a \
-        minimum context length. Output modalities include text, image, audio (audio-output \
-        chat models - music such as google/lyria-3-*), embeddings, video, rerank, speech \
-        (text-to-speech), transcription (speech-to-text); the default is text only, so pass \
-        output_modalities=\"all\" or a specific value to see the rest. Returns the \
-        first 20 models by default; set all=true for the complete list.",
+        (input/output modalities, context length, reasoning efforts, TTS voices, \
+        knowledge_cutoff, expiration_date) and pricing. Filtering and sorting happen \
+        server-side: search by name (query), filter by output/input modalities, supported \
+        parameters, use-case category, hosting providers, model_authors, arch (model \
+        family), prompt/completion price bounds ($/M tokens), zdr (zero data retention), \
+        region (eu|us), distillable, model age in days, and Artificial Analysis \
+        intelligence/coding/agentic index or tool_success_rate bounds; sort by \
+        newest/most-popular/pricing/context or by the intelligence/coding/agentic/\
+        design-arena benchmarks; set a minimum context length; page with limit/offset \
+        (the header line reports the server's total_count). Output modalities include \
+        text, image, audio (audio-output chat models - music such as google/lyria-3-*), \
+        embeddings, video, rerank, speech (text-to-speech), transcription (speech-to-text); \
+        the default is text only, so pass output_modalities=\"all\" or a specific value to \
+        see the rest. Returns the first 20 models by default; set all=true for the \
+        complete list.",
         annotations(
             title = "List OpenRouter Models",
             read_only_hint = true,
@@ -89,25 +214,20 @@ impl OpenRouterServer {
     )]
     async fn list_models(
         &self,
-        Parameters(args): Parameters<ListModelsArgs>,
+        Parameters(mut args): Parameters<ListModelsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let query = ModelsQuery {
-            q: args.query,
-            output_modalities: args.output_modalities,
-            input_modalities: args.input_modalities,
-            supported_parameters: args.supported_parameters,
-            // Default to most-used-this-week when the caller doesn't specify a sort.
-            sort: Some(args.sort.unwrap_or_else(|| "top-weekly".to_string())),
-            context: args.min_context,
-        };
+        // Local post-processing knobs; everything else is the wire query.
+        let (search, all) = (args.search.take(), args.all);
+        let query = args.into_query();
 
-        let raw = self
+        let page = self
             .client
-            .list_models(&query)
+            .list_models_page(&query)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let pagination = page.pagination_note();
 
-        let filtered = apply_filters(raw, args.search.as_deref(), args.all);
+        let filtered = apply_filters(page.data, search.as_deref(), all);
 
         // Shared enrichment: attach a human-readable pricing_human to each
         // model (same path the CLI uses, so the two never diverge).
@@ -120,6 +240,12 @@ impl OpenRouterServer {
                 filtered.total,
                 json
             );
+        }
+        // The server's own count (before limit/offset) and next-page link are
+        // what a paging caller needs; the local footer above only knows about
+        // this page.
+        if let Some(note) = pagination {
+            json = format!("// {note}\n{json}");
         }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
@@ -317,6 +443,181 @@ mod tests {
         let v = tool_result_json(&result);
         assert_eq!(v[0]["supported_voices"][0], "af_heart");
         assert_eq!(v[0]["supported_voices"][1], "af_bella");
+    }
+
+    /// Every new tool arg maps to the query param of the same name, with the
+    /// tolerant scalar deserializers accepting stringified numbers/booleans
+    /// (the failure mode the rest of the schema helpers exist for). The mock
+    /// only matches when all params are present.
+    #[tokio::test]
+    async fn list_models_tool_forwards_every_filter_by_its_documented_name() {
+        let mock = MockServer::start().await;
+        let expected: &[(&str, &str)] = &[
+            ("category", "programming"),
+            ("providers", "OpenAI,Anthropic"),
+            ("model_authors", "openai,anthropic"),
+            ("arch", "Claude"),
+            ("min_price", "0.5"),
+            ("max_price", "2.5"),
+            ("min_output_price", "1.5"),
+            ("max_output_price", "10.5"),
+            ("zdr", "true"),
+            ("region", "eu"),
+            ("distillable", "false"),
+            ("min_age_days", "7"),
+            ("max_age_days", "365"),
+            ("limit", "50"),
+            ("offset", "100"),
+            ("min_intelligence_index", "40.5"),
+            ("max_intelligence_index", "70.5"),
+            ("min_coding_index", "30.5"),
+            ("max_coding_index", "60.5"),
+            ("min_agentic_index", "20.5"),
+            ("max_agentic_index", "50.5"),
+            ("min_tool_success_rate", "0.9"),
+            ("max_tool_success_rate", "0.99"),
+            ("sort", "intelligence-high-to-low"),
+        ];
+        let mut m = Mock::given(method("GET")).and(path("/models"));
+        for (name, value) in expected {
+            m = m.and(wiremock::matchers::query_param(*name, *value));
+        }
+        m.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Mixed typed and stringified scalars, as real clients send them.
+        let args: ListModelsArgs = serde_json::from_value(json!({
+            "category": "programming",
+            "providers": "OpenAI,Anthropic",
+            "model_authors": "openai,anthropic",
+            "arch": "Claude",
+            "min_price": 0.5,
+            "max_price": "2.5",
+            "min_output_price": 1.5,
+            "max_output_price": "10.5",
+            "zdr": "true",
+            "region": "eu",
+            "distillable": false,
+            "min_age_days": "7",
+            "max_age_days": 365,
+            "limit": 50,
+            "offset": "100",
+            "min_intelligence_index": 40.5,
+            "max_intelligence_index": "70.5",
+            "min_coding_index": 30.5,
+            "max_coding_index": 60.5,
+            "min_agentic_index": "20.5",
+            "max_agentic_index": 50.5,
+            "min_tool_success_rate": 0.9,
+            "max_tool_success_rate": "0.99",
+            "sort": "intelligence-high-to-low"
+        }))
+        .unwrap();
+        let server = server_for(mock.uri());
+        server.list_models(Parameters(args)).await.unwrap();
+    }
+
+    /// The server's `total_count` (matches before this page's limit/offset)
+    /// is returned in the header line when present, so a caller paging with
+    /// limit/offset knows how far to go. Absent upstream -> no header, and
+    /// the body stays plain JSON.
+    #[tokio::test]
+    async fn list_models_tool_reports_server_total_count_when_present() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "openai/gpt"}],
+                "total_count": 546,
+                "links": {"next": "/api/v1/models?offset=1&limit=1"}
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .list_models(Parameters(ListModelsArgs {
+                limit: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&result).unwrap();
+        let text = v["content"][0]["text"].as_str().unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(header.starts_with("// "), "got: {header}");
+        assert!(header.contains("total_count: 546"), "got: {header}");
+        assert!(
+            header.contains("next page: /api/v1/models?offset=1&limit=1"),
+            "got: {header}"
+        );
+        assert!(text.contains("openai/gpt"));
+    }
+
+    /// The compact row (one `list_models` entry) surfaces the capability
+    /// fields callers are pointed at - `reasoning.supported_efforts` /
+    /// `mandatory`, `supported_voices`, `expiration_date`, `knowledge_cutoff` -
+    /// and only when non-null, so a plain text model's row stays lean.
+    #[tokio::test]
+    async fn list_models_compact_row_surfaces_capabilities_only_when_present() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {
+                        "id": "openai/gpt-5.6-sol",
+                        "reasoning": {
+                            "mandatory": true,
+                            "supported_efforts": ["high", "medium", "low"],
+                            "default_effort": "medium"
+                        },
+                        "expiration_date": "2027-03-01",
+                        "knowledge_cutoff": "2026-01-31",
+                        "supported_voices": null
+                    },
+                    {
+                        "id": "hexgrad/kokoro-82m",
+                        "supported_voices": ["af_heart"],
+                        "expiration_date": null,
+                        "knowledge_cutoff": null
+                    },
+                    { "id": "provider/plain" }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let result = server
+            .list_models(Parameters(ListModelsArgs::default()))
+            .await
+            .unwrap();
+        let rows = tool_result_json(&result);
+
+        let reasoning = &rows[0];
+        assert_eq!(reasoning["reasoning"]["supported_efforts"][0], "high");
+        assert_eq!(reasoning["reasoning"]["mandatory"], true);
+        assert_eq!(reasoning["expiration_date"], "2027-03-01");
+        assert_eq!(reasoning["knowledge_cutoff"], "2026-01-31");
+        assert!(reasoning.get("supported_voices").is_none());
+
+        let speech = &rows[1];
+        assert_eq!(speech["supported_voices"][0], "af_heart");
+        assert!(speech.get("expiration_date").is_none());
+        assert!(speech.get("knowledge_cutoff").is_none());
+
+        let plain = rows[2].as_object().unwrap();
+        for key in [
+            "reasoning",
+            "supported_voices",
+            "expiration_date",
+            "knowledge_cutoff",
+        ] {
+            assert!(!plain.contains_key(key), "plain row leaked {key}");
+        }
     }
 
     #[tokio::test]

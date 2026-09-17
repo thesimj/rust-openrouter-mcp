@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 
 use crate::manifest::{self, AudioManifest, AudioOutputMeta};
-use crate::openrouter::{InputAudio, OpenRouterClient, SpeechBody, TranscriptionBody};
+use crate::openrouter::{
+    InputAudio, OpenRouterClient, ProviderOptions, SpeechBody, SpeechInputReference,
+    SpeechReferenceAudio, TranscriptionBody,
+};
 
 /// Audio container formats the transcription endpoint accepts, as the
 /// `input_audio.format` values it expects. Keyed by file extension - which is
@@ -22,6 +25,15 @@ const TRANSCRIBE_FORMATS: [&str; 7] = ["wav", "mp3", "flac", "m4a", "ogg", "webm
 /// Local decoded audio limit (25 MiB), applied to files and inline inputs.
 /// This bounds memory use; OpenRouter JSON requests may support larger inputs.
 const MAX_TRANSCRIBE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Decoded cap for a voice-cloning reference sample sent as
+/// `input_references[].input_audio` on `/audio/speech` (OpenRouter documents
+/// 15 MiB decoded / 20 MiB base64).
+pub const MAX_VOICE_REFERENCE_BYTES: u64 = 15 * 1024 * 1024;
+
+/// Documented cap on the `text` part of a voice reference (the transcript of
+/// the sample).
+pub const MAX_VOICE_REFERENCE_TEXT_CHARS: usize = 10_000;
 
 /// The `input_audio.format` value for a file extension, if it is one the
 /// endpoint accepts. Case-insensitive.
@@ -52,6 +64,8 @@ pub struct TranscribeRequest {
     /// "segment"/"word"; verbose_json + OpenAI-compatible providers only.
     pub timestamp_granularities: Vec<String>,
     pub temperature: Option<f64>,
+    /// Per-provider passthrough (`provider.options.<slug>`), already validated.
+    pub provider: Option<ProviderOptions>,
 }
 
 /// A transcript plus the reported USD cost, when present. `verbose` carries the
@@ -100,26 +114,100 @@ pub async fn read_audio_file(
 
 /// Validate encoded input before upload, including MIME aliases from data URLs.
 /// Whitespace inside the base64 (line-wrapping encoders) is removed so the
-/// payload sent upstream is the compact form; padding is optional.
-fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
+/// payload sent upstream is the compact form; padding is optional. Shared
+/// with the chat `input_audio` parts (`server::media`).
+pub(crate) fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
+    let (data, format) =
+        validate_inline_audio_within(data, Some(format), MAX_TRANSCRIBE_BYTES, "transcription")?;
+    Ok((data, format.unwrap_or_default()))
+}
+
+/// The shared inline-audio check behind [`validate_inline_audio`] and
+/// [`VoiceReference::new`]: compact the base64, cap it at `limit` decoded bytes
+/// (checked on the encoded length first so an oversized payload is never
+/// decoded), reject empty/invalid data, and normalize the container format
+/// when one is given (`format` is optional for the speech reference, required
+/// for transcription - the caller decides). `what` names the limit in errors.
+fn validate_inline_audio_within(
+    data: &str,
+    format: Option<&str>,
+    limit: u64,
+    what: &str,
+) -> Result<(String, Option<String>)> {
     let data = crate::image_io::compact_base64(data);
-    let format = transcribe_format(format).context("unsupported audio format")?;
-    let encoded_limit = MAX_TRANSCRIBE_BYTES.div_ceil(3) * 4;
+    let format = format
+        .map(|f| transcribe_format(f).with_context(|| format!("unsupported audio format {f:?}")))
+        .transpose()?;
+    let encoded_limit = limit.div_ceil(3) * 4;
     if data.len() as u64 > encoded_limit {
-        bail!(
-            "audio exceeds the local transcription limit of {MAX_TRANSCRIBE_BYTES} decoded bytes"
-        );
+        bail!("audio exceeds the local {what} limit of {limit} decoded bytes");
     }
     let bytes = crate::image_io::decode_base64(&data).context("invalid base64 audio")?;
     if bytes.is_empty() {
         bail!("audio is empty");
     }
-    if bytes.len() as u64 > MAX_TRANSCRIBE_BYTES {
-        bail!(
-            "audio exceeds the local transcription limit of {MAX_TRANSCRIBE_BYTES} decoded bytes"
-        );
+    if bytes.len() as u64 > limit {
+        bail!("audio exceeds the local {what} limit of {limit} decoded bytes");
     }
-    Ok((data.into_owned(), format.to_string()))
+    Ok((data.into_owned(), format.map(str::to_string)))
+}
+
+/// A validated stateless voice-cloning reference for `/audio/speech`: one
+/// audio sample plus an optional transcript of it. Built through [`Self::new`]
+/// so the documented caps are enforced once, for the MCP tool and the CLI alike.
+#[derive(Debug, Clone)]
+pub struct VoiceReference {
+    /// Raw base64 of the sample (no `data:` prefix).
+    data: String,
+    /// Container format when known; omitted on the wire otherwise.
+    format: Option<String>,
+    /// Transcript of the sample, when given.
+    text: Option<String>,
+}
+
+impl VoiceReference {
+    /// Validate a reference: base64 sample under [`MAX_VOICE_REFERENCE_BYTES`]
+    /// decoded, an optional container format (aliases normalized like
+    /// transcription), and a transcript under
+    /// [`MAX_VOICE_REFERENCE_TEXT_CHARS`] - blank text counts as none.
+    pub fn new(data: &str, format: Option<&str>, text: Option<&str>) -> Result<Self> {
+        let format = format.map(str::trim).filter(|f| !f.is_empty());
+        let (data, format) = validate_inline_audio_within(
+            data,
+            format,
+            MAX_VOICE_REFERENCE_BYTES,
+            "voice reference",
+        )?;
+        let text = text
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        if let Some(t) = &text
+            && t.chars().count() > MAX_VOICE_REFERENCE_TEXT_CHARS
+        {
+            bail!(
+                "voice reference text exceeds the {MAX_VOICE_REFERENCE_TEXT_CHARS}-character \
+                 limit ({} characters)",
+                t.chars().count()
+            );
+        }
+        Ok(Self { data, format, text })
+    }
+
+    /// The wire parts, in the documented order: the audio sample, then the
+    /// transcript when there is one.
+    fn into_parts(self) -> Vec<SpeechInputReference> {
+        let mut parts = vec![SpeechInputReference::InputAudio {
+            input_audio: SpeechReferenceAudio {
+                data: self.data,
+                format: self.format,
+            },
+        }];
+        if let Some(text) = self.text {
+            parts.push(SpeechInputReference::Text { text });
+        }
+        parts
+    }
 }
 
 /// Transcribe audio to text. Requires already-encoded base64 `data` (see
@@ -154,6 +242,7 @@ pub async fn transcribe(
         response_format: response_format.clone(),
         timestamp_granularities,
         temperature: req.temperature,
+        provider: req.provider.clone(),
     };
     let raw = client.transcribe(&body).await?;
     let cost = raw
@@ -212,17 +301,24 @@ pub async fn transcribe(
 pub struct SpeechGenRequest {
     pub model: String,
     pub input: String,
-    pub voice: String,
+    /// Model-specific voice id. Provider-dependent: most models need one and
+    /// have no default, voice-cloning models take none. Blank counts as unset.
+    pub voice: Option<String>,
     /// `mp3` or `pcm`; defaults to `mp3` so the file extension is deterministic.
     pub response_format: Option<String>,
     pub speed: Option<f64>,
+    /// Stateless voice-cloning sample, sent as `input_references`.
+    pub voice_reference: Option<VoiceReference>,
+    /// Per-provider passthrough (`provider.options.<slug>`), already validated.
+    pub provider: Option<ProviderOptions>,
 }
 
 /// The saved audio file plus the metadata worth recording.
 pub struct AudioSummary {
     pub path: PathBuf,
     pub mime: String,
-    pub voice: String,
+    /// The voice sent, when one was.
+    pub voice: Option<String>,
     pub response_format: String,
 }
 
@@ -275,12 +371,28 @@ pub async fn run_job(
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "mp3".to_string());
 
+    // A blank voice is "no voice" (voice-cloning models take none), so it is
+    // omitted from the wire and the manifest rather than sent as "  ".
+    let voice = req
+        .voice
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let input_references = req
+        .voice_reference
+        .clone()
+        .map(VoiceReference::into_parts)
+        .unwrap_or_default();
+
     let body = SpeechBody {
         model: req.model.clone(),
         input: req.input.clone(),
-        voice: req.voice.clone(),
+        voice: voice.clone(),
         response_format: Some(response_format.clone()),
         speed: req.speed,
+        input_references,
+        provider: req.provider.clone(),
     };
 
     let result = client.speech(&body).await?;
@@ -303,9 +415,11 @@ pub async fn run_job(
         model: req.model.clone(),
         input: req.input.clone(),
         input_source: input_source.to_string(),
-        voice: req.voice.clone(),
+        voice: voice.clone(),
+        voice_reference: req.voice_reference.is_some(),
         response_format: response_format.clone(),
         speed: req.speed,
+        provider: req.provider.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         output: AudioOutputMeta {
             path: Some(path.to_string_lossy().into_owned()),
@@ -325,7 +439,7 @@ pub async fn run_job(
         audio: AudioSummary {
             path,
             mime: result.mime,
-            voice: req.voice.clone(),
+            voice,
             response_format,
         },
         warnings,
@@ -374,9 +488,11 @@ mod tests {
         let req = SpeechGenRequest {
             model: "openai/gpt-4o-mini-tts".to_string(),
             input: "hello world".to_string(),
-            voice: "alloy".to_string(),
+            voice: Some("alloy".to_string()),
             response_format: None,
             speed: None,
+            voice_reference: None,
+            provider: None,
         };
         // Pass an output with the "wrong" extension; the saved file is corrected.
         let base = std::env::temp_dir().join("openrouter-mcp-audio-test/speech.wav");
@@ -384,7 +500,7 @@ mod tests {
 
         assert_eq!(result.model, "openai/gpt-4o-mini-tts");
         assert_eq!(result.audio.mime, "audio/mpeg");
-        assert_eq!(result.audio.voice, "alloy");
+        assert_eq!(result.audio.voice.as_deref(), Some("alloy"));
         assert_eq!(result.audio.response_format, "mp3");
         // content-type audio/mpeg -> .mp3 extension regardless of the input path.
         assert_eq!(result.audio.path.extension().unwrap(), "mp3");
@@ -412,13 +528,170 @@ mod tests {
         let req = SpeechGenRequest {
             model: "openai/gpt-4o-mini-tts".to_string(),
             input: "hello world".to_string(),
-            voice: "alloy".to_string(),
+            voice: Some("alloy".to_string()),
             response_format: Some("   ".to_string()),
             speed: None,
+            voice_reference: None,
+            provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-blank-format/speech.mp3");
         let result = run_job(&client, &req, &base, "test").await.unwrap();
         assert_eq!(result.audio.response_format, "mp3");
+    }
+
+    /// `provider.options` and the voice-cloning `input_references` reach the
+    /// wire nested exactly as OpenRouter documents them: the audio part first,
+    /// the transcript part second, `voice` absent because none was given.
+    #[tokio::test]
+    async fn run_job_forwards_provider_options_and_voice_reference() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(body_partial_json(json!({
+                "model": "fish-audio/s1",
+                "input": "hello world",
+                "input_references": [
+                    {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}},
+                    {"type": "text", "text": "sample words"}
+                ],
+                "provider": {"options": {"openai": {"instructions": "speak cheerfully"}}}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE-MP3".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let mut options = std::collections::BTreeMap::new();
+        options.insert(
+            "openai".to_string(),
+            json!({"instructions": "speak cheerfully"}),
+        );
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let req = SpeechGenRequest {
+            model: "fish-audio/s1".to_string(),
+            input: "hello world".to_string(),
+            voice: None,
+            response_format: None,
+            speed: None,
+            voice_reference: Some(
+                VoiceReference::new("QUJD", Some("mpeg"), Some(" sample words ")).unwrap(),
+            ),
+            provider: Some(ProviderOptions { options }),
+        };
+        let base = std::env::temp_dir().join("openrouter-mcp-audio-ref/speech.mp3");
+        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        assert_eq!(result.audio.voice, None);
+
+        let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(sent.get("voice").is_none(), "sent: {sent}");
+
+        // The manifest records the provider block and that a reference went out.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["voice_reference"], true);
+        assert_eq!(
+            manifest["provider"],
+            json!({"options": {"openai": {"instructions": "speak cheerfully"}}})
+        );
+        assert!(manifest.get("voice").is_none(), "manifest: {manifest}");
+    }
+
+    /// A blank voice behaves like none: nothing on the wire, nothing in the
+    /// manifest, and no `input_references`/`provider` keys either.
+    #[tokio::test]
+    async fn run_job_omits_voice_references_and_provider_when_unset() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE-MP3".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let req = SpeechGenRequest {
+            model: "openai/gpt-4o-mini-tts".to_string(),
+            input: "hello".to_string(),
+            voice: Some("   ".to_string()),
+            response_format: None,
+            speed: None,
+            voice_reference: None,
+            provider: None,
+        };
+        let base = std::env::temp_dir().join("openrouter-mcp-audio-novoice/speech.mp3");
+        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        assert_eq!(result.audio.voice, None);
+
+        let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        for key in ["voice", "input_references", "provider"] {
+            assert!(sent.get(key).is_none(), "{key} sent: {sent}");
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result.manifest_path).unwrap()).unwrap();
+        assert!(manifest.get("voice_reference").is_none(), "{manifest}");
+        assert!(manifest.get("provider").is_none(), "{manifest}");
+    }
+
+    /// The reference sample obeys the documented caps locally: 15 MiB decoded
+    /// audio and a 10000-character transcript. Blank text is dropped, the
+    /// format is optional, and a format alias is normalized like transcription.
+    #[test]
+    fn voice_reference_enforces_the_documented_caps() {
+        let ok = VoiceReference::new(" QUJD\r\nRA== ", None, Some("  ")).unwrap();
+        assert_eq!(
+            ok.into_parts(),
+            vec![SpeechInputReference::InputAudio {
+                input_audio: SpeechReferenceAudio {
+                    data: "QUJDRA==".into(),
+                    format: None,
+                },
+            }]
+        );
+        let with_text = VoiceReference::new("QUJD", Some("x-wav"), Some("words")).unwrap();
+        assert_eq!(
+            with_text.into_parts(),
+            vec![
+                SpeechInputReference::InputAudio {
+                    input_audio: SpeechReferenceAudio {
+                        data: "QUJD".into(),
+                        format: Some("wav".into()),
+                    },
+                },
+                SpeechInputReference::Text {
+                    text: "words".into()
+                },
+            ]
+        );
+
+        let long = "x".repeat(MAX_VOICE_REFERENCE_TEXT_CHARS + 1);
+        let err = VoiceReference::new("QUJD", None, Some(&long)).unwrap_err();
+        assert!(err.to_string().contains("10000"), "got: {err}");
+        assert!(
+            VoiceReference::new("QUJD", None, Some(&long[..MAX_VOICE_REFERENCE_TEXT_CHARS]))
+                .is_ok()
+        );
+
+        let too_large = "A".repeat((MAX_VOICE_REFERENCE_BYTES.div_ceil(3) * 4 + 4) as usize);
+        let err = VoiceReference::new(&too_large, None, None).unwrap_err();
+        assert!(err.to_string().contains("voice reference"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains(&MAX_VOICE_REFERENCE_BYTES.to_string()),
+            "got: {err}"
+        );
+        assert!(VoiceReference::new("", None, None).is_err());
+        assert!(VoiceReference::new("not base64!", None, None).is_err());
+        assert!(VoiceReference::new("QUJD", Some("exe"), None).is_err());
     }
 
     #[tokio::test]
@@ -436,9 +709,11 @@ mod tests {
         let req = SpeechGenRequest {
             model: "openai/gpt-4o-mini-tts".to_string(),
             input: "hi".to_string(),
-            voice: "not-a-voice".to_string(),
+            voice: Some("not-a-voice".to_string()),
             response_format: None,
             speed: None,
+            voice_reference: None,
+            provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-err/speech.mp3");
         let err = match run_job(&client, &req, &base, "test").await {
@@ -457,6 +732,7 @@ mod tests {
             response_format: response_format.map(str::to_string),
             timestamp_granularities: granularities.iter().map(|s| s.to_string()).collect(),
             temperature: None,
+            provider: None,
         }
     }
 

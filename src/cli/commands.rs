@@ -2,13 +2,17 @@
 
 use super::table::{primary_modality, render_sectioned_table};
 use super::{
-    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, MusicArgs, TranscribeArgs, VideoArgs,
-    parse_image_arg, resolve_base_output, resolve_prompt,
+    AudioArgs, ChatArgs, DescribeArgs, EmbedArgs, GenerationArgs, ImageArgs, ModelsArgs, MusicArgs,
+    RerankArgs, TranscribeArgs, VideoArgs, parse_image_arg, parse_video_arg, resolve_base_output,
+    resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
-use crate::openrouter::{ModelsQuery, OpenRouterClient};
+use crate::openrouter::{ModelsQuery, OpenRouterClient, ProviderRouting};
 use crate::pricing::{models_to_json, video_price};
-use crate::{audio_gen, chat_gen, image_gen, music_gen, openrouter, video_gen};
+use crate::server::chat;
+use crate::server::media;
+use crate::server::provider::ProviderRoutingArgs;
+use crate::{audio_gen, chat_gen, embed_gen, image_gen, music_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
 /// output paths (JSON and table).
@@ -70,6 +74,7 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
     if args.images.is_empty() {
         anyhow::bail!("provide at least one --image");
     }
+    let provider = parse_routing(&args.provider)?;
     let req = image_gen::DescribeRequest {
         model: args.model,
         prompt: args
@@ -78,20 +83,80 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
         images: args.images.iter().map(|v| parse_image_arg(v)).collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         reasoning_effort: args.reasoning_effort,
+        provider,
+        ..Default::default()
     };
     let result = image_gen::describe_image(&client, &req).await?;
     println!("{}", result.text);
+    if let Some(meta) = chat::result_meta(&result) {
+        eprintln!("{meta}");
+    }
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }
     Ok(())
 }
 
+/// `--provider` for the routing-only endpoints (chat, describe, music,
+/// embed, rerank): routing fields only, parsed through the tool's own args
+/// type so validation is shared with the MCP tools.
+fn parse_routing(flags: &super::ProviderFlags) -> anyhow::Result<Option<ProviderRouting>> {
+    flags
+        .parse::<ProviderRoutingArgs>()?
+        .into_routing()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
 /// Send a prompt to a chat/text model and print the reply to stdout (cost to
-/// stderr). Mirrors the `chat_completion` MCP tool.
+/// stderr). Mirrors the `chat_completion` MCP tool, reusing its argument
+/// conversions so `--json-schema`, `--web-search` and `--pdf-engine` are
+/// normalized and validated the same way.
 pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let (prompt, _source) = resolve_prompt(args.prompt, args.prompt_file)?;
+    let provider = parse_routing(&args.provider)?;
+    let mcp_err = |e: rmcp::ErrorData| anyhow::anyhow!("{}", e.message);
+    let json_schema = match args.json_schema.as_deref() {
+        Some(v) => super::read_json_schema(v)?,
+        None => Default::default(),
+    };
+    let response_format =
+        chat::response_format(Some(args.json_mode), json_schema).map_err(mcp_err)?;
+    let (web_plugin, web_search_options) = chat::WebSearchArgs {
+        enabled: args.web_search.then_some(true),
+        ..Default::default()
+    }
+    .into_wire()
+    .map_err(mcp_err)?;
+    let pdf_plugin = chat::file_parser_plugin(args.pdf_engine).map_err(mcp_err)?;
+    // Multimodal inputs go through the same resolvers as the MCP tool (data
+    // URLs, size caps, format inference); the CLI takes local paths only.
+    let files = media::resolve_file_inputs(
+        args.files
+            .iter()
+            .map(|p| media::FileInput {
+                path: Some(p.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .collect(),
+    )
+    .await
+    .map_err(mcp_err)?;
+    let audio = media::resolve_audio_inputs(
+        args.audio
+            .iter()
+            .map(|p| media::AudioInput {
+                path: Some(p.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .collect(),
+    )
+    .await
+    .map_err(mcp_err)?;
+    let videos =
+        media::resolve_video_inputs(args.videos.iter().map(|v| parse_video_arg(v)).collect())
+            .await
+            .map_err(mcp_err)?;
 
     let result = chat_gen::complete(
         &client,
@@ -101,14 +166,25 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             prompt: &prompt,
             temperature: args.temperature,
             max_tokens: args.max_tokens,
-            // The CLI `chat` subcommand is text-only; no input images (cap unused).
+            // The CLI `chat` subcommand takes no input images (cap unused).
             images: &[],
             max_image_dimension: 0,
+            files: &files,
+            audio: &audio,
+            videos: &videos,
             reasoning_effort: args.reasoning_effort.as_deref(),
+            response_format,
+            plugins: web_plugin.into_iter().chain(pdf_plugin).collect(),
+            web_search_options,
+            provider,
+            ..Default::default()
         },
     )
     .await?;
     println!("{}", result.text);
+    if let Some(meta) = chat::result_meta(&result) {
+        eprintln!("{meta}");
+    }
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }
@@ -119,6 +195,16 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
 /// blocks until all variants finish (run in parallel).
 pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ImageProviderArgs>()?
+        .into_image_provider()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    image_gen::check_size_conflict(
+        args.size.as_deref(),
+        args.image_size.as_deref(),
+        args.aspect_ratio.as_deref(),
+    )?;
     let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
     let base = resolve_base_output(args.output, args.output_dir, args.output_name)?;
     let variants = args.variants.clamp(1, 16);
@@ -135,6 +221,8 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
         output_format: args.output_format,
         background: args.background,
         output_compression: args.output_compression,
+        size: args.size,
+        provider,
     };
 
     let summary = image_gen::run_job(&client, &req, variants, &base, &prompt_source).await?;
@@ -165,7 +253,19 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
 /// synchronously through the submit + poll loop (unlike the async MCP tool).
 pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
-    let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
+    // The prompt is optional for image-only models; run_job enforces "prompt
+    // or a frame/reference" so the rule is not repeated here.
+    let (prompt, prompt_source) = if args.prompt.is_none() && args.prompt_file.is_none() {
+        (None, "none".to_string())
+    } else {
+        let (text, source) = resolve_prompt(args.prompt, args.prompt_file)?;
+        (Some(text), source)
+    };
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let base = resolve_base_output(args.output, args.output_dir, args.output_name)?;
 
     let mut frames = Vec::new();
@@ -197,6 +297,11 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
             .iter()
             .map(std::path::PathBuf::from)
             .collect(),
+        reference_audio: args.reference_audio,
+        reference_videos: args.reference_videos,
+        creativity: args.creativity,
+        upscale_factor: args.upscale_factor,
+        provider,
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         poll_interval_secs: video_gen::resolve_poll_interval(),
         poll_timeout_secs: video_gen::resolve_poll_timeout(),
@@ -222,10 +327,29 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate speech and save it, plus a sidecar manifest.
+/// Generate speech and save it, plus a sidecar manifest. Mirrors the
+/// `generate_audio` MCP tool, including the optional voice-cloning reference.
 pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let (input, input_source) = resolve_prompt(args.input, args.input_file)?;
+    // clap guarantees --voice-reference-text only appears with --voice-reference;
+    // the sample goes through the MCP tool's resolver so both validate alike.
+    let voice_reference = crate::server::audio::resolve_voice_reference(
+        media::AudioInput {
+            path: args
+                .voice_reference
+                .map(|p| p.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        args.voice_reference_text,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
     let req = audio_gen::SpeechGenRequest {
         model: args.model,
@@ -233,11 +357,15 @@ pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
         voice: args.voice,
         response_format: args.response_format,
         speed: args.speed,
+        voice_reference,
+        provider,
     };
 
     let result = audio_gen::run_job(&client, &req, &args.output, &input_source).await?;
 
-    eprintln!("voice: {}", result.audio.voice);
+    if let Some(voice) = &result.audio.voice {
+        eprintln!("voice: {voice}");
+    }
     print_job_notes(&result.warnings, &[], &result.manifest_path);
     println!("{}", result.audio.path.display());
     Ok(())
@@ -255,6 +383,7 @@ pub(crate) async fn run_music(args: MusicArgs) -> anyhow::Result<()> {
         prompt,
         format: args.format,
         seed: args.seed,
+        provider: parse_routing(&args.provider)?,
     };
     let result = music_gen::run_job(&client, &req, &args.output, &prompt_source).await?;
 
@@ -273,6 +402,11 @@ pub(crate) async fn run_music(args: MusicArgs) -> anyhow::Result<()> {
 /// stderr). Mirrors the `transcribe_audio` MCP tool.
 pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let (data, format) = audio_gen::read_audio_file(&args.file, args.format.as_deref()).await?;
 
     let result = audio_gen::transcribe(
@@ -285,6 +419,7 @@ pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
             response_format: args.response_format,
             timestamp_granularities: args.timestamp_granularities,
             temperature: args.temperature,
+            provider,
         },
     )
     .await?;
@@ -300,6 +435,57 @@ pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Embed texts and print the same JSON envelope the `embed_text` MCP tool
+/// returns (cost to stderr).
+pub(crate) async fn run_embed(args: EmbedArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let req = embed_gen::EmbedRequest {
+        model: args.model,
+        input: args.inputs,
+        dimensions: args.dimensions,
+        input_type: args.input_type,
+        provider: parse_routing(&args.provider)?,
+    };
+    let result = embed_gen::embed(&client, &req).await?;
+    println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
+/// Rerank documents and print the same JSON envelope the `rerank_documents`
+/// MCP tool returns (cost to stderr).
+pub(crate) async fn run_rerank(args: RerankArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let req = embed_gen::RerankRequest {
+        model: args.model,
+        query: args.query,
+        documents: args.documents,
+        top_n: args.top_n,
+        provider: parse_routing(&args.provider)?,
+    };
+    let result = embed_gen::rerank(&client, &req).await?;
+    println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
+/// Fetch one generation record and print it verbatim as pretty JSON. Mirrors
+/// the `get_generation` MCP tool.
+pub(crate) async fn run_generation(args: GenerationArgs) -> anyhow::Result<()> {
+    let id = args.generation_id.trim();
+    if id.is_empty() {
+        anyhow::bail!("--id must not be blank");
+    }
+    let client = OpenRouterClient::from_env()?;
+    let record = client.get_generation(id).await?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
 pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let query = ModelsQuery {
@@ -309,10 +495,21 @@ pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
         supported_parameters: args.supported_parameters,
         sort: Some(args.sort.unwrap_or_else(|| "top-weekly".to_string())),
         context: args.min_context,
+        category: args.category,
+        providers: args.providers,
+        limit: args.limit,
+        offset: args.offset,
+        // The flag is presence-only; the DTO omits a `false` zdr from the wire.
+        zdr: Some(args.zdr),
+        region: args.region,
+        ..Default::default()
     };
 
-    let raw = client.list_models(&query).await?;
-    let filtered = openrouter::apply_filters(raw, args.search.as_deref(), args.all);
+    let page = client.list_models_page(&query).await?;
+    if let Some(note) = page.pagination_note() {
+        eprintln!("{note}");
+    }
+    let filtered = openrouter::apply_filters(page.data, args.search.as_deref(), args.all);
     let (models, total) = (filtered.models, filtered.total);
 
     if !args.table {
