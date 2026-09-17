@@ -6,8 +6,10 @@ use super::{
     parse_image_arg, resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
-use crate::openrouter::{ModelsQuery, OpenRouterClient};
+use crate::openrouter::{ModelsQuery, OpenRouterClient, ProviderRouting};
 use crate::pricing::{models_to_json, video_price};
+use crate::server::chat;
+use crate::server::provider::ProviderRoutingArgs;
 use crate::{audio_gen, chat_gen, image_gen, music_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
@@ -70,6 +72,7 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
     if args.images.is_empty() {
         anyhow::bail!("provide at least one --image");
     }
+    let provider = parse_routing(&args.provider)?;
     let req = image_gen::DescribeRequest {
         model: args.model,
         prompt: args
@@ -78,6 +81,8 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
         images: args.images.iter().map(|v| parse_image_arg(v)).collect(),
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         reasoning_effort: args.reasoning_effort,
+        provider,
+        ..Default::default()
     };
     let result = image_gen::describe_image(&client, &req).await?;
     println!("{}", result.text);
@@ -87,11 +92,37 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--provider` for the chat-family subcommands (chat, describe, music):
+/// routing fields only, validated exactly as the MCP tools validate them.
+fn parse_routing(flags: &super::ProviderFlags) -> anyhow::Result<Option<ProviderRouting>> {
+    flags
+        .parse::<ProviderRoutingArgs>()?
+        .into_routing()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
 /// Send a prompt to a chat/text model and print the reply to stdout (cost to
-/// stderr). Mirrors the `chat_completion` MCP tool.
+/// stderr). Mirrors the `chat_completion` MCP tool, reusing its argument
+/// conversions so `--json-schema`, `--web-search` and `--pdf-engine` are
+/// normalized and validated the same way.
 pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let (prompt, _source) = resolve_prompt(args.prompt, args.prompt_file)?;
+    let provider = parse_routing(&args.provider)?;
+    let mcp_err = |e: rmcp::ErrorData| anyhow::anyhow!("{}", e.message);
+    let json_schema = match args.json_schema.as_deref() {
+        Some(v) => super::read_json_schema(v)?,
+        None => Default::default(),
+    };
+    let response_format =
+        chat::response_format(Some(args.json_mode), json_schema).map_err(mcp_err)?;
+    let (web_plugin, web_search_options) = chat::WebSearchArgs {
+        enabled: args.web_search.then_some(true),
+        ..Default::default()
+    }
+    .into_wire()
+    .map_err(mcp_err)?;
+    let pdf_plugin = chat::file_parser_plugin(args.pdf_engine).map_err(mcp_err)?;
 
     let result = chat_gen::complete(
         &client,
@@ -105,10 +136,18 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             images: &[],
             max_image_dimension: 0,
             reasoning_effort: args.reasoning_effort.as_deref(),
+            response_format,
+            plugins: web_plugin.into_iter().chain(pdf_plugin).collect(),
+            web_search_options,
+            provider,
+            ..Default::default()
         },
     )
     .await?;
     println!("{}", result.text);
+    if let Some(meta) = chat::result_meta(&result) {
+        eprintln!("{meta}");
+    }
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }
@@ -255,6 +294,7 @@ pub(crate) async fn run_music(args: MusicArgs) -> anyhow::Result<()> {
         prompt,
         format: args.format,
         seed: args.seed,
+        provider: parse_routing(&args.provider)?,
     };
     let result = music_gen::run_job(&client, &req, &args.output, &prompt_source).await?;
 

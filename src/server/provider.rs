@@ -25,33 +25,12 @@ use crate::openrouter::{
 use crate::server::schema::{de_lenient, de_opt_bool, scalarize_nullable};
 
 /// Accepted `sort` values (OpenRouter `ProviderPreferences.sort`).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 const SORT_VALUES: [&str; 4] = ["price", "throughput", "latency", "exacto"];
 /// Accepted `sort_partition` values (`sort.partition` in the object form).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 const SORT_PARTITIONS: [&str; 2] = ["model", "none"];
 
 /// Routing-only `provider` block for chat completions, `/embeddings` and
 /// `/rerank` - the endpoints whose schema rejects `options`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct ProviderRoutingArgs {
@@ -84,13 +63,6 @@ pub(crate) struct ProviderRoutingArgs {
     pub sort_partition: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 impl ProviderRoutingArgs {
     /// Validate and convert; `Ok(None)` when nothing is set.
     pub(crate) fn into_routing(self) -> Result<Option<ProviderRouting>, ErrorData> {
@@ -194,13 +166,6 @@ impl ProviderOptionsArgs {
 }
 
 /// Trim slugs and drop blank entries (the repo-wide "blank means absent" rule).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 fn clean_slugs(slugs: Vec<String>) -> Vec<String> {
     slugs
         .into_iter()
@@ -212,13 +177,6 @@ fn clean_slugs(slugs: Vec<String>) -> Vec<String> {
 /// `sort` + `sort_partition` -> the wire enum. Blank strings count as unset;
 /// vocabulary is checked case-insensitively; a partition without a sort is an
 /// error because upstream has nowhere to put it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 fn parse_sort(
     sort: Option<String>,
     partition: Option<String>,

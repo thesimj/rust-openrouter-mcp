@@ -21,7 +21,7 @@ use caps::ModelCapsCache;
 mod account;
 mod audio;
 mod caps;
-mod chat;
+pub(crate) mod chat;
 mod image;
 mod models;
 mod music;

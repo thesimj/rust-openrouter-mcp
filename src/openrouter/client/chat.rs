@@ -132,15 +132,7 @@ mod tests {
             let error = client
                 .chat_completion(&ChatRequest {
                     model: "test/chat".into(),
-                    messages: vec![],
-                    modalities: None,
-                    image_config: None,
-                    seed: None,
-                    temperature: None,
-                    max_tokens: None,
-                    reasoning: None,
-                    audio: None,
-                    stream: false,
+                    ..Default::default()
                 })
                 .await
                 .expect_err("invalid response");
@@ -163,13 +155,8 @@ mod tests {
                 content: crate::openrouter::Content::Text("lo-fi loop".to_string()),
             }],
             modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            image_config: None,
-            seed: None,
-            temperature: None,
-            max_tokens: None,
-            reasoning: None,
-            audio: None,
             stream: true,
+            ..Default::default()
         }
     }
 

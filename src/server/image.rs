@@ -17,11 +17,13 @@ use serde_json::json;
 
 use crate::image_gen::{self, GenerateRequest};
 use crate::server::naming;
+use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
 use crate::server::schema::{
-    AtLeastOneOf, RequireFields, de_opt_uint, require_all, scalarize_nullable,
+    AtLeastOneOf, RequireFields, de_lenient, de_opt_f64, de_opt_uint, require_all,
+    scalarize_nullable,
 };
 use crate::tasks::TaskKind;
 
@@ -388,6 +390,20 @@ pub(crate) struct DescribeImageArgs {
     /// charts, diagrams and dense text benefit from "high".
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional system instruction prepended as a system message.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Optional sampling temperature.
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    pub temperature: Option<f64>,
+    /// Optional maximum number of tokens to generate.
+    #[serde(default, deserialize_with = "de_opt_uint")]
+    pub max_tokens: Option<u64>,
+    /// Provider routing: {"order": [...], "only": [...], "ignore": [...],
+    /// "allow_fallbacks", "require_parameters", "zdr", "sort", "sort_partition"}.
+    /// Routing fields only - chat completions have no per-provider `options`.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderRoutingArgs,
 }
 
 /// Build the lean per-job result object for an image job (paths, dims, requested
@@ -579,7 +595,10 @@ impl OpenRouterServer {
         model (image input, text output, e.g. google/gemini-2.5-flash, anthropic/claude-sonnet-4.6, \
         or openai/gpt-5.4). Pass one or more images (each a local path, an http(s) url, or \
         base64/data-URL) and an optional prompt/question (defaults to a detailed description); \
-        returns the model's text. Images are downscaled before sending. \
+        returns the model's text. Images are downscaled before sending. Optional `system`, \
+        `temperature`, `max_tokens` and `reasoning_effort` are passed through; `provider` \
+        takes routing fields only (order, only, ignore, allow_fallbacks, require_parameters, \
+        zdr, sort) - there is no per-provider `options` passthrough on chat completions. \
         To create or edit an image instead, use generate_image.",
         annotations(
             title = "Describe Image",
@@ -600,6 +619,7 @@ impl OpenRouterServer {
             ));
         }
         let model = args.model.clone();
+        let provider = args.provider.into_routing()?;
         let req = image_gen::DescribeRequest {
             model: args.model,
             prompt: args
@@ -608,6 +628,10 @@ impl OpenRouterServer {
             images: resolve_image_inputs(args.images).await?,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
             reasoning_effort: args.reasoning_effort,
+            system: args.system,
+            temperature: args.temperature,
+            max_tokens: args.max_tokens,
+            provider,
         };
         match image_gen::describe_image(&self.client, &req).await {
             Ok(result) => {
@@ -902,6 +926,60 @@ mod tests {
                 .any(|w| w.as_str().unwrap().contains("image/webp")
                     && w.as_str().unwrap().contains("image/png")),
             "got: {warnings:?}"
+        );
+    }
+
+    /// `describe_image` no longer hardcodes system/temperature/max_tokens to
+    /// `None`: they and the provider routing block reach the wire, arriving the
+    /// way a client sends them (lenient nested object).
+    #[tokio::test]
+    async fn describe_image_forwards_system_sampling_and_provider() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "messages": [{"role": "system", "content": "be brief"}, {"role": "user"}],
+                "temperature": 0.2,
+                "max_tokens": 50,
+                "provider": {"order": ["google-vertex"], "zdr": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "a square"}}]
+            })))
+            .mount(&mock)
+            .await;
+        let args: DescribeImageArgs = serde_json::from_value(json!({
+            "model": "google/gemini-2.5-flash",
+            "images": [{"base64": valid_png_b64()}],
+            "system": "be brief",
+            "temperature": "0.2",
+            "max_tokens": 50,
+            "provider": {"order": ["google-vertex"], "zdr": "true"}
+        }))
+        .unwrap();
+        let res = server_for(mock.uri())
+            .describe_image(rmcp::handler::server::wrapper::Parameters(args))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&res).unwrap()["content"][0]["text"],
+            "a square"
+        );
+
+        // An invalid routing block is rejected before any HTTP call.
+        let bad: DescribeImageArgs = serde_json::from_value(json!({
+            "model": "m", "images": [{"base64": valid_png_b64()}],
+            "provider": {"sort_partition": "model"}
+        }))
+        .unwrap();
+        let err = server_for("http://127.0.0.1:9".to_string())
+            .describe_image(rmcp::handler::server::wrapper::Parameters(bad))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("sort_partition"),
+            "got: {}",
+            err.message
         );
     }
 

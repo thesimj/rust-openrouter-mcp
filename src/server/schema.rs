@@ -335,12 +335,14 @@ mod tests {
         use super::schema_json;
         use crate::server::account::{GetResultArgs, ResetUsageStatsArgs};
         use crate::server::audio::TranscribeAudioArgs;
+        use crate::server::chat::WebSearchArgs;
         use crate::server::models::DescribeModelArgs;
         use crate::server::provider::{
             ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
         };
         let schemas: Vec<(&str, serde_json::Value)> = vec![
             ("ChatCompletionArgs", schema_json::<ChatCompletionArgs>()),
+            ("WebSearchArgs", schema_json::<WebSearchArgs>()),
             ("DescribeImageArgs", schema_json::<DescribeImageArgs>()),
             ("GenerateImageArgs", schema_json::<GenerateImageArgs>()),
             ("GenerateVideoArgs", schema_json::<GenerateVideoArgs>()),
