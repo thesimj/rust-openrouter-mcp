@@ -180,6 +180,17 @@ impl UsageStats {
         m.audio_files += 1;
     }
 
+    /// Record one metadata lookup (e.g. `get_generation`): it counts as a
+    /// request (and a failure when `success` is false) but never as a
+    /// generation or a cost - the record it fetches is some other call's bill.
+    pub async fn record_lookup(&self, success: bool) {
+        let mut s = self.inner.lock().await;
+        s.requests_total += 1;
+        if !success {
+            s.requests_failed += 1;
+        }
+    }
+
     /// Account the receipt carried by a failed request, if the provider had
     /// already answered (and so billed) before the local failure. A receipt
     /// without usage counts as an unknown cost, not as free.
@@ -255,6 +266,22 @@ mod tests {
         assert_eq!(s["actual_cost_usd"], 0.24);
         assert_eq!(s["by_model"]["model-a"]["images_generated"], 3);
         assert_eq!(s["by_model"]["model-b"]["actual_cost_usd"], 0.04);
+    }
+
+    /// A lookup (`get_generation`) is a request, never a generation or a
+    /// cost: the record it fetches describes some other call's charge.
+    #[tokio::test]
+    async fn record_lookup_counts_requests_only() {
+        let stats = UsageStats::new();
+        stats.record_lookup(true).await;
+        stats.record_lookup(false).await;
+        let s = stats.snapshot().await;
+        assert_eq!(s["requests_total"], 2);
+        assert_eq!(s["requests_failed"], 1);
+        assert_eq!(s["text_generations"], 0);
+        assert_eq!(s["actual_cost_usd"], 0.0);
+        assert_eq!(s["unknown_cost_count"], 0);
+        assert!(s["by_model"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]

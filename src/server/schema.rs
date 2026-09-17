@@ -335,11 +335,15 @@ mod tests {
         use super::schema_json;
         use crate::server::account::{GetResultArgs, ResetUsageStatsArgs};
         use crate::server::audio::TranscribeAudioArgs;
+        use crate::server::embeddings::{EmbedTextArgs, GetGenerationArgs, RerankDocumentsArgs};
         use crate::server::models::DescribeModelArgs;
         use crate::server::provider::{
             ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
         };
         let schemas: Vec<(&str, serde_json::Value)> = vec![
+            ("EmbedTextArgs", schema_json::<EmbedTextArgs>()),
+            ("RerankDocumentsArgs", schema_json::<RerankDocumentsArgs>()),
+            ("GetGenerationArgs", schema_json::<GetGenerationArgs>()),
             ("ChatCompletionArgs", schema_json::<ChatCompletionArgs>()),
             ("DescribeImageArgs", schema_json::<DescribeImageArgs>()),
             ("GenerateImageArgs", schema_json::<GenerateImageArgs>()),
@@ -358,6 +362,43 @@ mod tests {
         for (name, schema) in &schemas {
             super::assert_client_safe_schema(schema, name);
         }
+    }
+
+    /// The retrieval tools' required arrays advertise `minItems: 1` (the prose
+    /// says "at least one"), their genuinely required scalars are in
+    /// `required`, and the routing block is an optional `$ref` into `$defs`.
+    #[test]
+    fn retrieval_tool_schemas_require_texts_and_carry_optional_routing() {
+        use super::schema_json;
+        use crate::server::embeddings::{EmbedTextArgs, GetGenerationArgs, RerankDocumentsArgs};
+
+        let embed = schema_json::<EmbedTextArgs>();
+        assert_eq!(embed["properties"]["input"]["minItems"], json!(1));
+        assert_eq!(embed["properties"]["dimensions"]["type"], json!("integer"));
+        let required = required_fields::<EmbedTextArgs>();
+        assert!(required.contains(&"model".to_string()), "{required:?}");
+        assert!(required.contains(&"input".to_string()), "{required:?}");
+        assert!(!required.contains(&"provider".to_string()), "{required:?}");
+        assert_eq!(
+            embed["properties"]["provider"]["$ref"],
+            json!("#/$defs/ProviderRoutingArgs")
+        );
+        assert!(embed["$defs"]["ProviderRoutingArgs"].is_object());
+
+        let rerank = schema_json::<RerankDocumentsArgs>();
+        assert_eq!(rerank["properties"]["documents"]["minItems"], json!(1));
+        assert_eq!(rerank["properties"]["top_n"]["type"], json!("integer"));
+        let required = required_fields::<RerankDocumentsArgs>();
+        for name in ["model", "query", "documents"] {
+            assert!(required.contains(&name.to_string()), "{required:?}");
+        }
+        assert_eq!(
+            rerank["properties"]["provider"]["$ref"],
+            json!("#/$defs/ProviderRoutingArgs")
+        );
+
+        let required = required_fields::<GetGenerationArgs>();
+        assert_eq!(required, vec!["generation_id".to_string()]);
     }
 
     /// The lint must actually catch the two traps it exists for, or it guards

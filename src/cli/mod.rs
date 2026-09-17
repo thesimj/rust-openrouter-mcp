@@ -45,6 +45,12 @@ enum Command {
     Describe(DescribeArgs),
     /// Send a prompt to any chat/text model and print its reply.
     Chat(ChatArgs),
+    /// Embed one or more texts with an embeddings model and print the vectors as JSON.
+    Embed(EmbedArgs),
+    /// Rerank documents against a query with a rerank model and print the ranking as JSON.
+    Rerank(RerankArgs),
+    /// Fetch the cost/latency record of one request by its generation id.
+    Generation(GenerationArgs),
     /// Show basic info about the API key in use (label, owner, credits, limits).
     Key,
 }
@@ -288,6 +294,54 @@ pub(crate) struct TranscribeArgs {
     provider: ProviderFlags,
 }
 
+/// CLI flags for `embed`, mirroring the `embed_text` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct EmbedArgs {
+    /// Embeddings model id, e.g. openai/text-embedding-3-small (discover with
+    /// `models --output-modalities embeddings`).
+    #[arg(short, long)]
+    model: String,
+    /// Text to embed (repeatable; one flag per text).
+    #[arg(short, long = "input", required = true)]
+    inputs: Vec<String>,
+    /// Output vector size, for models that support truncation.
+    #[arg(long)]
+    dimensions: Option<u32>,
+    /// Provider-specific hint such as "query" or "document".
+    #[arg(long)]
+    input_type: Option<String>,
+    #[command(flatten)]
+    provider: ProviderFlags,
+}
+
+/// CLI flags for `rerank`, mirroring the `rerank_documents` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct RerankArgs {
+    /// Rerank model id, e.g. cohere/rerank-v3.5 (discover with
+    /// `models --output-modalities rerank`).
+    #[arg(short, long)]
+    model: String,
+    /// The query to rank the documents against.
+    #[arg(short, long)]
+    query: String,
+    /// Document text (repeatable; one flag per document, order preserved).
+    #[arg(short, long = "document", required = true)]
+    documents: Vec<String>,
+    /// Return only the best N documents.
+    #[arg(long)]
+    top_n: Option<u32>,
+    #[command(flatten)]
+    provider: ProviderFlags,
+}
+
+/// CLI flags for `generation`, mirroring the `get_generation` MCP tool.
+#[derive(clap::Args)]
+pub(crate) struct GenerationArgs {
+    /// The generation id (`X-Generation-Id`) reported by a previous request.
+    #[arg(long = "id", value_name = "GENERATION_ID")]
+    generation_id: String,
+}
+
 /// CLI flags for `chat`, mirroring the `chat_completion` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct ChatArgs {
@@ -360,6 +414,9 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Transcribe(args)) => commands::run_transcribe(args).await,
         Some(Command::Describe(args)) => commands::run_describe(args).await,
         Some(Command::Chat(args)) => commands::run_chat(args).await,
+        Some(Command::Embed(args)) => commands::run_embed(args).await,
+        Some(Command::Rerank(args)) => commands::run_rerank(args).await,
+        Some(Command::Generation(args)) => commands::run_generation(args).await,
         Some(Command::Key) => commands::run_key().await,
         Some(Command::Mcp) | None => crate::server::run().await,
     }
@@ -514,6 +571,87 @@ mod tests {
                 .into_options()
                 .is_err()
         );
+    }
+
+    /// The retrieval subcommands mirror their MCP tools: repeatable text
+    /// flags, the optional knobs, and the shared `--provider` routing block
+    /// parsed through the tool's own args type.
+    #[test]
+    fn embed_rerank_and_generation_subcommands_parse_like_their_tools() {
+        use crate::server::provider::ProviderRoutingArgs;
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "embed",
+            "-m",
+            "openai/text-embedding-3-small",
+            "--input",
+            "a",
+            "--input",
+            "b",
+            "--dimensions",
+            "256",
+            "--input-type",
+            "query",
+            "--provider",
+            "{\"order\":[\"openai\"],\"zdr\":true}",
+        ])
+        .unwrap();
+        let Some(Command::Embed(args)) = cli.command else {
+            panic!("expected embed")
+        };
+        assert_eq!(args.inputs, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(args.dimensions, Some(256));
+        assert_eq!(args.input_type.as_deref(), Some("query"));
+        let routing = args
+            .provider
+            .parse::<ProviderRoutingArgs>()
+            .unwrap()
+            .into_routing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.order, vec!["openai".to_string()]);
+        assert_eq!(routing.zdr, Some(true));
+        // At least one --input is mandatory, like the tool's minItems: 1.
+        assert!(Cli::try_parse_from(["openrouter-mcp", "embed", "-m", "m"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "rerank",
+            "-m",
+            "cohere/rerank-v3.5",
+            "-q",
+            "rust",
+            "--document",
+            "go",
+            "--document",
+            "rust lang",
+            "--top-n",
+            "1",
+        ])
+        .unwrap();
+        let Some(Command::Rerank(args)) = cli.command else {
+            panic!("expected rerank")
+        };
+        assert_eq!(args.query, "rust");
+        assert_eq!(
+            args.documents,
+            vec!["go".to_string(), "rust lang".to_string()]
+        );
+        assert_eq!(args.top_n, Some(1));
+        assert!(
+            args.provider
+                .parse::<ProviderRoutingArgs>()
+                .unwrap()
+                .into_routing()
+                .unwrap()
+                .is_none()
+        );
+
+        let cli = Cli::try_parse_from(["openrouter-mcp", "generation", "--id", "gen-1"]).unwrap();
+        let Some(Command::Generation(args)) = cli.command else {
+            panic!("expected generation")
+        };
+        assert_eq!(args.generation_id, "gen-1");
     }
 
     #[test]

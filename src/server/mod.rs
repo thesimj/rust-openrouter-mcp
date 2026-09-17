@@ -22,6 +22,7 @@ mod account;
 mod audio;
 mod caps;
 mod chat;
+mod embeddings;
 mod image;
 mod models;
 mod music;
@@ -70,6 +71,7 @@ impl OpenRouterServer {
                 + Self::audio_router()
                 + Self::music_router()
                 + Self::chat_router()
+                + Self::embeddings_router()
                 + Self::account_router(),
         }
     }
