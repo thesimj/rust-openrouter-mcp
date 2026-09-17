@@ -30,6 +30,13 @@ pub struct Manifest {
     pub background: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_compression: Option<u32>,
+    /// Requested `size` ("WIDTHxHEIGHT" pixels or a tier), when one was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// The `provider` block sent with the request (routing + passthrough
+    /// options), when one was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ImageProvider>,
     pub created_at: String,
     pub input_images: Vec<InputImageMeta>,
     pub variants: Vec<VariantMeta>,

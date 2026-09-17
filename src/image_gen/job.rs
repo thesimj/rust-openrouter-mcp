@@ -55,6 +55,8 @@ pub async fn generate_variants(
         output_format: req.output_format.clone(),
         background: req.background.clone(),
         output_compression: req.output_compression,
+        size: req.size.clone(),
+        provider: req.provider.clone(),
     });
     let content = Arc::new(content);
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_VARIANTS));
@@ -340,6 +342,8 @@ async fn save_outcomes(
         output_format: req.output_format.clone(),
         background: req.background.clone(),
         output_compression: req.output_compression,
+        size: req.size.clone(),
+        provider: req.provider.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         input_images,
         variants: variant_metas,
@@ -433,6 +437,11 @@ mod tests {
             output_format: Some("webp".to_string()),
             background: Some("transparent".to_string()),
             output_compression: Some(80),
+            size: Some("1024x1024".to_string()),
+            provider: Some(crate::openrouter::ImageProvider {
+                order: vec!["openai".to_string()],
+                ..Default::default()
+            }),
         };
         let base = std::env::temp_dir().join("openrouter-mcp-manifest-knobs-test/hero.png");
         let summary = run_job(&client, &req, 1, &base, "inline").await.unwrap();
@@ -443,6 +452,11 @@ mod tests {
         assert_eq!(manifest["output_format"], "webp");
         assert_eq!(manifest["background"], "transparent");
         assert_eq!(manifest["output_compression"], 80);
+        assert_eq!(manifest["size"], "1024x1024");
+        assert_eq!(
+            manifest["provider"],
+            serde_json::json!({"order": ["openai"]})
+        );
     }
 }
 
@@ -462,6 +476,8 @@ mod audit_regression {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: None,
         }
     }
 

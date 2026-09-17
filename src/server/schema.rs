@@ -494,9 +494,16 @@ mod tests {
         let music = required_fields::<GenerateMusicArgs>();
         assert!(music.contains(&"prompt".to_string()), "{music:?}");
 
+        // aspect_ratio/image_size are conditional (not required when `size` is
+        // given), so they stay OUT of the unconditional schema required list;
+        // model and prompt remain required.
         let image = required_fields::<GenerateImageArgs>();
-        assert!(image.contains(&"aspect_ratio".to_string()), "{image:?}");
-        assert!(image.contains(&"image_size".to_string()), "{image:?}");
+        assert!(image.contains(&"model".to_string()), "{image:?}");
+        assert!(image.contains(&"prompt".to_string()), "{image:?}");
+        assert!(!image.contains(&"aspect_ratio".to_string()), "{image:?}");
+        assert!(!image.contains(&"image_size".to_string()), "{image:?}");
+        assert!(!image.contains(&"size".to_string()), "{image:?}");
+        assert!(!image.contains(&"provider".to_string()), "{image:?}");
 
         let video = required_fields::<GenerateVideoArgs>();
         assert!(video.contains(&"duration".to_string()), "{video:?}");

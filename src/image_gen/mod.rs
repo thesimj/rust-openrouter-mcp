@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 
 use crate::chat_gen;
 use crate::image_io;
-use crate::openrouter::{ImageUrl, ImagesRequest, InputReference, OpenRouterClient};
+use crate::openrouter::{ImageProvider, ImageUrl, ImagesRequest, InputReference, OpenRouterClient};
 
 pub(crate) mod job;
 
@@ -99,7 +99,8 @@ pub struct GenerateRequest {
     pub images: Vec<InputImage>,
     /// Longest-side cap (px) for normalized input images.
     pub max_image_dimension: u32,
-    /// "auto" | "low" | "medium" | "high". Provider support varies.
+    /// "auto" | "low" | "medium" | "high" | "xhigh" | "max". Provider support
+    /// varies.
     pub quality: Option<String>,
     /// "png" | "jpeg" | "webp" | "svg". Provider support varies.
     pub output_format: Option<String>,
@@ -107,6 +108,52 @@ pub struct GenerateRequest {
     pub background: Option<String>,
     /// 0-100, webp/jpeg only. Provider support varies.
     pub output_compression: Option<u32>,
+    /// Output size as "WIDTHxHEIGHT" pixels or a tier; see
+    /// [`check_size_conflict`] for the combination upstream rejects.
+    pub size: Option<String>,
+    /// The `/images` `provider` block (routing subset + passthrough options),
+    /// already validated by the caller; `None` sends nothing.
+    pub provider: Option<ImageProvider>,
+}
+
+/// True for the pixel form of `size` ("2048x2048", also "2048X2048"): two
+/// positive integers around an `x`. Tiers ("2K", "512") are not pixel-form.
+fn is_pixel_size(size: &str) -> bool {
+    let s = size.trim();
+    s.split_once(['x', 'X']).is_some_and(|(w, h)| {
+        w.parse::<u32>().is_ok_and(|w| w > 0) && h.parse::<u32>().is_ok_and(|h| h > 0)
+    })
+}
+
+/// Refuse the request shape OpenRouter answers with 400: a pixel-form `size`
+/// sent alongside `image_size` (wire `resolution`) or `aspect_ratio`. Shared by
+/// the MCP tool and the CLI so the check lives once. Blank strings count as
+/// absent; a tier-form `size` never conflicts.
+pub fn check_size_conflict(
+    size: Option<&str>,
+    image_size: Option<&str>,
+    aspect_ratio: Option<&str>,
+) -> Result<()> {
+    fn present(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let Some(size) = present(size).filter(|s| is_pixel_size(s)) else {
+        return Ok(());
+    };
+    let conflicting: Vec<&str> = [
+        present(image_size).map(|_| "image_size"),
+        present(aspect_ratio).map(|_| "aspect_ratio"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    anyhow::ensure!(
+        conflicting.is_empty(),
+        "size {size:?} is pixel dimensions and conflicts with {}: OpenRouter returns 400 when \
+         both are given. Pass either size (pixels) or image_size + aspect_ratio, not both",
+        conflicting.join(" and ")
+    );
+    Ok(())
 }
 
 /// Resolve the input-image dimension cap: explicit value, else the
@@ -350,6 +397,8 @@ pub(crate) async fn generate_core(
         output_format: req.output_format.clone(),
         background: req.background.clone(),
         output_compression: req.output_compression,
+        size: req.size.clone(),
+        provider: req.provider.clone(),
     };
 
     let (resp, generation_id) = client.generate_images(&request).await?;

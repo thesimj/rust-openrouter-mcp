@@ -119,6 +119,16 @@ pub(crate) async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
 /// blocks until all variants finish (run in parallel).
 pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ImageProviderArgs>()?
+        .into_image_provider()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    image_gen::check_size_conflict(
+        args.size.as_deref(),
+        args.image_size.as_deref(),
+        args.aspect_ratio.as_deref(),
+    )?;
     let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
     let base = resolve_base_output(args.output, args.output_dir, args.output_name)?;
     let variants = args.variants.clamp(1, 16);
@@ -135,6 +145,8 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
         output_format: args.output_format,
         background: args.background,
         output_compression: args.output_compression,
+        size: args.size,
+        provider,
     };
 
     let summary = image_gen::run_job(&client, &req, variants, &base, &prompt_source).await?;

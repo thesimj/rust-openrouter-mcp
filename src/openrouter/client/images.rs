@@ -62,6 +62,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: None,
         }
     }
 

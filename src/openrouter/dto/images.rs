@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{InputReference, Usage};
+use super::{ImageProvider, InputReference, Usage};
 
 /// Request body for `POST /api/v1/images`. Optional fields are omitted when
 /// unset. `resolution`/`aspect_ratio` map from the tool's `image_size`/
@@ -28,7 +28,8 @@ pub struct ImagesRequest {
     pub n: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_references: Vec<InputReference>,
-    /// "auto" | "low" | "medium" | "high". Provider support varies.
+    /// "auto" | "low" | "medium" | "high" | "xhigh" | "max". Provider support
+    /// varies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
     /// "png" | "jpeg" | "webp" | "svg". Provider support varies.
@@ -40,6 +41,14 @@ pub struct ImagesRequest {
     /// 0-100, webp/jpeg only. Provider support varies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_compression: Option<u32>,
+    /// Output size: pixel dimensions ("2048x2048") or a tier ("2K"). A pixel
+    /// size sent together with `resolution`/`aspect_ratio` is a 400 upstream;
+    /// the domain layer refuses that combination before it gets here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Provider routing subset plus per-provider passthrough `options`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ImageProvider>,
 }
 
 /// Response from `POST /api/v1/images`.
@@ -64,7 +73,7 @@ pub struct ImageData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openrouter::ImageUrl;
+    use crate::openrouter::{ImageProvider, ImageUrl};
     use serde_json::json;
 
     /// The request omits empty/unset optionals and renders `input_references`
@@ -85,6 +94,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: None,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -116,6 +127,8 @@ mod tests {
             output_format: Some("webp".to_string()),
             background: Some("transparent".to_string()),
             output_compression: Some(80),
+            size: None,
+            provider: None,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -126,6 +139,49 @@ mod tests {
                 "output_format": "webp",
                 "background": "transparent",
                 "output_compression": 80
+            })
+        );
+    }
+
+    /// `size` and the `/images` `provider` block reach the wire only when set,
+    /// with `provider` nested exactly as OpenRouter documents it (routing
+    /// subset plus `options` keyed by provider slug).
+    #[test]
+    fn images_request_serializes_size_and_provider_when_set() {
+        let mut options = std::collections::BTreeMap::new();
+        options.insert(
+            "black-forest-labs".to_string(),
+            json!({"steps": 28, "guidance": 3.5}),
+        );
+        let req = ImagesRequest {
+            model: "black-forest-labs/flux.2-pro".to_string(),
+            prompt: "an owl".to_string(),
+            resolution: None,
+            aspect_ratio: None,
+            seed: None,
+            n: None,
+            input_references: vec![],
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
+            size: Some("2048x2048".to_string()),
+            provider: Some(ImageProvider {
+                order: vec!["black-forest-labs".to_string()],
+                options,
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "model": "black-forest-labs/flux.2-pro",
+                "prompt": "an owl",
+                "size": "2048x2048",
+                "provider": {
+                    "order": ["black-forest-labs"],
+                    "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+                }
             })
         );
     }
