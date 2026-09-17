@@ -88,6 +88,9 @@ pub(crate) async fn run_describe(args: DescribeArgs) -> anyhow::Result<()> {
     };
     let result = image_gen::describe_image(&client, &req).await?;
     println!("{}", result.text);
+    if let Some(meta) = chat::result_meta(&result) {
+        eprintln!("{meta}");
+    }
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }

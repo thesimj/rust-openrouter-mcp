@@ -182,8 +182,10 @@ impl OpenRouterServer {
 
     #[tool(
         description = "Look up the stored record of one request by its generation id \
-        (GET /api/v1/generation?id=). Every other tool's result carries a generation_id (from \
-        OpenRouter's X-Generation-Id header); this returns what OpenRouter recorded for it as \
+        (GET /api/v1/generation?id=). The id (\"gen-...\", from OpenRouter's X-Generation-Id \
+        header) is in the result of chat_completion, describe_image, generate_music, embed_text \
+        and rerank_documents, and in the sidecar manifest generate_image, generate_video and \
+        generate_audio write; this returns what OpenRouter recorded for it as \
         JSON, verbatim: total_cost (USD actually charged), provider_name, the model, native \
         token counts (native_tokens_prompt / native_tokens_completion / reasoning / cached), \
         latency and generation_time in milliseconds, api_type, finish reason, and more. Use \

@@ -222,8 +222,13 @@ pub struct ImageUrl {
     pub url: String,
 }
 
+/// A non-streamed completion. `id` is the generation id (`gen-...`) OpenRouter
+/// puts in the body; the client overwrites it with the `X-Generation-Id`
+/// header when that is present, so it is the value `get_generation` takes.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletion {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub choices: Vec<Choice>,
     #[serde(default)]

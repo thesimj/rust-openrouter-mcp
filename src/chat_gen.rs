@@ -13,12 +13,16 @@ use crate::openrouter::{
 };
 
 /// A chat reply: the assistant text plus what came with it - the reported USD
-/// cost, the reasoning text (when the model exposes it), the raw response
-/// `annotations` (web-search citations, parsed-file records), the
-/// `finish_reason`, and the token counts.
+/// cost, the generation id (for `get_generation`), the reasoning text (when
+/// the model exposes it), the raw response `annotations` (web-search
+/// citations, parsed-file records), the `finish_reason`, and the token counts.
+#[derive(Debug)]
 pub struct ChatResult {
     pub text: String,
     pub cost: Option<f64>,
+    /// OpenRouter's generation id (`gen-...`): the `X-Generation-Id` header,
+    /// else the body `id`. Absent only when the upstream sent neither.
+    pub generation_id: Option<String>,
     pub reasoning: Option<String>,
     pub annotations: Vec<serde_json::Value>,
     pub finish_reason: Option<String>,
@@ -187,13 +191,15 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
     let cost = usage.as_ref().and_then(|u| u.cost);
     let receipt = crate::billing::Receipt {
         cost,
-        generation_id: None,
+        generation_id: completion.id,
     };
+    let generation_id = receipt.generation_id.clone();
     receipt.wrap(|| {
         let choice = first_choice(completion.choices, !inputs.images.is_empty())?;
         Ok(ChatResult {
             text: choice.text,
             cost,
+            generation_id,
             reasoning: choice.reasoning,
             annotations: choice.annotations,
             finish_reason: choice.finish_reason,
@@ -235,4 +241,54 @@ fn first_choice(choices: Vec<Choice>, has_images: bool) -> Result<FirstChoice> {
         annotations: choice.message.annotations,
         finish_reason: choice.finish_reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mock_completion(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-chat-7")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The generation id reaches the result on success and rides on the
+    /// billing receipt when the reply is unusable (billed, but no text) - the
+    /// two paths `get_generation` and `record_failed_receipt` depend on.
+    #[tokio::test]
+    async fn complete_carries_the_generation_id_on_success_and_in_the_failure_receipt() {
+        let server = mock_completion(serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"cost": 0.01}
+        }))
+        .await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let inputs = ChatInputs {
+            model: "m",
+            prompt: "hello",
+            ..Default::default()
+        };
+        let result = complete(&client, &inputs).await.unwrap();
+        assert_eq!(result.generation_id.as_deref(), Some("gen-chat-7"));
+        assert_eq!(result.cost, Some(0.01));
+
+        let server =
+            mock_completion(serde_json::json!({"choices": [], "usage": {"cost": 0.01}})).await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let error = complete(&client, &inputs).await.unwrap_err();
+        let receipt = crate::billing::Receipt::from_error(&error).expect("billed failure");
+        assert_eq!(receipt.generation_id.as_deref(), Some("gen-chat-7"));
+        assert_eq!(receipt.cost, Some(0.01));
+    }
 }

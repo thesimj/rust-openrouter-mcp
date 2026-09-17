@@ -457,7 +457,10 @@ impl OpenRouterServer {
         model (image input, text output, e.g. google/gemini-2.5-flash, anthropic/claude-sonnet-4.6, \
         or openai/gpt-5.4). Pass one or more images (each a local path, an http(s) url, or \
         base64/data-URL) and an optional prompt/question (defaults to a detailed description); \
-        returns the model's text. Images are downscaled before sending. Optional `system`, \
+        returns the model's text as the first content block, then a JSON block with the \
+        generation_id (for get_generation) and, when present, reasoning, finish_reason and \
+        token counts - the same shape chat_completion returns. Images are downscaled before \
+        sending. Optional `system`, \
         `temperature`, `max_tokens` and `reasoning_effort` are passed through; `provider` \
         takes routing fields only (order, only, ignore, allow_fallbacks, require_parameters, \
         zdr, sort) - there is no per-provider `options` passthrough on chat completions. \
@@ -498,9 +501,11 @@ impl OpenRouterServer {
         match image_gen::describe_image(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    result.text,
-                )]))
+                let mut blocks = vec![ContentBlock::text(result.text.clone())];
+                if let Some(meta) = super::chat::result_meta(&result) {
+                    blocks.push(ContentBlock::text(meta));
+                }
+                Ok(CallToolResult::success(blocks))
             }
             Err(e) => {
                 self.stats.record_text(&model, false, None).await;
@@ -855,9 +860,14 @@ mod tests {
                 "max_tokens": 50,
                 "provider": {"order": ["google-vertex"], "zdr": true}
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "a square"}}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-desc")
+                    .set_body_json(json!({
+                        "choices": [{"message": {"content": "a square"}}],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 2}
+                    })),
+            )
             .mount(&mock)
             .await;
         let args: DescribeImageArgs = serde_json::from_value(json!({
@@ -873,10 +883,14 @@ mod tests {
             .describe_image(rmcp::handler::server::wrapper::Parameters(args))
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::to_value(&res).unwrap()["content"][0]["text"],
-            "a square"
-        );
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["content"][0]["text"], "a square");
+        // Same second block as chat_completion: the generation id (for
+        // get_generation) and the token counts.
+        let meta: serde_json::Value =
+            serde_json::from_str(v["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["generation_id"], "gen-desc");
+        assert_eq!(meta["usage"]["prompt_tokens"], 9);
 
         // An invalid routing block is rejected before any HTTP call.
         let bad: DescribeImageArgs = serde_json::from_value(json!({

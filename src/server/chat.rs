@@ -328,11 +328,13 @@ fn typed_annotation(raw: &serde_json::Value) -> serde_json::Value {
     out
 }
 
-/// The metadata block appended after the reply text when there is something
-/// beyond a plain completed answer: reasoning, annotations (web-search
-/// citations), a finish_reason other than "stop" (truncation, filtering), with
-/// the token counts riding along. `None` in the common case, so the result
-/// stays the single text block it always was.
+/// The second content block a chat-family tool returns, as pretty JSON:
+/// the generation id (what `get_generation` takes), plus - when present -
+/// the reasoning text, the typed annotations (web-search citations), a
+/// finish_reason other than "stop" (truncation, filtering), with the token
+/// counts riding along. `None` only when the response carried none of those,
+/// so a result from an upstream that sends no id stays the single text block
+/// it always was.
 pub(crate) fn result_meta(result: &chat_gen::ChatResult) -> Option<String> {
     let reasoning = result
         .reasoning
@@ -340,10 +342,17 @@ pub(crate) fn result_meta(result: &chat_gen::ChatResult) -> Option<String> {
         .map(str::trim)
         .filter(|r| !r.is_empty());
     let truncated = result.finish_reason.as_deref().is_some_and(|f| f != "stop");
-    if reasoning.is_none() && result.annotations.is_empty() && !truncated {
+    if result.generation_id.is_none()
+        && reasoning.is_none()
+        && result.annotations.is_empty()
+        && !truncated
+    {
         return None;
     }
     let mut meta = json!({});
+    if let Some(id) = &result.generation_id {
+        meta["generation_id"] = json!(id);
+    }
     if let Some(r) = reasoning {
         meta["reasoning"] = json!(r);
     }
@@ -398,10 +407,11 @@ impl OpenRouterServer {
         input_modalities: the call is rejected only when the catalog says the model does NOT \
         accept that kind (find models with list_models input_modalities=image|file|audio|\
         video); unknown capabilities are let through. Returns the assistant's text as the \
-        first content block; when the response \
-        carries reasoning, annotations (url_citation: url, title, content, start_index, \
-        end_index), or a finish_reason other than \"stop\" (e.g. \"length\" = truncated), a \
-        second JSON block follows with those plus prompt/completion token counts. Not \
+        first content block, then a second JSON block with the generation_id (pass it to \
+        get_generation for the recorded cost) plus, when the response carries them, \
+        reasoning, annotations (url_citation: url, title, content, start_index, \
+        end_index), a finish_reason other than \"stop\" (e.g. \"length\" = truncated), and \
+        the prompt/completion token counts. Not \
         exposed on purpose: tools/tool_choice, logit_bias, logprobs, prediction, fallback \
         models, min_p/top_a/repetition_penalty.",
         annotations(
@@ -999,7 +1009,7 @@ mod tests {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(200).insert_header("x-generation-id", "gen-c1").set_body_json(serde_json::json!({
                 "choices": [{
                     "finish_reason": "length",
                     "message": {
@@ -1026,6 +1036,7 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "The answer");
         let meta: serde_json::Value =
             serde_json::from_str(v["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["generation_id"], "gen-c1");
         assert_eq!(meta["reasoning"], "Let me think.");
         assert_eq!(meta["finish_reason"], "length");
         assert_eq!(meta["usage"]["prompt_tokens"], 12);
@@ -1039,6 +1050,38 @@ mod tests {
         );
         // Non-citation annotations pass through raw.
         assert_eq!(meta["annotations"][1]["file"]["hash"], "abc");
+    }
+
+    /// A plain completed reply that carries a generation id still gets the
+    /// second block, holding just that id: it is what `get_generation` takes
+    /// to close the cost loop, so it cannot be dropped when nothing else is
+    /// noteworthy.
+    #[tokio::test]
+    async fn chat_completion_reports_the_generation_id_even_for_a_plain_reply() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-plain")
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+                    })),
+            )
+            .mount(&mock)
+            .await;
+        let res = server_for(mock.uri())
+            .run_chat_completion(args("m", "hi"))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["content"][0]["text"], "ok");
+        let meta: serde_json::Value =
+            serde_json::from_str(v["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            meta,
+            serde_json::json!({"generation_id": "gen-plain", "finish_reason": "stop"})
+        );
     }
 
     /// chat_completion writes nothing (like describe_image/transcribe_audio), so
