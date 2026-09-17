@@ -8,319 +8,77 @@
   <img src="assets/hero.jpg" alt="rust-openrouter-mcp - one Rust binary routing an AI assistant to OpenRouter's models" width="100%">
 </p>
 
-MCP (stdio) server **and** CLI for [OpenRouter](https://openrouter.ai), in a
-single Rust binary. Discover models, generate and edit images (with parallel
-variants and a sidecar manifest), generate video, speech, and music, transcribe
-audio, embed and rerank text, describe images with a vision model, send
-multimodal prompts to any chat model, look up what a request actually cost, and
-track per-process usage - all behind one `openrouter-mcp` executable. Every
-tool can steer OpenRouter's provider routing and pass provider-specific
-parameters through a shared `provider` object.
+One small Rust program that gives your AI assistant access to every model on
+[OpenRouter](https://openrouter.ai). It runs as an MCP server for Claude
+Desktop, Claude Code, Cursor and other clients, and it doubles as a
+command-line tool. Bring your own OpenRouter API key.
 
-## Features
+## What you can do with it
 
-- **Model discovery** - `list_models` with server-side filters (modality,
-  supported params, `category`, `providers`, `model_authors`, `arch`,
-  prompt/completion price bounds, `zdr`, `region`, `distillable`, model age,
-  Artificial Analysis intelligence/coding/agentic index and tool-success-rate
-  bounds, sort - including the benchmark sorts - min context, `limit`/`offset`
-  paging with the server's `total_count` reported), local search, and pricing;
-  each compact row carries `reasoning.supported_efforts`/`mandatory`,
-  `supported_voices`, `knowledge_cutoff` and `expiration_date`. `describe_model`
-  returns full detail for one model id (architecture, context, benchmarks, and
-  per-provider endpoints with pricing - including real `pricing_skus` for video
-  and each image endpoint's `allowed_passthrough_parameters`, the list of
-  provider-specific keys you may pass in `provider.options`).
-- **Provider routing and passthrough** - every generation tool takes a
-  `provider` object (CLI: `--provider '<json>'`). Chat, `describe_image`,
-  `generate_music`, `embed_text` and `rerank_documents` take routing only
-  (`order`, `only`, `ignore`, `allow_fallbacks`, `require_parameters`, `zdr`,
-  `sort` + `sort_partition`). `generate_image` takes routing plus
-  `provider.options`; `generate_audio`, `transcribe_audio` and `generate_video`
-  take `provider.options` only. `options` is keyed by provider slug and holds
-  that provider's own parameters - e.g. speaker diarization on transcription
-  with `{"options": {"deepgram": {"diarize": true}}}` (segments and words then
-  carry a `speaker` index), OpenAI speaking-style `instructions` or Azure
-  `style`/`styledegree` on speech, `steps`/`guidance` for FLUX on images,
-  `negativePrompt` for Vertex on video. Only the slug that serves the request is
-  forwarded. Values are validated locally (each `options` value must be an
-  object; `sort` vocabulary) and recorded in the manifest.
-- **Image generation** - `generate_image`: text-to-image, image editing /
-  image-to-image (multiple local inputs), and **parallel variants** (seed-stepped).
-  - Input images may be PNG, JPEG, WebP, GIF, or **SVG**. SVG inputs are
-    rasterized to PNG (longest side scaled to the dimension cap; transparency
-    preserved). Text in SVGs is not rendered (no fonts are loaded) and is flagged
-    as a warning. SVGs cannot load external files or URLs through image references.
-    Embedded data images remain supported where the renderer supports their format.
-  - The output format is **chosen by the provider**: PNG/JPEG/WebP/GIF are
-    sniffed from the response bytes; SVG is taken from the provider's declared
-    media type instead (sniffing can't detect it). Either way the file
-    extension is set to match what actually came back. An `output_format`
-    request hint is passed through, but support varies by model.
-  - Output size is either `aspect_ratio` + `image_size` (tier: `512`, `1K`,
-    `2K`, `4K`) or a single `size` (`"2048x2048"` pixels, or a tier). A pixel
-    `size` combined with `aspect_ratio`/`image_size` is rejected locally with
-    the same text OpenRouter's 400 would carry. `quality` also accepts `xhigh`
-    and `max`; `aspect_ratio` accepts the wide/tall values (`2.35:1`, `5:2`,
-    `9:19.5`, `19.5:9`, `9:20`, `20:9`). Up to 16 input images.
-  - Requested `aspect_ratio` / `image_size` are **verified** against the actual
-    decoded pixels; mismatches are surfaced as warnings.
-  - Every job writes a `*.manifest.json` sidecar (full settings, per-input and
-    per-variant metadata, cost, provider, timing).
-  - **Asynchronous**: if a job runs longer than `wait_seconds` (default 10) the
-    tool returns a `task_id`; poll `get_result` for completion.
-- **Video generation** - `generate_video`: text-to-video, image-to-video
-  (first/last frame) and reference-to-video (`reference_images`,
-  `reference_audio`, `reference_videos` - https URLs or local files inlined as
-  data URLs, 20 MiB each) with an OpenRouter video model. `prompt` is optional
-  when a frame or reference stands in for it (image-only models take no text).
-  `creativity` and `upscale_factor` drive upscaling models; `resolution` accepts
-  `768p`. `provider.options` is sent opaque and unchanged (OpenRouter documents
-  both `{"google-vertex": {"negativePrompt": ...}}` and the nested
-  `{"google-vertex": {"parameters": {...}}}` shape - pass what your provider
-  expects).
-  **Asynchronous**: if the job runs longer than `wait_seconds` (default 20, video
-  usually needs it) the tool returns a `task_id`; poll `get_result` for
-  completion. Once done, the clip is downloaded and saved to disk (a local
-  path, plus a `file://` resource link when previews are enabled).
-  Links retain the clip's media type and require client access to the server filesystem. `with_audio` (renamed from
-  `generate_audio` in 0.6.0) controls the clip's audio track; if a provider
-  ignores it, the result carries a warning and `has_audio` reports the file's
-  real state. The manifest records the upstream `job_id` before polling starts.
-  Polling retries transient failures within the configured deadline and respects `Retry-After`;
-  clip downloads retry transient failures too, since the job is already paid for.
-  Retries never submit another generation request.
-- **Speech generation** - `generate_audio`: text-to-speech with an OpenRouter
-  TTS model (voice/format/speed); saves the audio to disk with a manifest.
-  `voice` is provider-dependent and optional in the schema - most models still
-  fail upstream without one. **Voice cloning**: pass a sample as
-  `voice_reference` (`{"path": ...}` or `{"base64": ...}`, optional `format`)
-  plus an optional `voice_reference_text` transcript (up to 10000 characters;
-  15 MiB decoded max) and it is sent as `input_references` for
-  models such as fish-audio, which need no `voice`. `provider.options` carries
-  e.g. `{"openai": {"instructions": "speak like a calm narrator"}}`.
-- **Music generation** - `generate_music`: text-to-music with an OpenRouter
-  music model (Google Lyria 3: `google/lyria-3-clip-preview` for a 30-second
-  clip, `google/lyria-3-pro-preview` for a full song). OpenRouter has no
-  dedicated music endpoint: music models are chat models whose
-  `output_modalities` include `audio`, so the server streams
-  `/api/v1/chat/completions` with `modalities: ["text", "audio"]`, decodes the
-  streamed audio, and saves it with the extension its bytes call for (Lyria
-  returns MP3 and ignores a requested `format`). Synchronous (a clip takes about 10-25 s). The catalog lists
-  0 token pricing for these models; the real per-track price is only in the
-  model description ($0.04 per clip, $0.08 per song) and comes back as
-  `cost_usd`. Find them with `list_models` + `output_modalities="audio"`.
-  Takes `provider` routing (it is a chat call, so no `options` passthrough).
-- **Transcription** - `transcribe_audio`: speech-to-text with an OpenRouter STT
-  model; audio by local `path` or inline `base64`, optional language hint,
-  `response_format` json/verbose_json, timestamp granularities, and
-  `provider.options` - the diarization recipe is
-  `{"options": {"deepgram": {"diarize": true}}}` or
-  `{"options": {"azure": {"diarization": {"enabled": true}}}}`; verbose_json
-  segments and words then carry a `speaker` index.
-- **Image description** - `describe_image`: image -> detailed text via any
-  vision-capable model (image input, text output); optional `system`,
-  `temperature`, `max_tokens`, `reasoning_effort` and `provider` routing.
-- **Chat completion** - `chat_completion`: send a prompt to any OpenRouter
-  chat/text model and get its text reply - route a sub-task to a different model.
-  Sampling controls `system`, `temperature`, `max_tokens`, `seed`, `top_p`,
-  `top_k`, `stop`, `frequency_penalty`, `presence_penalty`, `verbosity`.
-  Structured output: `json_mode: true` or a `json_schema` object (strict mode).
-  `web_search` attaches the OpenRouter web plugin (`engine`, `max_results`,
-  `search_prompt`, `include_domains`, `exclude_domains`, `search_context_size`)
-  and citations come back as `annotations`; `pdf_engine` (`mistral-ocr`,
-  `cloudflare-ai`, `native`) picks the PDF parser. **Multimodal inputs**:
-  `images` (path/url/base64), `files` (PDF and other documents; path/url/base64
-  + `filename`), `audio` (path/base64 + `format`) and `videos` (url passed
-  through, or path/base64 as a data URL), each gated on the model's declared
-  `input_modalities` - the call is rejected only when the catalog says the model
-  does NOT accept that kind. When the reply carries reasoning, annotations, or a
-  `finish_reason` other than `stop`, a second JSON content block follows the
-  text with those plus token counts.
-- **Embeddings** - `embed_text`: float vectors for one or more texts with an
-  embeddings model (`dimensions`, `input_type`, `provider` routing); returns the
-  vectors, their length, `usage.cost` and a `generation_id`. Find models with
-  `list_models` + `output_modalities="embeddings"`.
-- **Rerank** - `rerank_documents`: rank plain-text documents against a query
-  with a rerank model (`top_n`, `provider` routing); results come back best-first
-  as `{index, relevance_score, text}`. Find models with `list_models` +
-  `output_modalities="rerank"`.
-- **Generation lookup** - `get_generation`: OpenRouter's stored record for one
-  `generation_id` (every tool result carries one): `total_cost` actually
-  charged, `provider_name`, native token counts, latency and generation time.
-  Closes the cost loop when a tool reported `usage.cost` as null.
-- **Reasoning controls** - `chat_completion` and `describe_image` take an
-  optional `reasoning_effort`: `max`, `xhigh`, `high`, `medium`, `low`,
-  `minimal` or `none`. It is omitted from the request unless you set it, so each
-  model keeps its catalog `default_effort` (see `reasoning.supported_efforts` in
-  `list_models`). Reasoning tokens bill as output tokens, so `none` is the
-  cheapest and fastest setting on models that allow it. Some models make
-  reasoning mandatory and reject `none` with a 400. `chat_completion` also takes
-  `reasoning_max_tokens` (instead of `reasoning_effort`, not both) and
-  `reasoning_exclude` to keep the reasoning text out of the reply.
-- **Account info** - `get_account`: basic info about the API key in use (label,
-  owning user id, credit usage with daily/weekly/monthly breakdown, spending
-  limit / remaining balance, and tier / key-type flags).
-- **Usage stats** - `get_usage_stats` (read-only) and `reset_usage_stats`
-  (destructive, requires `confirm: true`): per-process request/cost counters with
-  a by-model breakdown. Known charges remain counted when decoding or saving fails.
-  Video cost belongs to the job and is counted once, regardless of clip count.
-  Accepted video jobs without reported usage count as unknown cost.
+- **Find models.** Search the catalog by what a model can do, what it costs,
+  who serves it, and how well it scores.
+- **Make images.** Text-to-image and image editing with any image model.
+  Several variants in parallel. Each result gets a sidecar manifest.
+- **Make video.** Text-to-video, image-to-video from a first or last frame,
+  or reference-to-video from images, audio or clips.
+- **Make speech and music.** Text-to-speech, voice cloning from a sample, and
+  music from a prompt (Google Lyria).
+- **Transcribe audio.** Speech-to-text, with speaker labels when the provider
+  supports them.
+- **Talk to any chat model.** Send a prompt with images, PDFs, audio or video
+  attached. Ask for JSON output. Turn on web search.
+- **Embed and rerank text.** Vectors for search, and best-first ranking of
+  documents against a query.
+- **Know what you paid.** Every result carries a generation id, and one tool
+  looks up the real charge for it.
 
-## Add to Claude Desktop (one-click)
+Every tool also accepts a `provider` setting. Use it to choose which provider
+serves the request, or to pass a provider's own knobs through. See
+[Provider routing](#provider-routing-and-passthrough).
 
-This server ships as a **Claude Desktop extension** (`.mcpb`) for **macOS,
-Windows, and Linux** - no terminal or Rust toolchain required.
+## Install
+
+### Claude Desktop, one click
 
 1. Download the bundle for your platform from the
    [latest release](https://github.com/thesimj/rust-openrouter-mcp/releases/latest):
    `openrouter-mcp-macos.mcpb`, `openrouter-mcp-windows.mcpb`, or
    `openrouter-mcp-linux.mcpb`.
-2. Double-click it (or drag it into **Claude Desktop -> Settings -> Extensions**).
-3. Click **Install**, paste your
-   [OpenRouter API key](https://openrouter.ai/keys), and enable it.
+2. Double-click it, or drag it into **Claude Desktop -> Settings -> Extensions**.
+3. Click **Install** and paste your [OpenRouter API key](https://openrouter.ai/keys).
 
-Your API key is stored by Claude Desktop (the OS keychain/credential store) and
-injected into the server as `OPENROUTER_API_KEY`. See [Privacy Policy](#privacy-policy).
+Claude Desktop stores the key in the OS credential store and hands it to the
+server as `OPENROUTER_API_KEY`. No terminal or Rust toolchain needed.
 
-To build the bundle yourself, run the cross-platform generator on the target
-platform:
+### Other clients
 
-```bash
-node scripts/build-mcpb.mjs   # -> dist/openrouter-mcp-<os>.mcpb
-```
+[CONNECT.md](CONNECT.md) has copy-paste setup for Claude Code, Codex CLI,
+Gemini CLI, Cursor, Windsurf, VS Code, Zed, Cline, Roo Code, Continue, Goose,
+opencode, Crush, Amp, OpenHands, and more.
 
-Per-platform specifics, all handled by the generator: macOS produces a universal
-arm64+x86_64 binary (via `lipo`); Linux builds a static `x86_64-unknown-linux-musl`
-binary so the bundle runs on any distro regardless of the host's glibc version;
-Windows statically links the CRT so it starts on a fresh install with no Visual
-C++ Redistributable. TLS uses [rustls](https://github.com/rustls/rustls) with the OS certificate store.
-The crypto provider, aws-lc, requires C build tools.
-OpenSSL is not required. Custom root CAs use the platform certificate verifier.
-Release packaging runs only after formatting, lint, tests, and the MSRV check pass.
-
-## Connect another client (CLI, IDE, agent)
-
-`openrouter-mcp` is a universal local stdio MCP server. **[CONNECT.md](CONNECT.md)**
-has copy-paste setup for Claude Code, Codex CLI, Gemini CLI, Antigravity, Cursor,
-Windsurf, VS Code (Copilot), Zed, Cline, Roo Code, Continue, Goose, opencode,
-Crush, Amp, OpenHands, and more.
-
-## Install (CLI / other MCP clients)
-
-One-click install into a supported IDE (both wire up `openrouter-mcp mcp` over
-stdio - replace the placeholder `sk-or-v1-YOUR_KEY` with your real key after):
+One-click buttons for two of them (install the binary first, then replace the
+placeholder key):
 
 [![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=openrouter&config=eyJjb21tYW5kIjogIm9wZW5yb3V0ZXItbWNwIiwgImFyZ3MiOiBbIm1jcCJdLCAiZW52IjogeyJPUEVOUk9VVEVSX0FQSV9LRVkiOiAic2stb3ItdjEtWU9VUl9LRVkifX0=)
 [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=openrouter&config=%7B%22command%22%3A%20%22openrouter-mcp%22%2C%20%22args%22%3A%20%5B%22mcp%22%5D%2C%20%22env%22%3A%20%7B%22OPENROUTER_API_KEY%22%3A%20%22sk-or-v1-YOUR_KEY%22%7D%7D)
 
-Both require `openrouter-mcp` to be on your `PATH` (install it below first).
-
-From a local checkout:
+### The binary
 
 ```bash
-cargo install --path . --locked --force
+cargo install openrouter-mcp            # from crates.io
+cargo install --path . --locked --force # from a checkout
 ```
 
-From crates.io:
+Then set your key:
 
 ```bash
-cargo install openrouter-mcp
+export OPENROUTER_API_KEY="sk-or-v1-..."      # bash/zsh
+$env:OPENROUTER_API_KEY = "sk-or-v1-..."      # PowerShell
 ```
 
-## Configuration
+A `.env` file in the working directory works too. Do not commit it.
 
-Set an OpenRouter API key:
-
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."
-```
-
-On PowerShell:
-
-```powershell
-$env:OPENROUTER_API_KEY = "sk-or-v1-..."
-```
-
-A local `.env` file is also loaded if present (real env vars take precedence):
-
-```text
-OPENROUTER_API_KEY=sk-or-v1-...
-```
-
-Do not commit `.env`.
-
-All environment variables read by the server/CLI:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `OPENROUTER_API_KEY` | OpenRouter API key. The only required variable; every API-backed call errors without it. May also be supplied via `.env`. | (none - required) |
-| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Whether `generate_image`/`generate_video`/`generate_audio`/`generate_music` (and `get_result`) embed inline previews - base64 image previews, video `file://` resource links, and inline audio blocks: `always`, `never`, or `auto`. | `auto` (inline for all clients except `claude-code`) |
-| `OPENROUTER_MCP_OUTPUT_DIR` | Base directory for auto-named output artifacts (images/video/audio + manifests). | `$HOME/Downloads/openrouter-mcp` (system temp dir if `HOME` unset) |
-| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest-side pixel cap for normalized input images before sending. Clamped to a hard ceiling of `4096`; larger values are reduced to `4096`. | `1536` |
-| `OPENROUTER_VIDEO_POLL_INTERVAL` | Polling interval (seconds) for the video generation status loop. | `5` |
-| `OPENROUTER_VIDEO_POLL_TIMEOUT` | Ceiling (seconds) on the video generation poll loop. | `600` |
-| `OPENROUTER_VIDEO_DELIVERY_TIMEOUT` | Shared deadline in seconds for clip downloads and retries. Positive values cap at 30 days. Zero, invalid, or unset disables it. | disabled |
-| `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to drain generation jobs after disconnect or Ctrl-C. Caps at 300 seconds. Zero cancels immediately. | `30` |
-| `OPENROUTER_HTTP_REFERER` | Overrides the `HTTP-Referer` app-attribution header (OpenRouter rankings only; no effect on responses). | `https://github.com/thesimj/rust-openrouter-mcp` |
-| `OPENROUTER_X_TITLE` | Overrides the `X-Title` app-attribution header. | `rust-openrouter-mcp` |
-| `HOME` | OS variable; only used to derive the default output directory when `OPENROUTER_MCP_OUTPUT_DIR` is unset. Only `HOME` is checked, not `USERPROFILE` - a stock Windows install without `HOME` set falls straight to the system temp dir. | (OS-provided) |
-
-A few of these warrant extra detail.
-
-`OPENROUTER_MCP_IMAGE_PREVIEWS` controls whether `generate_image`,
-`generate_video`, `generate_audio`, `generate_music`, and `get_result` embed the generated
-media **inline** in the tool result (base64 images, video `file://` resource
-links, or inline audio blocks), in addition to saving it to disk:
-
-- `auto` (default) - inline previews for every client **except** the local
-  `claude-code` CLI, which shares the filesystem and can open the saved file
-  directly.
-- `always` - always embed previews. The Claude Desktop connector sets this,
-  so images and small audio files can render without shared filesystem access.
-- `never` - paths only, never inline bytes.
-
-Inline previews are downscaled to a 1568px longest side; the full-resolution
-image is always the file saved on disk. At most 4 inline previews are embedded
-per job (remaining images are reported by path only in the JSON), and inline
-audio previews are capped at 4 MB (larger clips are saved to disk with the
-path returned instead). Video links contain no inline bytes and grant no filesystem access.
-
-The task registry accepts at most 32 pending image/video jobs per process.
-Image jobs reserve capacity before fetching or decoding inputs. Finished or cancelled jobs release their pending slots.
-Each image job allows four concurrent variant requests. Cancelling a job aborts its remaining variant tasks.
-Eight synchronous chat, description, speech, music, or transcription calls may run per server.
-Input preparation, DNS, and preview encoding share four blocking workers.
-Four image/video preview calls may run concurrently. Further preview calls return paths without inline media.
-
-Image inputs allow 16 images, 20 MiB per image, and 64 MiB per batch.
-These limits apply to local files, inline data, and fetched images, including CLI preparation.
-Local media inputs must be regular files. FIFOs and device files are rejected.
-Upstream requests share 16 slots across client clones. Each response keeps its slot until consumed or dropped.
-Decompressed JSON responses cap at 64 MiB. Audio and video bodies cap at 256 MiB.
-Error bodies retain at most 2 KiB before truncating displayed text to 500 characters.
-
-The optional video delivery deadline covers all clip downloads and retry waits together.
-Retry waits cap at 300 seconds. Delivery expiry preserves recovery metadata and never resubmits the paid generation request.
-Filesystem writes and manifest finalization finish outside this network deadline.
-
-On disconnect or Ctrl-C, the server stops admission and drains tracked generation jobs for the configured grace period.
-It cancels remaining tasks when that period expires. Already running blocking work must still finish.
-Cancellation cannot undo provider charges. Forced shutdown can discard unsaved variant results and their unrecorded charges.
-Task status remains process-local and disappears when the server exits.
-
-## MCP usage
-
-The server speaks MCP over stdio (the `mcp` subcommand); it is local-only, with
-no remote/HTTP transport.
-
-Start the stdio server (`mcp` subcommand is implied when none is given):
-
-```bash
-openrouter-mcp        # or: openrouter-mcp mcp
-```
-
-Example MCP client config:
+Generic MCP client config:
 
 ```json
 {
@@ -333,317 +91,125 @@ Example MCP client config:
 }
 ```
 
-If the client already provides `OPENROUTER_API_KEY` in the environment, the `env`
-block is optional.
+## The tools
 
-### MCP tools
+| Tool | What it does |
+| --- | --- |
+| `list_models` | Search the catalog. Filter by input/output modality, supported parameters, category, provider, author, price, region, zero-data-retention, model age, and benchmark scores. Sort, page, and see pricing in dollars per million tokens. |
+| `describe_model` | Everything about one model: architecture, context, benchmarks, and each provider endpoint with its pricing and the `allowed_passthrough_parameters` you may send in `provider.options`. |
+| `generate_image` | Text-to-image or image editing. Inputs by path, URL or base64 (up to 16). Pick `aspect_ratio` + `image_size`, or one `size`. Optional `quality`, `output_format`, `background`, `output_compression`, `seed`, `variants`. Long jobs return a `task_id`. |
+| `generate_video` | Text-, image- or reference-to-video. Required: `model`, `duration`, `with_audio`. `prompt` is optional when a frame or reference is given. Optional `resolution`, `aspect_ratio`, `size`, `seed`, `creativity`, `upscale_factor`. Always returns a `task_id`; poll `get_result`. |
+| `generate_audio` | Text-to-speech. `voice` is model-specific. Voice cloning: pass a sample as `voice_reference` plus an optional transcript. |
+| `generate_music` | Text-to-music with Google Lyria. Returns the track, the lyrics text, and the per-track cost. |
+| `transcribe_audio` | Speech-to-text from a file or base64. Optional `language`, `verbose_json` with timestamps, and speaker labels via `provider.options`. |
+| `chat_completion` | Send a prompt to any chat model. Attach `images`, `files`, `audio`, `videos`. Ask for `json_mode` or a `json_schema`. Turn on `web_search`. Control sampling and reasoning. |
+| `describe_image` | Describe one or more images with a vision model. |
+| `embed_text` | Float vectors for a list of texts. |
+| `rerank_documents` | Rank documents against a query, best first. |
+| `get_generation` | The stored record for a `generation_id`: real cost, provider, tokens, latency. |
+| `get_result` | Fetch an async job by `task_id`. |
+| `get_account` | Your API key's label, credits, and limits. |
+| `get_usage_stats` | This process's request and cost counters. |
+| `reset_usage_stats` | Clear those counters. Needs `confirm: true`. |
 
-| Tool | Kind | Description |
-| --- | --- | --- |
-| `list_models` | read-only | List models with capabilities and pricing (server-side filters: modalities, `supported_parameters`, `category`, `providers`, `model_authors`, `arch`, `min_price`/`max_price`, `min_output_price`/`max_output_price`, `zdr`, `region`, `distillable`, `min_age_days`/`max_age_days`, the intelligence/coding/agentic index and `tool_success_rate` min/max pairs, `sort`, `min_context`, `limit`/`offset`; local `search`; human-readable `$X/M tokens` pricing; tiered/time-window `overrides` are passed through raw and rendered in `pricing_human` when a model has them). The output starts with a `// server total_count: N ...` header line when OpenRouter reports one. |
-| `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, (for image models) per-endpoint image capabilities merged under an `image` key - including `allowed_passthrough_parameters`, the keys you may send in `provider.options` - and (for zero-priced audio-output models such as Lyria) an `audio_pricing_note` pointing at the per-track price in the description. |
-| `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64` (max 16). Optional `quality` (auto/low/medium/high/xhigh/max), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), `output_compression` (0-100, webp/jpeg only) and `provider` (routing `order`/`only`/`ignore`/`allow_fallbacks`/`sort` plus `options` keyed by provider slug, e.g. `{"options": {"black-forest-labs": {"steps": 28}}}`) pass through to the provider. **No defaults** for `model`, `prompt`, and either `size` (`"WIDTHxHEIGHT"` or a tier) or both `aspect_ratio` and `image_size` - checked at runtime, the call fails naming what is missing; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
-| `generate_video` | write | Text-to-video / image-to-video / reference-to-video with an OpenRouter video model; async, poll by `task_id`. Required: `model`, `duration`, `with_audio` (renamed from `generate_audio` in 0.6.0); `prompt` is required unless a `first_frame`/`last_frame` or a reference (`reference_images`, `reference_audio`, `reference_videos`) is given. Optional `creativity` and `upscale_factor` (upscaling models), `provider.options` keyed by provider slug. |
-| `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. `voice` is provider-dependent (optional in the schema, but most models fail without it); voice cloning via the `voice_reference` object (`{"path"|"base64", "format"?}`) plus `voice_reference_text`; `provider.options` e.g. `{"openai": {"instructions": "..."}}`, `{"azure": {"style": "cheerful"}}`. |
-| `generate_music` | write | Text-to-music with an OpenRouter music model (Google Lyria 3) via streamed `/api/v1/chat/completions` audio output; synchronous; saves the track to disk (extension from the returned bytes, MP3 for Lyria), returns the model's text (lyrics or `<instrumental>`), `cost_usd`, the manifest path, and a `warnings` entry if the stream ended before its `[DONE]` sentinel (the track may be cut short). Required: `model`, `prompt`; optional `format` (audio.format passthrough), `seed`, `output`, `provider` (routing only). Find models with `list_models` + `output_modalities="audio"`. |
-| `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, local 25 MiB limit for files and inline data), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), `temperature`, and `provider.options` (e.g. `{"deepgram": {"diarize": true}}` - segments/words then carry `speaker`); returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
-| `chat_completion` | read-only | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Sampling: `system`, `temperature`, `max_tokens`, `seed`, `top_p`, `top_k`, `stop`, `frequency_penalty`, `presence_penalty`, `verbosity`. Structured output: `json_mode` or `json_schema` (strict). `web_search` plugin (citations as `annotations`), `pdf_engine`, `reasoning_effort`/`reasoning_max_tokens`/`reasoning_exclude`, `provider` routing. Multimodal: `images`, `files`, `audio`, `videos`, each gated on the model's declared input modalities. Reply text is `content[0]`; a second JSON block with reasoning/annotations/finish_reason/usage is appended only when present. |
-| `describe_image` | read-only | Describe image(s) - by `path`, `url`, or `base64`/data-URL - with a vision-capable model; returns text. Optional `prompt`, `system`, `temperature`, `max_tokens`, `reasoning_effort`, `provider` routing. |
-| `embed_text` | read-only | Embed `input` (a list of strings) with an embeddings model via `/api/v1/embeddings`; optional `dimensions`, `input_type`, `provider` routing. Returns the float vectors, `dimensions`, `count`, `usage` (tokens + `cost`) and `generation_id`. |
-| `rerank_documents` | read-only | Rank `documents` (plain strings) against `query` with a rerank model via `/api/v1/rerank`; optional `top_n`, `provider` routing. Returns `results` best-first as `{index, relevance_score, text}`, `usage` and `generation_id`. |
-| `get_generation` | read-only | `GET /api/v1/generation?id=`: OpenRouter's stored record for a `generation_id` (actual `total_cost`, `provider_name`, native token counts, latency, `generation_time`, `api_type`), verbatim. The record can lag a few seconds; a not-yet-indexed id is an invalid-params error - retry shortly. Counted as a request in `get_usage_stats`, adds no cost there. |
-| `get_result` | read-only | Fetch a job by `task_id`: `pending` / `completed` / `failed`. |
-| `get_account` | read-only | Basic info about the API key in use: label, owning user id, credit usage (total + daily/weekly/monthly), limit/remaining, and tier/key-type flags. |
-| `get_usage_stats` | read-only | In-memory request/cost counters (and server `version`) with a by-model breakdown. |
-| `reset_usage_stats` | destructive | Reset all counters (`confirm: true` required). |
+Every tool description tells the assistant which `list_models` filter finds
+the right kind of model, for example `output_modalities="transcription"`.
 
-`generate_image` returns a lean result - saved paths, decoded width/height,
-requested vs. actual aspect/size, seeds, and a pointer to the sidecar manifest;
-the full per-variant detail lives in the manifest on disk.
+## Provider routing and passthrough
 
-### 0.10.0 notes
+OpenRouter can route one model to several providers. The `provider` object on
+each tool lets you steer that.
 
-0.10.0 closes the gap between the tools and the OpenRouter request schemas:
-every tool gained a `provider` object, several gained the documented top-level
-fields they were missing, and three tools are new (`embed_text`,
-`rerank_documents`, `get_generation`). Contract changes worth knowing about:
+**Routing** (chat, describe_image, generate_music, embed_text, rerank_documents,
+generate_image): `order`, `only`, `ignore`, `allow_fallbacks`,
+`require_parameters`, `zdr`, `sort`.
 
-- `generate_audio`: `voice` changed from required to optional in the tool
-  schema (removed from the JSON Schema `required` array and from the runtime
-  no-defaults check). It is provider-dependent: most TTS models still have no
-  default voice and fail upstream without one; only voice-cloning models (e.g.
-  fish-audio, driven by `voice_reference`) take none. The description and
-  field doc keep the warning.
-- CLI `audio`: `--voice` is now optional (was a required flag); a run without
-  it and without `--voice-reference` is accepted locally and rejected by the
-  provider.
-- `AudioManifest`: `voice` is omitted when none was sent (was always a string);
-  new optional keys `provider` and `voice_reference` appear only when used.
-- Wire types: `SpeechBody.voice` is `Option<String>`; `SpeechGenRequest` gained
-  `voice_reference` and `provider` fields (internal API).
-- `generate_image` tools/list schema: `aspect_ratio` and `image_size` are no
-  longer in the unconditional `required` array (they are required at runtime
-  only when `size` is absent). Schema-trusting clients now see them as
-  optional; the runtime no-defaults error is unchanged when neither `size` nor
-  both of them is given.
-- New `generate_image` params `size` and `provider` (CLI `image --size`,
-  `--provider <json>`).
-- `generate_video.prompt` changed from required (`String`, in the schema
-  `required` list) to conditional: optional in the schema, required at runtime
-  only when no `first_frame`/`last_frame` and no reference (`reference_images`
-  / `reference_audio` / `reference_videos`) is given.
-- `VideoManifest.prompt` is now optional (omitted from the sidecar JSON for
-  image-only requests) and `prompt_source` can be `"none"`; manifest readers
-  that assumed a string prompt should tolerate its absence.
-- Internal only: `openrouter::InputReference` is now an enum
-  (`image_url`/`audio_url`/`video_url`); the image constructor
-  `InputReference::new(ImageUrl)` is unchanged.
-- `list_models` tool output now starts with a `// server total_count: N ...`
-  header line whenever OpenRouter returns `total_count` (documented as
-  required, so in production effectively always); programmatic JSON parsers of
-  the tool text must skip leading `//` lines - the same convention the
-  existing `// showing X of Y` truncation header already used.
-- `OpenRouterClient::list_models` signature unchanged; new `list_models_page`
-  returns `ModelsResponse`. `Model` now derives `Default` (additive).
-- Three new tools and three new CLI subcommands (`embed`, `rerank`,
-  `generation`); no existing tool argument, wire shape, or CLI flag changed for
-  them.
-- `UsageStats` gains `record_lookup(success)`; `get_usage_stats` now counts
-  `get_generation` calls in `requests_total` (and `requests_failed`) without
-  touching `text_generations` or cost.
-- `chat_completion` result: unchanged for the common case (`content[0]` is the
-  reply text). When the response carries reasoning, annotations, or a
-  `finish_reason` other than `"stop"`, a second text block containing a JSON
-  object `{reasoning?, annotations?, finish_reason?, usage?}` is appended -
-  clients that assumed exactly one content block should read `content[0]`.
-- `ChatCompletionArgs` / `DescribeImageArgs` / `GenerateMusicArgs` schemas gain
-  new optional properties (`provider`, `web_search`, `json_schema`, `files`,
-  `audio`, `videos`, ...); all are optional, none added to `required`.
-- `describe_image` no longer forces `system`/`temperature`/`max_tokens` to
-  `None`; callers that pass them now change the request (the tool did not
-  expose them before, so no existing caller is affected).
-- `MusicManifest` gains an optional `provider` field (serialized only when a
-  routing block was sent); existing manifests still parse.
-- Internal: the `expect(dead_code)` attributes on the provider routing family
-  (`ProviderSort`, `ImageProvider`, `SORT_VALUES`, `SORT_PARTITIONS`,
-  `ImageProviderArgs`, `clean_slugs`, `parse_sort`) are gone now that every
-  tool consumes them.
+```json
+{ "provider": { "order": ["anthropic", "google-vertex"], "allow_fallbacks": false } }
+```
 
-**Not implemented on purpose** (documented in the tool descriptions where it
-matters):
+**Passthrough** (generate_image, generate_audio, transcribe_audio,
+generate_video): `options`, keyed by provider slug, holding that provider's own
+parameters. Only the provider that serves the request receives them.
 
-- Chat: `tools`/`tool_choice` (needs an agent loop the tool cannot run),
-  `logit_bias`, `logprobs`, `top_logprobs`, `prediction`, `response_format`
-  types `text`/`grammar`/`python`, `reasoning.context`/`mode` (GPT-5.6+ only),
-  web plugin `max_uses`/`user_location`, `fallback_models`, `min_p`, `top_a`,
-  `repetition_penalty`, `max_completion_tokens`, `provider.options` on chat
-  (OpenRouter's chat `provider` schema is routing-only and rejects `options`).
-- Provider routing: `quantizations`, `max_price`, `preferred_max_latency`,
-  `preferred_min_throughput` (and their percentile forms), `data_collection`,
-  `enforce_distillable_text` - add on demand.
-- Embeddings: `encoding_format` (float vectors only), token-array and
-  multimodal `input`. Rerank: `{text, image}` documents (plain strings only).
-  `top_n`/`dimensions` range validation (values pass through; the provider
-  rejects them).
-- `describe_model`: the `/embeddings/models` lookup (it is a paginated list of
-  the same `Model` shape; `describe_model` already fetches `links.details`).
-- `generate_image`: `n` stays unsent - `variants` fans out as N parallel calls,
-  which single-image providers accept where `n>1` fails.
-- Everywhere: `stream`, `callback_url`, `session_id`, `user`, `trace`
-  (observability plumbing for hosted apps), and the Files/Containers/
-  Workspaces/Guardrails/BYOK/Analytics management APIs, the Responses and
-  Anthropic Messages endpoints.
-- Speech: a CLI `--voice-reference-format` override (the CLI infers the format
-  from the file extension; the MCP tool takes `voice_reference.format`); a
-  `voice_reference` flag in the tool result JSON (the manifest records it;
-  `audio.voice` in the result is `null` when no voice was sent).
-- `list_models` CLI: flags for `model_authors`, `arch`, the price bounds,
-  `distillable`, the age bounds, and the index / `tool_success_rate` pairs are
-  MCP-only (CLI: `--category`, `--providers`, `--limit`, `--offset`, `--zdr`,
-  `--region`). The `--table` layout is unchanged; the JSON rows carry the new
-  fields.
-- `chat` CLI: per-knob sampling flags (`--seed`, `--top-p`, `--top-k`,
-  `--stop`, `--frequency-penalty`, `--presence-penalty`, `--verbosity`,
-  `--reasoning-max-tokens`, `--reasoning-exclude`) - the MCP tool exposes them,
-  the CLI keeps `--temperature`/`--max-tokens`/`--reasoning-effort`.
-  `--web-search` attaches the plugin with defaults only (full control via the
-  MCP tool's `web_search` object). `--file`/`--audio` take local paths only;
-  `--video` takes a URL or a local path (inline base64 on a command line is
-  impractical; the MCP tool covers it).
-- Manifests: no manifest struct for `embed_text`/`rerank_documents`/
-  `get_generation` - they save no files, and manifests are the sidecar record
-  for saved media.
-- Verification: the live end-to-end runs in the plan (flux.2-pro with
-  `provider.options.steps`, Deepgram diarization) were not part of the release
-  gates; the wire shapes are locked by wiremock body assertions at the client
-  and tool layers.
+```json
+{ "provider": { "options": { "deepgram": { "diarize": true } } } }
+```
 
-## CLI usage
+That example turns on speaker labels for a Deepgram transcription. Other common
+uses: `{"openai": {"instructions": "speak like a calm narrator"}}` on speech,
+`{"black-forest-labs": {"steps": 28, "guidance": 3.5}}` on FLUX images,
+`{"google-vertex": {"negativePrompt": "people, text"}}` on Veo video. Run
+`describe_model` to see which keys a provider accepts.
+
+Chat-family tools take routing only. OpenRouter's chat schema has no
+passthrough field.
+
+## Command line
 
 The same binary is a CLI. Subcommands: `models`, `image`, `video`, `audio`,
 `music`, `transcribe`, `describe`, `chat`, `embed`, `rerank`, `generation`,
-`key`, `mcp`.
-
-Every network subcommand except `models`, `generation` and `key` takes
-`--provider '<json>'` - the same object the matching MCP tool's `provider`
-argument takes, validated by the same code (routing keys on `chat`/`describe`/
-`music`/`embed`/`rerank`, routing + `options` on `image`, `options` only on
-`audio`/`transcribe`/`video`).
-
-Show info about the API key in use:
+`key`, `mcp`. Every network subcommand takes `--provider '<json>'` with the same
+object the MCP tool takes. `--help` lists every flag.
 
 ```bash
-openrouter-mcp key
-```
+# Ask a model something
+openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -p "Why Rust?" --temperature 0.3
 
-Send a prompt to a chat/text model:
-
-```bash
-openrouter-mcp chat --model openai/gpt-5.4 --prompt "Summarize MCP in one sentence."
-openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -s "Be terse." -p "Why Rust?" --temperature 0.3
-```
-
-Structured output, web search, documents, and provider routing:
-
-```bash
-openrouter-mcp chat -m openai/gpt-5.4 -p "List three Rust web frameworks." --json-mode
+# Read a PDF and answer as JSON matching a schema
 openrouter-mcp chat -m openai/gpt-5.4 -p "Extract the invoice total." \
   --file ./invoice.pdf --pdf-engine mistral-ocr --json-schema ./invoice.schema.json
-openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -p "What changed in rmcp this month?" --web-search
-openrouter-mcp chat -m google/gemini-2.5-flash -p "Transcribe and summarize." --audio ./call.mp3
-openrouter-mcp chat -m google/gemini-2.5-flash -p "Describe the scene." --video https://example.com/clip.mp4
-openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -p "Why Rust?" \
-  --provider '{"order":["anthropic","google-vertex"],"allow_fallbacks":false}'
-```
 
-Browse models:
-
-```bash
-openrouter-mcp models --query openai --sort newest --table
+# Browse models
 openrouter-mcp models --output-modalities image --sort newest --table
-openrouter-mcp models --query openai --search codex
-openrouter-mcp models --query claude --all
-openrouter-mcp models --category programming --providers OpenAI,Anthropic --sort intelligence-high-to-low --table
-openrouter-mcp models --zdr --region eu --limit 50 --offset 50
-```
+openrouter-mcp models --category programming --sort intelligence-high-to-low --table
 
-Embed, rerank, and look up what a request cost:
+# Make an image, then four seed-stepped variants
+openrouter-mcp image -m google/gemini-3.1-flash-image-preview \
+  -p "a photorealistic owl with one cybernetic eye" --aspect-ratio 1:1 --image-size 1K -o ./out/owl.png
+openrouter-mcp image -m bytedance-seed/seedream-4.5 -p "a cute baby dragon" \
+  --aspect-ratio 1:1 --image-size 1K --seed 1490 --variants 4 -o ./out/dragon.png
 
-```bash
-openrouter-mcp embed -m openai/text-embedding-3-small -i "first text" -i "second text" --dimensions 256
-openrouter-mcp rerank -m cohere/rerank-v3.5 -q "rust async runtime" \
-  -d "Tokio is an asynchronous runtime for Rust." -d "A recipe for sourdough bread." --top-n 1
+# Make a video from a still frame
+openrouter-mcp video -m bytedance/seedance-2.0 --first-frame ./out/owl.png --duration 5 -o ./out/owl.mp4
+
+# Speech, cloned voice, music
+openrouter-mcp audio -m hexgrad/kokoro-82m --voice af_heart --input "Hello." -o ./out/hello.mp3
+openrouter-mcp audio -m fish-audio/s1 --voice-reference ./sample.wav --input "Cloned hello." -o ./out/clone.mp3
+openrouter-mcp music -m google/lyria-3-clip-preview -p "warm lo-fi loop, soft piano, 80 bpm" -o ./out/loop.mp3
+
+# Transcribe with speaker labels
+openrouter-mcp transcribe -m deepgram/nova-3 --file ./meeting.mp3 --response-format verbose_json \
+  --provider '{"options":{"deepgram":{"diarize":true}}}'
+
+# Embeddings, rerank, and the real cost of a request
+openrouter-mcp embed -m openai/text-embedding-3-small -i "first text" -i "second text"
+openrouter-mcp rerank -m cohere/rerank-v3.5 -q "rust async runtime" -d "Tokio is..." -d "Sourdough..." --top-n 1
 openrouter-mcp generation --id gen-1234567890abcdef
 ```
 
-Generate an image:
+## Configuration
 
-```bash
-openrouter-mcp image \
-  --model google/gemini-3.1-flash-image-preview \
-  --prompt "a photorealistic owl with one cybernetic eye, starry sky" \
-  --aspect-ratio 1:1 --image-size 1K --seed 1200 \
-  --output ./out/owl.png
-```
+`OPENROUTER_API_KEY` is the only required setting. The rest have sensible
+defaults.
 
-Edit / image-to-image (repeatable `--image`, optional `label=path`):
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | Your OpenRouter key. | required |
+| `OPENROUTER_MCP_OUTPUT_DIR` | Where generated files land when you give no `output` path. | `$HOME/Downloads/openrouter-mcp` |
+| `OPENROUTER_MCP_IMAGE_PREVIEWS` | Embed previews of generated media in tool results: `auto`, `always`, `never`. `auto` embeds for every client except Claude Code, which can open the saved file itself. | `auto` |
+| `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest side, in pixels, that input images are scaled down to before upload. Hard ceiling 4096. | `1536` |
+| `OPENROUTER_VIDEO_POLL_INTERVAL` | Seconds between video status checks. | `5` |
+| `OPENROUTER_VIDEO_POLL_TIMEOUT` | Seconds to wait for a video job. | `600` |
+| `OPENROUTER_VIDEO_DELIVERY_TIMEOUT` | Seconds allowed for downloading finished clips, retries included. | off |
+| `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to let running jobs finish after the client disconnects. | `30` |
+| `OPENROUTER_HTTP_REFERER`, `OPENROUTER_X_TITLE` | App attribution headers shown in OpenRouter rankings. | this repo |
 
-```bash
-openrouter-mcp image \
-  --model google/gemini-3.1-flash-image-preview \
-  --prompt "add a small wizard hat" \
-  --image ./out/owl.png \
-  --output ./out/owl-hat.png
-```
-
-Four parallel variants (files named `*-var-<seed>-<index>.<ext>` plus a manifest):
-
-```bash
-openrouter-mcp image -m bytedance-seed/seedream-4.5 \
-  --prompt "a cute pixar-style baby dragon" \
-  --aspect-ratio 1:1 --image-size 1K --seed 1490 --variants 4 \
-  --output ./out/dragon.png
-```
-
-Also accepts `--size` (WIDTHxHEIGHT pixels or a tier, instead of
-`--aspect-ratio` + `--image-size`), `--quality`, `--output-format`,
-`--background`, `--output-compression`, and `--provider` (provider support
-varies; see `--help`). FLUX steps via passthrough:
-
-```bash
-openrouter-mcp image -m black-forest-labs/flux.2-pro \
-  --prompt "a lighthouse at dusk" --size 2048x2048 \
-  --provider '{"options":{"black-forest-labs":{"steps":28,"guidance":3.5}}}'
-```
-
-Describe an image:
-
-```bash
-openrouter-mcp describe -m google/gemini-2.5-flash-lite --image ./out/owl.png
-```
-
-The image format the provider returns is not guaranteed; the CLI corrects the
-saved file's extension to match what actually came back.
-
-Generate a video (blocks through submit + poll; text-to-video,
-image-to-video via `--first-frame` / `--last-frame`, or reference-to-video via
-repeatable `--reference-image` / `--reference-audio` / `--reference-video`;
-`--prompt` is optional when a frame or reference is given):
-
-```bash
-openrouter-mcp video \
-  --model bytedance/seedance-2.0 \
-  --prompt "a paper boat drifting down a rain-soaked street, cinematic" \
-  --duration 8 --resolution 1080p --output ./out/boat.mp4
-openrouter-mcp video -m bytedance/seedance-2.0 --first-frame ./out/owl.png \
-  --duration 5 --output ./out/owl.mp4
-openrouter-mcp video -m google/veo-3.1 -p "a calm lake at dawn" --duration 8 --with-audio \
-  --provider '{"options":{"google-vertex":{"negativePrompt":"people, text"}}}'
-```
-
-`--creativity` and `--upscale-factor` are for upscaling models.
-
-Generate speech (text-to-speech; `--voice` is provider-dependent - most
-models need it, voice-cloning models take `--voice-reference` instead):
-
-```bash
-openrouter-mcp audio \
-  --model hexgrad/kokoro-82m --voice af_heart \
-  --input "Hello from OpenRouter." --output ./out/hello.mp3
-openrouter-mcp audio -m fish-audio/s1 --voice-reference ./sample.wav \
-  --voice-reference-text "the transcript of the sample" \
-  --input "Cloned voice says hello." --output ./out/clone.mp3
-openrouter-mcp audio -m openai/gpt-4o-mini-tts --voice alloy --input "Good evening." \
-  --provider '{"options":{"openai":{"instructions":"speak like a calm narrator"}}}' \
-  --output ./out/narrator.mp3
-```
-
-Generate music (text-to-music; the extension follows the returned bytes):
-
-```bash
-openrouter-mcp music \
-  --model google/lyria-3-clip-preview \
-  --prompt "warm lo-fi hip hop loop, soft piano, vinyl crackle, 80 bpm" \
-  --output ./out/loop.mp3
-```
-
-Transcribe audio (speech-to-text):
-
-```bash
-openrouter-mcp transcribe \
-  --model openai/gpt-4o-mini-transcribe --file ./out/hello.mp3 --language en
-```
-
-Also accepts `--response-format verbose_json` (segment/word timestamps, duration,
-detected language - OpenAI-compatible providers only), `--timestamp-granularities
-segment,word`, `--temperature`, and `--provider` for provider options such as
-speaker diarization:
-
-```bash
-openrouter-mcp transcribe -m deepgram/nova-3 --file ./out/meeting.mp3 \
-  --response-format verbose_json \
-  --provider '{"options":{"deepgram":{"diarize":true}}}'
-```
+**Limits worth knowing.** Input images: 16 per request, 20 MiB each, 64 MiB per
+batch. Audio for transcription or cloning: 25 MiB. Files, audio and video
+attached to chat: 20 MiB each. At most 32 image or video jobs wait at once, and
+8 synchronous calls run at once. Job status lives in memory and is gone when
+the server exits.
 
 ## Development
 
@@ -651,36 +217,22 @@ openrouter-mcp transcribe -m deepgram/nova-3 --file ./out/meeting.mp3 \
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo llvm-cov --summary-only        # coverage (cargo install cargo-llvm-cov)
 ```
 
-CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, and the
-test suite on every push to `main` and every pull request, plus a separate
-`msrv` job that runs `cargo check --all-targets` at the declared
-`rust-version` floor; the release workflow only fires on a version tag, so
-this is the gate that runs before anything ships.
+CI runs the same three checks plus a build at the minimum supported Rust
+version on every push and pull request. A version tag triggers the release
+workflow, which builds the `.mcpb` bundles for macOS, Windows and Linux.
 
-Live smoke tests (require `OPENROUTER_API_KEY`):
+Release notes and the list of OpenRouter features left out on purpose live in
+[CHANGELOG.md](CHANGELOG.md).
 
-```bash
-cargo run -- models --query openai --sort newest --table
-cargo run -- describe -m google/gemini-2.5-flash-lite --image ./some.png
-```
+## Privacy
 
-## Privacy Policy
-
-`openrouter-mcp` runs entirely on your machine and collects no telemetry. Full
-details, including the one third-party-URL-fetch exception (image `url`
-inputs are fetched directly, not via OpenRouter) and where generated files
-land (the path you specify, or an auto-named one under
-`OPENROUTER_MCP_OUTPUT_DIR` / `$HOME/Downloads/openrouter-mcp` / the system
-temp dir): [PRIVACY.md](PRIVACY.md).
+`openrouter-mcp` runs on your machine and sends nothing anywhere except to
+OpenRouter, plus a direct fetch of any image URL you pass as input. No
+telemetry. Details in [PRIVACY.md](PRIVACY.md).
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Apache License 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) or MIT
+([LICENSE-MIT](LICENSE-MIT)), at your option.

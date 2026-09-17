@@ -5,7 +5,7 @@ Model Context Protocol over stdin/stdout. Almost every MCP-capable CLI, agent, a
 editor can use it. This guide gives the exact config for the popular ones.
 
 > **Claude Desktop** users: don't use this file - install the one-click
-> [`.mcpb` extension](README.md#add-to-claude-desktop-one-click) instead.
+> [`.mcpb` extension](README.md#claude-desktop-one-click) instead.
 
 ## Prerequisites
 
