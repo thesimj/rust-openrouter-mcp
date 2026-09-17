@@ -254,8 +254,9 @@ pub struct ResponseMessage {
     pub reasoning: Option<String>,
     /// Kept raw: `url_citation` entries from web search (`{type, url_citation:
     /// {url, title, content, start_index, end_index}}`) and `file` entries from
-    /// the PDF parser; the tool layer types what it surfaces.
-    #[serde(default)]
+    /// the PDF parser; the tool layer types what it surfaces. Some providers
+    /// send an explicit `null` for "none", so null decodes as empty.
+    #[serde(default, deserialize_with = "super::null_as_default")]
     pub annotations: Vec<serde_json::Value>,
 }
 
@@ -577,5 +578,14 @@ mod tests {
         assert!(minimal.choices[0].finish_reason.is_none());
         assert!(minimal.choices[0].message.reasoning.is_none());
         assert!(minimal.choices[0].message.annotations.is_empty());
+
+        // Providers may send an explicit `null` for an absent list; a billed
+        // response must not fail to decode over it.
+        let nulled: ChatCompletion = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "x", "reasoning": null, "annotations": null}}]
+        }))
+        .unwrap();
+        assert!(nulled.choices[0].message.reasoning.is_none());
+        assert!(nulled.choices[0].message.annotations.is_empty());
     }
 }

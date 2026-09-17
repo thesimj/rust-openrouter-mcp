@@ -21,14 +21,8 @@ pub struct VideoModelsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VideoModel {
     pub id: String,
-    #[serde(default, deserialize_with = "null_pricing")]
+    #[serde(default, deserialize_with = "super::null_as_default")]
     pub pricing_skus: BTreeMap<String, String>,
-}
-
-fn null_pricing<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeMap<String, String>, D::Error> {
-    Ok(Option::<BTreeMap<String, String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Request body for `POST /api/v1/videos`. Optional fields are omitted when
