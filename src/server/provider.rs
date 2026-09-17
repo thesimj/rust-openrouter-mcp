@@ -31,13 +31,6 @@ const SORT_PARTITIONS: [&str; 2] = ["model", "none"];
 
 /// Routing-only `provider` block for chat completions, `/embeddings` and
 /// `/rerank` - the endpoints whose schema rejects `options`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct ProviderRoutingArgs {
@@ -70,13 +63,6 @@ pub(crate) struct ProviderRoutingArgs {
     pub sort_partition: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases expose provider routing"
-    )
-)]
 impl ProviderRoutingArgs {
     /// Validate and convert; `Ok(None)` when nothing is set.
     pub(crate) fn into_routing(self) -> Result<Option<ProviderRouting>, ErrorData> {

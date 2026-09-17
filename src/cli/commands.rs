@@ -2,13 +2,14 @@
 
 use super::table::{primary_modality, render_sectioned_table};
 use super::{
-    AudioArgs, ChatArgs, DescribeArgs, ImageArgs, ModelsArgs, MusicArgs, TranscribeArgs, VideoArgs,
-    parse_image_arg, resolve_base_output, resolve_prompt,
+    AudioArgs, ChatArgs, DescribeArgs, EmbedArgs, GenerationArgs, ImageArgs, ModelsArgs, MusicArgs,
+    RerankArgs, TranscribeArgs, VideoArgs, parse_image_arg, resolve_base_output, resolve_prompt,
 };
 use crate::image_gen::GenerateRequest;
 use crate::openrouter::{ModelsQuery, OpenRouterClient};
 use crate::pricing::{models_to_json, video_price};
-use crate::{audio_gen, chat_gen, image_gen, music_gen, openrouter, video_gen};
+use crate::server::provider::ProviderRoutingArgs;
+use crate::{audio_gen, chat_gen, embed_gen, image_gen, music_gen, openrouter, video_gen};
 
 /// Print the "showing N of total / N models" footer shared by both `run_models`
 /// output paths (JSON and table).
@@ -354,6 +355,68 @@ pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
     if let Some(cost) = result.cost {
         eprintln!("cost: ${cost}");
     }
+    Ok(())
+}
+
+/// Parse `--provider` for the routing-only endpoints (`/embeddings`,
+/// `/rerank`) through the tool's own args type, so validation is shared.
+fn parse_routing(
+    flags: &super::ProviderFlags,
+) -> anyhow::Result<Option<openrouter::ProviderRouting>> {
+    flags
+        .parse::<ProviderRoutingArgs>()?
+        .into_routing()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
+/// Embed texts and print the same JSON envelope the `embed_text` MCP tool
+/// returns (cost to stderr).
+pub(crate) async fn run_embed(args: EmbedArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let req = embed_gen::EmbedRequest {
+        model: args.model,
+        input: args.inputs,
+        dimensions: args.dimensions,
+        input_type: args.input_type,
+        provider: parse_routing(&args.provider)?,
+    };
+    let result = embed_gen::embed(&client, &req).await?;
+    println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
+/// Rerank documents and print the same JSON envelope the `rerank_documents`
+/// MCP tool returns (cost to stderr).
+pub(crate) async fn run_rerank(args: RerankArgs) -> anyhow::Result<()> {
+    let client = OpenRouterClient::from_env()?;
+    let req = embed_gen::RerankRequest {
+        model: args.model,
+        query: args.query,
+        documents: args.documents,
+        top_n: args.top_n,
+        provider: parse_routing(&args.provider)?,
+    };
+    let result = embed_gen::rerank(&client, &req).await?;
+    println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+    if let Some(cost) = result.cost {
+        eprintln!("cost: ${cost}");
+    }
+    Ok(())
+}
+
+/// Fetch one generation record and print it verbatim as pretty JSON. Mirrors
+/// the `get_generation` MCP tool.
+pub(crate) async fn run_generation(args: GenerationArgs) -> anyhow::Result<()> {
+    let id = args.generation_id.trim();
+    if id.is_empty() {
+        anyhow::bail!("--id must not be blank");
+    }
+    let client = OpenRouterClient::from_env()?;
+    let record = client.get_generation(id).await?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 

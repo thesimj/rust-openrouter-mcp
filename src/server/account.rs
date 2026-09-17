@@ -127,7 +127,8 @@ impl OpenRouterServer {
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
         video_generations, videos_generated, audio_generations, audio_files (generate_audio \
         and generate_music), \
-        text_generations (describe_image, chat_completion, and transcribe_audio calls), \
+        text_generations (describe_image, chat_completion, transcribe_audio, embed_text, and \
+        rerank_documents calls; get_generation lookups count only toward requests_total), \
         actual_cost_usd (summed from usage.cost), \
         unknown_cost_count, and a by_model breakdown. Counters reset when the server restarts.",
         annotations(

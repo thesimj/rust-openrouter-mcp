@@ -9,6 +9,7 @@ mod audio_gen;
 mod billing;
 mod chat_gen;
 mod cli;
+mod embed_gen;
 mod image_gen;
 mod image_io;
 mod manifest;

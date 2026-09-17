@@ -40,13 +40,6 @@ pub enum ProviderSort {
 }
 
 /// Routing-only block for chat completions, `/embeddings` and `/rerank`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases send routing blocks"
-    )
-)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProviderRouting {
     /// Provider slugs to try in order; disables load balancing.
@@ -70,13 +63,6 @@ pub struct ProviderRouting {
     pub sort: Option<ProviderSort>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed once the images and chat phases send routing blocks"
-    )
-)]
 impl ProviderRouting {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
