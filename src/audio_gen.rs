@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 
 use crate::manifest::{self, AudioManifest, AudioOutputMeta};
-use crate::openrouter::{InputAudio, OpenRouterClient, SpeechBody, TranscriptionBody};
+use crate::openrouter::{
+    InputAudio, OpenRouterClient, ProviderOptions, SpeechBody, TranscriptionBody,
+};
 
 /// Audio container formats the transcription endpoint accepts, as the
 /// `input_audio.format` values it expects. Keyed by file extension - which is
@@ -52,6 +54,8 @@ pub struct TranscribeRequest {
     /// "segment"/"word"; verbose_json + OpenAI-compatible providers only.
     pub timestamp_granularities: Vec<String>,
     pub temperature: Option<f64>,
+    /// Per-provider passthrough (`provider.options.<slug>`), already validated.
+    pub provider: Option<ProviderOptions>,
 }
 
 /// A transcript plus the reported USD cost, when present. `verbose` carries the
@@ -154,6 +158,7 @@ pub async fn transcribe(
         response_format: response_format.clone(),
         timestamp_granularities,
         temperature: req.temperature,
+        provider: req.provider.clone(),
     };
     let raw = client.transcribe(&body).await?;
     let cost = raw
@@ -457,6 +462,7 @@ mod tests {
             response_format: response_format.map(str::to_string),
             timestamp_granularities: granularities.iter().map(|s| s.to_string()).collect(),
             temperature: None,
+            provider: None,
         }
     }
 

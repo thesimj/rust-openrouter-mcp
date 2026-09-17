@@ -195,6 +195,27 @@ where
     }
 }
 
+/// Deserialize an object-valued argument leniently: accept the value itself,
+/// a JSON *string* that parses to it (clients that stringify nested objects,
+/// the same failure mode [`de_bool`] absorbs for scalars), or `null` / a blank
+/// string, both of which yield `T::default()`. Pair with `#[serde(default)]` so
+/// an absent field also defaults.
+pub(crate) fn de_lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    use serde::Deserialize as _;
+    use serde::de::Error as _;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(T::default()),
+        serde_json::Value::String(s) if s.trim().is_empty() => Ok(T::default()),
+        serde_json::Value::String(s) => serde_json::from_str(&s)
+            .map_err(|e| D::Error::custom(format!("invalid JSON in string argument: {e}"))),
+        other => serde_json::from_value(other).map_err(D::Error::custom),
+    }
+}
+
 /// Shared "no defaults" validator: if any required-but-absent parameters were
 /// collected in `missing`, fail with the standard message naming them and the
 /// modality to pass to `list_models`. Returns `Ok(())` when nothing is missing.
@@ -212,6 +233,89 @@ pub(crate) fn require_all(tool: &str, modality: &str, missing: &[&str]) -> Resul
     ))
 }
 
+/// The generated tool-args schema of `T` as a plain JSON value (rmcp's
+/// `schema_for_type` hands back a shared map).
+#[cfg(test)]
+pub(crate) fn schema_json<T: schemars::JsonSchema + std::any::Any>() -> serde_json::Value {
+    let schema = rmcp::handler::server::common::schema_for_type::<T>();
+    serde_json::Value::Object((*schema).clone())
+}
+
+/// Walk a generated tool-args schema (root and every `$defs` entry) and
+/// panic on the shapes that break real MCP clients: a nullable union
+/// (`anyOf`/`oneOf` with a `{"type":"null"}` branch, or a `type` array
+/// containing `"null"` - the trap `Option<Struct>` falls into, which
+/// `scalarize_nullable` cannot fix) and an untyped property schema (the bare
+/// boolean `true`, or `{"default": null}` - both what
+/// `Option<serde_json::Value>` emits). A tool-args *root* may carry no
+/// `anyOf`/`oneOf` at all. Later phases only add their struct to
+/// `tests::every_tool_args_schema_is_client_safe`.
+#[cfg(test)]
+pub(crate) fn assert_client_safe_schema(root: &serde_json::Value, name: &str) {
+    assert!(
+        root.get("anyOf").is_none() && root.get("oneOf").is_none(),
+        "{name}: tool-args root carries a union"
+    );
+    walk(root, name);
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = root.get(key).and_then(|d| d.as_object()) {
+            for (def_name, def) in defs {
+                walk(def, &format!("{name}.{key}.{def_name}"));
+            }
+        }
+    }
+
+    fn is_null_branch(v: &serde_json::Value) -> bool {
+        v.get("type").and_then(|t| t.as_str()) == Some("null")
+    }
+
+    fn walk(node: &serde_json::Value, path: &str) {
+        let Some(obj) = node.as_object() else { return };
+        for key in ["anyOf", "oneOf"] {
+            if let Some(branches) = obj.get(key).and_then(|b| b.as_array()) {
+                assert!(
+                    !branches.iter().any(is_null_branch),
+                    "{path}: {key} has a null branch: {node}"
+                );
+            }
+        }
+        if let Some(types) = obj.get("type").and_then(|t| t.as_array()) {
+            assert!(
+                !types.iter().any(|t| t.as_str() == Some("null")),
+                "{path}: nullable type union {types:?}"
+            );
+        }
+        if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+            for (prop, schema) in props {
+                assert!(
+                    !schema.is_boolean(),
+                    "{path}.{prop}: bare boolean property schema"
+                );
+                // `Option<Value>` + `serde(default)` emits `{"default": null}`:
+                // the same accept-anything schema as `true`, spelled as an
+                // object. Every property must say what it is.
+                let typed = ["type", "$ref", "anyOf", "oneOf", "allOf", "enum", "const"]
+                    .iter()
+                    .any(|k| schema.get(k).is_some());
+                assert!(typed, "{path}.{prop}: untyped property schema {schema}");
+                walk(schema, &format!("{path}.{prop}"));
+            }
+        }
+        for key in ["items", "additionalProperties", "not"] {
+            if let Some(sub) = obj.get(key) {
+                walk(sub, &format!("{path}.{key}"));
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(branches) = obj.get(key).and_then(|b| b.as_array()) {
+                for (i, b) in branches.iter().enumerate() {
+                    walk(b, &format!("{path}.{key}[{i}]"));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::server::audio::GenerateAudioArgs;
@@ -223,6 +327,103 @@ mod tests {
     use rmcp::handler::server::common::schema_for_type;
     use schemars::JsonSchema;
     use serde_json::json;
+
+    /// The permanent guard: every tool-arg struct, root and `$defs`, is free of
+    /// nullable unions and bare `true` schemas. Add new arg structs here.
+    #[test]
+    fn every_tool_args_schema_is_client_safe() {
+        use super::schema_json;
+        use crate::server::account::{GetResultArgs, ResetUsageStatsArgs};
+        use crate::server::audio::TranscribeAudioArgs;
+        use crate::server::models::DescribeModelArgs;
+        use crate::server::provider::{
+            ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
+        };
+        let schemas: Vec<(&str, serde_json::Value)> = vec![
+            ("ChatCompletionArgs", schema_json::<ChatCompletionArgs>()),
+            ("DescribeImageArgs", schema_json::<DescribeImageArgs>()),
+            ("GenerateImageArgs", schema_json::<GenerateImageArgs>()),
+            ("GenerateVideoArgs", schema_json::<GenerateVideoArgs>()),
+            ("GenerateAudioArgs", schema_json::<GenerateAudioArgs>()),
+            ("TranscribeAudioArgs", schema_json::<TranscribeAudioArgs>()),
+            ("GenerateMusicArgs", schema_json::<GenerateMusicArgs>()),
+            ("ListModelsArgs", schema_json::<ListModelsArgs>()),
+            ("DescribeModelArgs", schema_json::<DescribeModelArgs>()),
+            ("GetResultArgs", schema_json::<GetResultArgs>()),
+            ("ResetUsageStatsArgs", schema_json::<ResetUsageStatsArgs>()),
+            ("ProviderRoutingArgs", schema_json::<ProviderRoutingArgs>()),
+            ("ImageProviderArgs", schema_json::<ImageProviderArgs>()),
+            ("ProviderOptionsArgs", schema_json::<ProviderOptionsArgs>()),
+        ];
+        for (name, schema) in &schemas {
+            super::assert_client_safe_schema(schema, name);
+        }
+    }
+
+    /// The lint must actually catch the two traps it exists for, or it guards
+    /// nothing: `Option<Struct>` (nullable anyOf) and `Option<Value>` (bare true).
+    #[test]
+    fn client_safe_lint_rejects_option_struct_and_option_value() {
+        use serde::Deserialize;
+        #[derive(Deserialize, JsonSchema, Default)]
+        struct Inner {
+            #[allow(dead_code)]
+            #[serde(default)]
+            k: Option<String>,
+        }
+        #[derive(Deserialize, JsonSchema)]
+        #[schemars(transform = super::scalarize_nullable)]
+        struct BadStruct {
+            #[allow(dead_code)]
+            #[serde(default)]
+            inner: Option<Inner>,
+        }
+        #[derive(Deserialize, JsonSchema)]
+        #[schemars(transform = super::scalarize_nullable)]
+        struct BadValue {
+            #[allow(dead_code)]
+            #[serde(default)]
+            v: Option<serde_json::Value>,
+        }
+        let bad_struct = super::schema_json::<BadStruct>();
+        let r =
+            std::panic::catch_unwind(|| super::assert_client_safe_schema(&bad_struct, "BadStruct"));
+        assert!(r.is_err(), "Option<Struct> must be rejected: {bad_struct}");
+        let bad_value = super::schema_json::<BadValue>();
+        let r =
+            std::panic::catch_unwind(|| super::assert_client_safe_schema(&bad_value, "BadValue"));
+        assert!(r.is_err(), "Option<Value> must be rejected: {bad_value}");
+    }
+
+    /// `de_lenient` accepts the object itself, a JSON string holding it, and
+    /// `null`/blank (-> default); an absent field defaults via `serde(default)`.
+    #[test]
+    fn de_lenient_accepts_object_string_and_null() {
+        use std::collections::BTreeMap;
+        #[derive(serde::Deserialize, Debug)]
+        struct Holder {
+            #[serde(default, deserialize_with = "super::de_lenient")]
+            opts: BTreeMap<String, serde_json::Value>,
+        }
+        let direct: Holder =
+            serde_json::from_value(json!({"opts": {"deepgram": {"diarize": true}}})).unwrap();
+        assert_eq!(direct.opts["deepgram"], json!({"diarize": true}));
+
+        let stringified: Holder =
+            serde_json::from_value(json!({"opts": "{\"deepgram\":{\"diarize\":true}}"})).unwrap();
+        assert_eq!(stringified.opts["deepgram"], json!({"diarize": true}));
+
+        let null: Holder = serde_json::from_value(json!({"opts": null})).unwrap();
+        assert!(null.opts.is_empty());
+        let blank: Holder = serde_json::from_value(json!({"opts": "  "})).unwrap();
+        assert!(blank.opts.is_empty());
+        let absent: Holder = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.opts.is_empty());
+
+        // Garbage in the string, or the wrong shape, is still an error.
+        assert!(serde_json::from_value::<Holder>(json!({"opts": "{not json"})).is_err());
+        assert!(serde_json::from_value::<Holder>(json!({"opts": [1, 2]})).is_err());
+    }
 
     /// Fetch the JSON Schema `type` for a property of a tool-argument struct.
     fn prop_type<T: JsonSchema + std::any::Any>(prop: &str) -> serde_json::Value {

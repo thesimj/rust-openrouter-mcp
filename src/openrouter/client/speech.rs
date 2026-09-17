@@ -97,6 +97,7 @@ mod tests {
                     response_format: None,
                     timestamp_granularities: vec![],
                     temperature: None,
+                    provider: None,
                 })
                 .await
                 .expect_err("invalid response");

@@ -32,6 +32,13 @@ use serde::Serialize;
 pub type ProviderOptionsMap = BTreeMap<String, serde_json::Value>;
 
 /// `sort` is either a bare string (`"price"`) or `{by, partition}` upstream.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed once the images and chat phases send routing blocks"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ProviderSort {
@@ -40,6 +47,13 @@ pub enum ProviderSort {
 }
 
 /// Routing-only block for chat completions, `/embeddings` and `/rerank`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed once the images and chat phases send routing blocks"
+    )
+)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProviderRouting {
     /// Provider slugs to try in order; disables load balancing.
@@ -63,6 +77,13 @@ pub struct ProviderRouting {
     pub sort: Option<ProviderSort>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed once the images and chat phases send routing blocks"
+    )
+)]
 impl ProviderRouting {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -75,6 +96,13 @@ impl ProviderRouting {
 }
 
 /// The `/images` block: the documented routing subset plus passthrough.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed once the images and chat phases send routing blocks"
+    )
+)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ImageProvider {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -91,6 +119,13 @@ pub struct ImageProvider {
     pub options: ProviderOptionsMap,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed once the images and chat phases send routing blocks"
+    )
+)]
 impl ImageProvider {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()

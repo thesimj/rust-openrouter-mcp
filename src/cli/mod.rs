@@ -234,6 +234,30 @@ pub(crate) struct MusicArgs {
     output: PathBuf,
 }
 
+/// The `--provider <json>` flag shared by the subcommands whose MCP tool takes
+/// a `provider` block. Parsed with the tool's own lenient path into the
+/// matching `*Args` type from [`crate::server::provider`], so the CLI and MCP
+/// validate identically and no normalization is duplicated here.
+#[derive(clap::Args)]
+pub(crate) struct ProviderFlags {
+    /// OpenRouter `provider` block as JSON, the same object the matching MCP
+    /// tool takes, e.g. '{"options":{"deepgram":{"diarize":true}}}'. Which keys
+    /// are accepted depends on the endpoint (see the tool's `provider` docs).
+    #[arg(long, value_name = "JSON")]
+    provider: Option<String>,
+}
+
+impl ProviderFlags {
+    /// Parse the flag into a provider args type; an absent flag is `T::default()`.
+    pub(crate) fn parse<T>(&self) -> anyhow::Result<T>
+    where
+        T: serde::de::DeserializeOwned + Default,
+    {
+        let raw = serde_json::Value::String(self.provider.clone().unwrap_or_default());
+        crate::server::schema::de_lenient(raw).context("--provider is not a valid JSON object")
+    }
+}
+
 /// CLI flags for `transcribe`, mirroring the `transcribe_audio` MCP tool.
 #[derive(clap::Args)]
 pub(crate) struct TranscribeArgs {
@@ -260,6 +284,8 @@ pub(crate) struct TranscribeArgs {
     /// Sampling temperature (select providers only).
     #[arg(long)]
     temperature: Option<f64>,
+    #[command(flatten)]
+    provider: ProviderFlags,
 }
 
 /// CLI flags for `chat`, mirroring the `chat_completion` MCP tool.
@@ -425,6 +451,69 @@ mod tests {
         assert_eq!(parse_image_arg("./plain.png").label, None);
         assert_eq!(parse_image_arg("=/leading.png").label, None);
         assert_eq!(parse_image_arg("trailing=").label, None);
+    }
+
+    /// `--provider` takes the same JSON block the MCP tool takes and goes
+    /// through the same lenient parse + validation, so the CLI cannot drift.
+    #[test]
+    fn transcribe_provider_flag_parses_and_validates_like_the_tool() {
+        use crate::server::provider::ProviderOptionsArgs;
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "transcribe",
+            "-m",
+            "deepgram/nova-3",
+            "-f",
+            "a.mp3",
+            "--provider",
+            "{\"options\":{\"deepgram\":{\"diarize\":true}}}",
+        ])
+        .unwrap();
+        let Some(Command::Transcribe(args)) = cli.command else {
+            panic!("expected transcribe")
+        };
+        let block = args
+            .provider
+            .parse::<ProviderOptionsArgs>()
+            .unwrap()
+            .into_options()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block.options["deepgram"],
+            serde_json::json!({"diarize": true})
+        );
+
+        // Absent flag -> nothing sent.
+        let cli = Cli::try_parse_from(["openrouter-mcp", "transcribe", "-m", "m", "-f", "a.mp3"])
+            .unwrap();
+        let Some(Command::Transcribe(args)) = cli.command else {
+            panic!("expected transcribe")
+        };
+        assert!(
+            args.provider
+                .parse::<ProviderOptionsArgs>()
+                .unwrap()
+                .into_options()
+                .unwrap()
+                .is_none()
+        );
+
+        // Malformed JSON is a parse error, a non-object slug value a validation error.
+        let bad = ProviderFlags {
+            provider: Some("{nope".to_string()),
+        };
+        assert!(bad.parse::<ProviderOptionsArgs>().is_err());
+        let bad_value = ProviderFlags {
+            provider: Some("{\"options\":{\"deepgram\":true}}".to_string()),
+        };
+        assert!(
+            bad_value
+                .parse::<ProviderOptionsArgs>()
+                .unwrap()
+                .into_options()
+                .is_err()
+        );
     }
 
     #[test]

@@ -273,6 +273,11 @@ pub(crate) async fn run_music(args: MusicArgs) -> anyhow::Result<()> {
 /// stderr). Mirrors the `transcribe_audio` MCP tool.
 pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let (data, format) = audio_gen::read_audio_file(&args.file, args.format.as_deref()).await?;
 
     let result = audio_gen::transcribe(
@@ -285,6 +290,7 @@ pub(crate) async fn run_transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
             response_format: args.response_format,
             timestamp_granularities: args.timestamp_granularities,
             temperature: args.temperature,
+            provider,
         },
     )
     .await?;

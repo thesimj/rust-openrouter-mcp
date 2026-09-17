@@ -14,8 +14,11 @@ use serde_json::json;
 
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
+use crate::server::provider::ProviderOptionsArgs;
 use crate::server::result::{client_wants_inline_previews, inline_audio_block};
-use crate::server::schema::{RequireFields, de_opt_f64, require_all, scalarize_nullable};
+use crate::server::schema::{
+    RequireFields, de_lenient, de_opt_f64, require_all, scalarize_nullable,
+};
 
 use super::OpenRouterServer;
 
@@ -52,6 +55,15 @@ pub(crate) struct TranscribeAudioArgs {
     /// Sampling temperature (select providers only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
+    /// Provider-specific passthrough: {"options": {"<provider-slug>": {...}}}.
+    /// Only the slug that serves the request is forwarded. Speaker diarization:
+    /// {"options": {"deepgram": {"diarize": true}}} or
+    /// {"options": {"azure": {"diarization": {"enabled": true}}}}; with
+    /// response_format="verbose_json" the segments/words then carry a "speaker"
+    /// index. Groq takes vocabulary hints as {"options": {"groq": {"prompt": "..."}}}.
+    /// Routing fields are ignored by this endpoint.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ProviderOptionsArgs,
 }
 
 /// Arguments for the `generate_audio` tool.
@@ -221,7 +233,10 @@ impl OpenRouterServer {
         response object (language, duration, segments, words, ...) instead - this needs an \
         OpenAI-compatible provider; other providers reject it with a 400. \
         timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
-        an OpenAI-compatible provider. Discover \
+        an OpenAI-compatible provider. Provider-specific settings go in `provider.options` keyed \
+        by provider slug - e.g. speaker diarization with {\"deepgram\": {\"diarize\": true}} or \
+        {\"azure\": {\"diarization\": {\"enabled\": true}}}; when the provider diarizes, \
+        verbose_json segments and words carry a \"speaker\" index. Discover \
         STT models with list_models using output_modalities=\"transcription\" - they are not in \
         the default model list. To create speech from text instead, use generate_audio.",
         annotations(
@@ -301,6 +316,10 @@ async fn resolve_transcribe_request(
         response_format: args.response_format,
         timestamp_granularities: args.timestamp_granularities,
         temperature: args.temperature,
+        provider: args
+            .provider
+            .into_options()
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?,
     })
 }
 
@@ -416,6 +435,7 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
@@ -441,6 +461,7 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             })
         };
 
@@ -516,6 +537,7 @@ mod tests {
                 response_format: Some("verbose_json".to_string()),
                 timestamp_granularities: vec!["word".to_string(), "segment".to_string()],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
@@ -561,11 +583,89 @@ mod tests {
                 response_format: None,
                 timestamp_granularities: vec![],
                 temperature: None,
+                provider: Default::default(),
             }))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["content"][0]["text"], "from disk");
+    }
+
+    /// The diarization recipe from the tool description reaches the wire as
+    /// `provider.options.<slug>`, nested exactly as OpenRouter documents it.
+    #[tokio::test]
+    async fn transcribe_audio_forwards_provider_options_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "deepgram/nova-3",
+                "provider": { "options": { "deepgram": { "diarize": true } } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello there",
+                "segments": [{"id": 0, "text": "hello there", "speaker": 0}]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        // Deserialized the way a client sends it, so the nested object goes
+        // through the lenient path rather than a hand-built struct.
+        let args: TranscribeAudioArgs = serde_json::from_value(serde_json::json!({
+            "model": "deepgram/nova-3",
+            "base64": "data:audio/mp3;base64,QUJD",
+            "provider": { "options": { "deepgram": { "diarize": true } } }
+        }))
+        .unwrap();
+        let res = server.transcribe_audio(Parameters(args)).await.unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["content"][0]["text"], "hello there");
+    }
+
+    /// The shared fixture later phases reuse produces exactly the block it
+    /// promises, and an invalid block is rejected before any HTTP call.
+    #[tokio::test]
+    async fn transcribe_audio_uses_the_shared_provider_fixture_and_rejects_bad_options() {
+        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "provider": expected }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })),
+            )
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let args = |provider| TranscribeAudioArgs {
+            model: "m".to_string(),
+            path: None,
+            base64: Some("data:audio/mp3;base64,QUJD".to_string()),
+            format: None,
+            language: None,
+            response_format: None,
+            timestamp_granularities: vec![],
+            temperature: None,
+            provider,
+        };
+        server
+            .transcribe_audio(Parameters(args(provider)))
+            .await
+            .unwrap();
+
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("deepgram".to_string(), serde_json::json!("diarize"));
+        let err = server
+            .transcribe_audio(Parameters(args(
+                crate::server::provider::ProviderOptionsArgs { options },
+            )))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("deepgram"), "got: {}", err.message);
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@
 
 use serde::Serialize;
 
+use super::provider::ProviderOptions;
+
 /// Request body for `POST /api/v1/audio/speech`. `response_format`/`speed` are
 /// omitted when unset.
 #[derive(Debug, Serialize)]
@@ -42,6 +44,9 @@ pub struct TranscriptionBody {
     pub timestamp_granularities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Per-provider passthrough (`options.<slug>`); routing is ignored here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderOptions>,
 }
 
 /// Inline audio payload. `data` is **raw** base64 - a `data:` URL prefix is
@@ -50,4 +55,42 @@ pub struct TranscriptionBody {
 pub struct InputAudio {
     pub data: String,
     pub format: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn body(provider: Option<ProviderOptions>) -> TranscriptionBody {
+        TranscriptionBody {
+            model: "openai/whisper-1".into(),
+            input_audio: InputAudio {
+                data: "QUJD".into(),
+                format: "mp3".into(),
+            },
+            language: None,
+            response_format: None,
+            timestamp_granularities: vec![],
+            temperature: None,
+            provider,
+        }
+    }
+
+    /// Serde lock: `provider` is omitted entirely when unset (a bare
+    /// `"provider": null` or `{}` is not what the endpoint documents), and
+    /// serializes as the options-only block when set.
+    #[test]
+    fn transcription_body_omits_provider_when_none_and_nests_options_when_set() {
+        let none = serde_json::to_value(body(None)).unwrap();
+        assert!(none.get("provider").is_none(), "sent: {none}");
+
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("deepgram".to_string(), json!({"diarize": true}));
+        let some = serde_json::to_value(body(Some(ProviderOptions { options }))).unwrap();
+        assert_eq!(
+            some["provider"],
+            json!({"options": {"deepgram": {"diarize": true}}})
+        );
+    }
 }

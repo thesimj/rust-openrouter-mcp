@@ -26,8 +26,9 @@ mod image;
 mod models;
 mod music;
 mod naming;
+pub(crate) mod provider;
 mod result;
-mod schema;
+pub(crate) mod schema;
 mod video;
 
 #[cfg(test)]
