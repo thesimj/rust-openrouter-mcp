@@ -19,7 +19,7 @@ use crate::tasks::TaskRegistry;
 use caps::ModelCapsCache;
 
 mod account;
-mod audio;
+pub(crate) mod audio;
 mod caps;
 pub(crate) mod chat;
 mod embeddings;

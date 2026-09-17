@@ -425,7 +425,8 @@ pub(crate) struct FileInput {
     pub filename: Option<String>,
 }
 
-/// An audio clip input for `chat_completion`. Exactly one of `path`, `base64`.
+/// An audio clip input: a `chat_completion` `audio` entry, or the
+/// `generate_audio` voice-cloning sample. Exactly one of `path`, `base64`.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 #[schemars(transform = AtLeastOneOf(&["path", "base64"]))]
@@ -442,6 +443,16 @@ pub(crate) struct AudioInput {
     /// from the file extension or the data URL's MIME type when omitted.
     #[serde(default)]
     pub format: Option<String>,
+}
+
+impl AudioInput {
+    /// True when no field is set: the "no reference" state of an optional
+    /// nested object (a lone `format` is a malformed reference, not an absent one).
+    pub(crate) fn is_empty(&self) -> bool {
+        [&self.path, &self.base64, &self.format]
+            .into_iter()
+            .all(|f| present(f.as_deref()).is_none())
+    }
 }
 
 /// A video input for `chat_completion`. Exactly one of `url`, `path`, `base64`.
@@ -703,7 +714,14 @@ pub(crate) async fn resolve_file_inputs(files: Vec<FileInput>) -> Result<Vec<Fil
     Ok(out)
 }
 
-async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
+/// Load one audio input as `(raw base64, format hint)`: a path is read with
+/// the transcription cap and its format taken from `format` or the file
+/// extension; inline data has a `data:` prefix stripped, the MIME subtype
+/// standing in as the hint when `format` is unset (upstream wants raw bytes).
+/// Whether a format is required, and the decoded-size cap, are the caller's:
+/// chat's `input_audio` needs both (`validate_inline_audio`), the speech voice
+/// reference applies its own (`VoiceReference::new`).
+pub(crate) async fn load_audio_input(a: AudioInput) -> Result<(String, Option<String>), ErrorData> {
     check_audio_input(&a)?;
     let invalid = |e: anyhow::Error| ErrorData::invalid_params(format!("{e:#}"), None);
     let format = present(a.format.as_deref()).map(str::to_string);
@@ -711,21 +729,21 @@ async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
         let (data, format) = crate::audio_gen::read_audio_file(Path::new(p), format.as_deref())
             .await
             .map_err(invalid)?;
-        return Ok(InputAudio { data, format });
+        return Ok((data, Some(format)));
     }
     let b64 = a.base64.unwrap_or_default();
-    // Tolerate a `data:audio/mp3;base64,...` URL: upstream wants the raw bytes,
-    // and the subtype is a usable format when none was passed.
-    let (from_url, data) = if b64.trim().starts_with("data:") {
-        let (mime, data) = crate::image_io::split_data_url(&b64).map_err(invalid)?;
-        (
-            mime.rsplit('/').next().map(str::to_string),
-            data.trim().to_string(),
-        )
-    } else {
-        (None, b64.trim().to_string())
-    };
-    let format = format.or(from_url).ok_or_else(|| {
+    let b64 = b64.trim();
+    if !b64.starts_with("data:") {
+        return Ok((b64.to_string(), format));
+    }
+    let (mime, data) = crate::image_io::split_data_url(b64).map_err(invalid)?;
+    let from_url = mime.rsplit('/').next().map(str::to_string);
+    Ok((data.trim().to_string(), format.or(from_url)))
+}
+
+async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
+    let (data, format) = load_audio_input(a).await?;
+    let format = format.ok_or_else(|| {
         ErrorData::invalid_params(
             "audio[].format is required with raw base64 (wav, mp3, flac, m4a, ogg, webm, aac)",
             None,
@@ -735,7 +753,7 @@ async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
         crate::audio_gen::validate_inline_audio(&data, &format)
     })
     .await
-    .map_err(invalid)?;
+    .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
     Ok(InputAudio { data, format })
 }
 
@@ -1058,6 +1076,68 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.message.contains("path or base64"), "{}", err.message);
+    }
+
+    /// `load_audio_input` is the one place an audio argument becomes
+    /// `(base64, format hint)`; chat's `resolve_audio_inputs` and the speech
+    /// voice reference both sit on it and only differ in what they require.
+    #[tokio::test]
+    async fn load_audio_input_yields_base64_and_a_format_hint_without_requiring_one() {
+        assert!(AudioInput::default().is_empty());
+        assert!(
+            !AudioInput {
+                format: Some("wav".into()),
+                ..Default::default()
+            }
+            .is_empty(),
+            "a lone format is a malformed reference, not an absent one"
+        );
+
+        // Raw base64: no hint, and that is not an error here.
+        let (data, format) = load_audio_input(AudioInput {
+            base64: Some(" QUJD ".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!((data.as_str(), format), ("QUJD", None));
+
+        // Data URL: prefix stripped, subtype as the hint, argument wins.
+        let (data, format) = load_audio_input(AudioInput {
+            base64: Some("data:audio/mp3;base64,QUJD".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!((data.as_str(), format.as_deref()), ("QUJD", Some("mp3")));
+        let (_, format) = load_audio_input(AudioInput {
+            base64: Some("data:audio/mp3;base64,QUJD".into()),
+            format: Some("wav".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(format.as_deref(), Some("wav"));
+
+        // A file: read and base64'd, format from the extension (or override).
+        let dir = std::env::temp_dir().join("openrouter-mcp-media-load-audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let flac = dir.join("ref.flac");
+        std::fs::write(&flac, b"ABC").unwrap();
+        let (data, format) = load_audio_input(AudioInput {
+            path: Some(flac.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!((data.as_str(), format.as_deref()), ("QUJD", Some("flac")));
+        let err = load_audio_input(AudioInput {
+            path: Some(dir.join("notes.txt").to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("could not infer"), "{}", err.message);
     }
 
     #[tokio::test]

@@ -337,18 +337,19 @@ pub(crate) async fn run_audio(args: AudioArgs) -> anyhow::Result<()> {
         .into_options()
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let (input, input_source) = resolve_prompt(args.input, args.input_file)?;
-    // clap guarantees --voice-reference-text only appears with --voice-reference.
-    let voice_reference = match args.voice_reference {
-        Some(path) => {
-            let (data, format) = audio_gen::read_audio_file(&path, None).await?;
-            Some(audio_gen::VoiceReference::new(
-                &data,
-                Some(&format),
-                args.voice_reference_text.as_deref(),
-            )?)
-        }
-        None => None,
-    };
+    // clap guarantees --voice-reference-text only appears with --voice-reference;
+    // the sample goes through the MCP tool's resolver so both validate alike.
+    let voice_reference = crate::server::audio::resolve_voice_reference(
+        media::AudioInput {
+            path: args
+                .voice_reference
+                .map(|p| p.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        args.voice_reference_text,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
     let req = audio_gen::SpeechGenRequest {
         model: args.model,

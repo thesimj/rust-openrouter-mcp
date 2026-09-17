@@ -546,6 +546,15 @@ mod tests {
         // `voice` is provider-dependent (voice-cloning models take none), so it
         // must NOT be advertised as required even though most models need it.
         assert!(!audio.contains(&"voice".to_string()), "{audio:?}");
+        // The cloning sample is the shared nested AudioInput object, optional
+        // at the root (empty = no reference) and a $ref, never an Option<Struct>.
+        assert!(!audio.contains(&"voice_reference".to_string()), "{audio:?}");
+        let audio_schema = super::schema_json::<GenerateAudioArgs>();
+        assert_eq!(
+            audio_schema["properties"]["voice_reference"]["$ref"],
+            json!("#/$defs/AudioInput"),
+            "{audio_schema}"
+        );
 
         let music = required_fields::<GenerateMusicArgs>();
         assert!(music.contains(&"prompt".to_string()), "{music:?}");

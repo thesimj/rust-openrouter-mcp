@@ -1,6 +1,6 @@
 //! The `generate_audio` text-to-speech tool and its argument struct.
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -21,6 +21,7 @@ use crate::server::schema::{
 };
 
 use super::OpenRouterServer;
+use super::media;
 
 /// Arguments for the `transcribe_audio` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -83,7 +84,7 @@ pub(crate) struct GenerateAudioArgs {
     /// Voice id, valid only for the chosen model (e.g. "af_heart" for
     /// hexgrad/kokoro-82m). Provider-dependent: most TTS models have NO default
     /// voice and fail without one, so pass it unless the model clones a voice
-    /// from `voice_reference_*` instead (e.g. fish-audio).
+    /// from `voice_reference` instead (e.g. fish-audio).
     #[serde(default)]
     pub voice: Option<String>,
     /// Output audio format: "mp3" (default) or "pcm".
@@ -92,23 +93,16 @@ pub(crate) struct GenerateAudioArgs {
     /// Playback speed (select models only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub speed: Option<f64>,
-    /// Stateless voice cloning: local audio file whose voice to imitate (wav,
-    /// mp3, flac, m4a, ogg, webm, aac; format inferred from the extension;
-    /// 15 MiB decoded max). One of voice_reference_path/voice_reference_base64.
-    #[serde(default)]
-    pub voice_reference_path: Option<String>,
-    /// Stateless voice cloning: the sample as inline base64 (a `data:` URL is
-    /// also accepted; 15 MiB decoded max). One of
-    /// voice_reference_path/voice_reference_base64.
-    #[serde(default)]
-    pub voice_reference_base64: Option<String>,
-    /// Container format of the voice reference (wav, mp3, flac, m4a, ogg,
-    /// webm, aac). Optional: inferred from the file extension or data URL;
-    /// omitted from the request when unknown.
-    #[serde(default)]
-    pub voice_reference_format: Option<String>,
+    /// Stateless voice cloning: the audio sample whose voice to imitate, as
+    /// {"path": "<local file>"} (wav, mp3, flac, m4a, ogg, webm, aac; format
+    /// inferred from the extension) or {"base64": "<base64 or data: URL>",
+    /// "format"?: "wav"} (15 MiB decoded max; the format is optional and
+    /// omitted from the request when unknown). Omit for no cloning. Sent as
+    /// `input_references`; needs no `voice`.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub voice_reference: media::AudioInput,
     /// Transcript of the voice reference sample (max 10000 characters);
-    /// improves cloning fidelity on models that use it. Needs a sample.
+    /// improves cloning fidelity on models that use it. Needs `voice_reference`.
     #[serde(default)]
     pub voice_reference_text: Option<String>,
     /// Provider block for this request: per-provider passthrough only, as
@@ -138,9 +132,10 @@ impl OpenRouterServer {
         one, so pass it unless the model clones a voice instead. Voice ids are model-specific and \
         are not interchangeable between models - call list_models with output_modalities=speech \
         to see each model's supported_voices. Stateless voice cloning (e.g. fish-audio models): \
-        pass the sample as `voice_reference_path` (local file) or `voice_reference_base64` \
-        (15 MiB decoded max), optionally with `voice_reference_text` (its transcript, max 10000 \
-        characters); it is sent as `input_references` and needs no `voice`. Provider-specific \
+        pass the sample as `voice_reference` ({\"path\": ...} for a local file, or \
+        {\"base64\": ..., \"format\"?: ...} for inline data or a data: URL; 15 MiB decoded max), \
+        optionally with `voice_reference_text` (its transcript, max 10000 characters); it is \
+        sent as `input_references` and needs no `voice`. Provider-specific \
         settings go in `provider.options` keyed by provider slug, e.g. \
         {\"openai\": {\"instructions\": \"speak like a calm narrator\"}} for OpenAI speaking-style \
         instructions or {\"azure\": {\"style\": \"cheerful\", \"styledegree\": 1.0}} for Azure \
@@ -188,14 +183,8 @@ impl OpenRouterServer {
         require_all("generate_audio", "speech", &missing)?;
 
         let provider = args.provider.into_options()?;
-        let voice_reference = resolve_voice_reference(
-            args.voice_reference_path,
-            args.voice_reference_base64,
-            args.voice_reference_format,
-            args.voice_reference_text,
-        )
-        .await
-        .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        let voice_reference =
+            resolve_voice_reference(args.voice_reference, args.voice_reference_text).await?;
 
         let model = args.model.clone();
         let req = SpeechGenRequest {
@@ -326,25 +315,21 @@ impl OpenRouterServer {
 
 /// Resolve `transcribe_audio` arguments to a [`audio_gen::TranscribeRequest`]:
 /// exactly one source, base64 decoded from a `data:` URL when given as one, and
-/// the format taken from the argument, the data URL, or the file extension.
+/// the format taken from the argument, the data URL, or the file extension -
+/// through the same [`media::load_audio_input`] the chat `audio` parts use.
 async fn resolve_transcribe_request(
     args: TranscribeAudioArgs,
 ) -> anyhow::Result<audio_gen::TranscribeRequest> {
-    let path = args.path.filter(|s| !s.trim().is_empty());
-    let inline = args.base64.filter(|s| !s.trim().is_empty());
-    let (data, format) = match (path, inline) {
-        (Some(p), None) => {
-            audio_gen::read_audio_file(std::path::Path::new(&p), args.format.as_deref()).await?
-        }
-        (None, Some(b64)) => {
-            let (data, from_url) = inline_audio_source(&b64)?;
-            let format = args.format.or(from_url).context(
-                "base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)",
-            )?;
-            (data, format)
-        }
-        _ => bail!("transcribe_audio needs exactly one of: path or base64"),
+    let source = media::AudioInput {
+        path: args.path,
+        base64: args.base64,
+        format: args.format,
     };
+    let (data, format) = media::load_audio_input(source)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let format = format
+        .context("base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)")?;
 
     Ok(audio_gen::TranscribeRequest {
         model: args.model,
@@ -361,67 +346,31 @@ async fn resolve_transcribe_request(
     })
 }
 
-/// Split an inline audio argument into `(raw base64, format hint)`. A
-/// `data:audio/mp3;base64,...` URL is tolerated - upstream wants the raw
-/// bytes, and the MIME subtype is a usable format hint - while bare base64
-/// passes through trimmed with no hint. Shared by both audio tools so they
-/// agree on what counts as a data URL.
-fn inline_audio_source(b64: &str) -> anyhow::Result<(String, Option<String>)> {
-    if b64.trim().starts_with("data:") {
-        let (mime, data) = crate::image_io::split_data_url(b64)?;
-        Ok((
-            data.trim().to_string(),
-            mime.rsplit('/').next().map(str::to_string),
-        ))
-    } else {
-        Ok((b64.trim().to_string(), None))
-    }
-}
-
-/// Resolve the `voice_reference_*` arguments of `generate_audio` to a validated
-/// [`audio_gen::VoiceReference`], or `None` when none was given. Exactly one
-/// of path/base64 carries the sample when any reference argument is set; the
-/// format comes from the argument, the data URL, or the file extension and may
-/// stay unknown for inline data (the endpoint does not require it).
-async fn resolve_voice_reference(
-    path: Option<String>,
-    base64: Option<String>,
-    format: Option<String>,
+/// Resolve the `voice_reference` object (plus `voice_reference_text`) of
+/// `generate_audio` to a validated [`audio_gen::VoiceReference`], or `None`
+/// when the object is empty. The sample is loaded like any other audio input
+/// ([`media::load_audio_input`]); its format may stay unknown for inline data
+/// (the endpoint does not require it) and [`audio_gen::VoiceReference::new`]
+/// applies the 15 MiB / 10000-character caps. Shared with the CLI.
+pub(crate) async fn resolve_voice_reference(
+    reference: media::AudioInput,
     text: Option<String>,
-) -> anyhow::Result<Option<audio_gen::VoiceReference>> {
-    let present = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
-    let (path, inline, format, text) = (
-        present(path),
-        present(base64),
-        present(format),
-        present(text),
-    );
-    let (data, format) = match (path, inline) {
-        (None, None) => {
-            if format.is_some() || text.is_some() {
-                bail!(
-                    "voice_reference_text/voice_reference_format need a sample: pass exactly \
-                     one of voice_reference_path or voice_reference_base64"
-                );
-            }
-            return Ok(None);
+) -> Result<Option<audio_gen::VoiceReference>, ErrorData> {
+    let text = text.filter(|t| !t.trim().is_empty());
+    if reference.is_empty() {
+        if text.is_some() {
+            return Err(ErrorData::invalid_params(
+                "voice_reference_text needs a sample: pass voice_reference with exactly one \
+                 of path or base64",
+                None,
+            ));
         }
-        (Some(p), None) => {
-            let (data, format) =
-                audio_gen::read_audio_file(std::path::Path::new(&p), format.as_deref()).await?;
-            (data, Some(format))
-        }
-        (None, Some(b64)) => {
-            let (data, from_url) = inline_audio_source(&b64)?;
-            (data, format.or(from_url))
-        }
-        (Some(_), Some(_)) => {
-            bail!(
-                "generate_audio needs exactly one of: voice_reference_path or voice_reference_base64"
-            )
-        }
-    };
-    audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref()).map(Some)
+        return Ok(None);
+    }
+    let (data, format) = media::load_audio_input(reference).await?;
+    audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref())
+        .map(Some)
+        .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))
 }
 
 #[cfg(test)]
@@ -439,9 +388,7 @@ mod tests {
             voice: Some("alloy".to_string()),
             response_format: None,
             speed: None,
-            voice_reference_path: None,
-            voice_reference_base64: None,
-            voice_reference_format: None,
+            voice_reference: Default::default(),
             voice_reference_text: None,
             provider: Default::default(),
             output: Some(out.to_string_lossy().into_owned()),
@@ -847,7 +794,7 @@ mod tests {
         let args: GenerateAudioArgs = serde_json::from_value(serde_json::json!({
             "model": "fish-audio/s1",
             "input": "hello",
-            "voice_reference_base64": "data:audio/wav;base64,QUJD",
+            "voice_reference": {"base64": "data:audio/wav;base64,QUJD"},
             "voice_reference_text": "the sample words",
             "output": out.to_string_lossy(),
         }))
@@ -864,7 +811,8 @@ mod tests {
     }
 
     /// A reference read from disk infers its format from the extension, like
-    /// transcribe_audio, and `voice_reference_format` overrides it.
+    /// transcribe_audio (`voice_reference.format` would override it). The
+    /// nested object arrives the way a stringifying client sends it.
     #[tokio::test]
     async fn generate_audio_reads_a_voice_reference_file() {
         let mock = MockServer::start().await;
@@ -888,7 +836,10 @@ mod tests {
         let server = server_for(mock.uri());
         let out = std::env::temp_dir().join("openrouter-mcp-audio-clone-file/voice.mp3");
         let mut args = speech_args(&out);
-        args.voice_reference_path = Some(file.to_string_lossy().into_owned());
+        args.voice_reference = serde_json::from_value(serde_json::json!({
+            "path": file.to_string_lossy()
+        }))
+        .unwrap();
         server.run_generate_audio(args, false).await.unwrap();
         // Exactly one part: no transcript was given, so no text part is sent.
         let sent: serde_json::Value = mock.received_requests().await.unwrap()[0]
@@ -906,15 +857,15 @@ mod tests {
         let out = std::path::Path::new("out.mp3");
 
         let mut args = speech_args(out);
-        args.voice_reference_base64 = Some("QUJD".to_string());
+        args.voice_reference.base64 = Some("QUJD".to_string());
         args.voice_reference_text = Some("x".repeat(10_001));
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("10000"), "got: {}", err.message);
 
         let mut args = speech_args(out);
-        args.voice_reference_base64 = Some("QUJD".to_string());
-        args.voice_reference_path = Some("sample.wav".to_string());
+        args.voice_reference.base64 = Some("QUJD".to_string());
+        args.voice_reference.path = Some("sample.wav".to_string());
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
@@ -928,13 +879,24 @@ mod tests {
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
-            err.message.contains("voice_reference_path"),
+            err.message.contains("voice_reference"),
+            "got: {}",
+            err.message
+        );
+
+        // A format with no sample is a malformed reference, not an absent one.
+        let mut args = speech_args(out);
+        args.voice_reference.format = Some("wav".to_string());
+        let err = server.run_generate_audio(args, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("exactly one of"),
             "got: {}",
             err.message
         );
 
         let mut args = speech_args(out);
-        args.voice_reference_base64 = Some("not base64!".to_string());
+        args.voice_reference.base64 = Some("not base64!".to_string());
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
