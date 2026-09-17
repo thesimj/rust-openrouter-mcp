@@ -1271,7 +1271,7 @@ mod tests {
             );
         }
         // Sniffed bytes beat a misleading extension.
-        let wav = write("sample.bin", b"RIFF   WAVEfmt ");
+        let wav = write("sample.bin", b"RIFF\x10\x00\x00\x00WAVEfmt ");
         assert!(
             resolve_media_reference(InputKind::Audio, &wav)
                 .await

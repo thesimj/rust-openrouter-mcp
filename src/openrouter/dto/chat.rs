@@ -92,8 +92,6 @@ pub struct Reasoning {
     /// Reason internally but leave the reasoning text out of the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
 }
 
 /// `response_format`: `{"type": "json_object"}` or
@@ -489,11 +487,10 @@ mod tests {
             effort: None,
             max_tokens: Some(2000),
             exclude: Some(true),
-            enabled: Some(true),
         };
         assert_eq!(
             serde_json::to_value(budget).unwrap(),
-            json!({"max_tokens": 2000, "exclude": true, "enabled": true})
+            json!({"max_tokens": 2000, "exclude": true})
         );
     }
 

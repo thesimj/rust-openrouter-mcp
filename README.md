@@ -94,9 +94,9 @@ parameters through a shared `provider` object.
   TTS model (voice/format/speed); saves the audio to disk with a manifest.
   `voice` is provider-dependent and optional in the schema - most models still
   fail upstream without one. **Voice cloning**: pass a sample as
-  `voice_reference_path` or `voice_reference_base64` (optional
-  `voice_reference_format`, and `voice_reference_text` transcript up to 10000
-  characters; 15 MiB decoded max) and it is sent as `input_references` for
+  `voice_reference` (`{"path": ...}` or `{"base64": ...}`, optional `format`)
+  plus an optional `voice_reference_text` transcript (up to 10000 characters;
+  15 MiB decoded max) and it is sent as `input_references` for
   models such as fish-audio, which need no `voice`. `provider.options` carries
   e.g. `{"openai": {"instructions": "speak like a calm narrator"}}`.
 - **Music generation** - `generate_music`: text-to-music with an OpenRouter
@@ -344,7 +344,7 @@ block is optional.
 | `describe_model` | read-only | Full detail for one model id: description, architecture, context, benchmarks, per-provider endpoints, (for video models) real `pricing_skus`, (for image models) per-endpoint image capabilities merged under an `image` key - including `allowed_passthrough_parameters`, the keys you may send in `provider.options` - and (for zero-priced audio-output models such as Lyria) an `audio_pricing_note` pointing at the per-track price in the description. |
 | `generate_image` | write | Generate or edit images via OpenRouter's dedicated `/api/v1/images` endpoint (works with any image model: Nano Banana, Grok, Seedream, FLUX, GPT Image, Recraft, ...); supports `variants`; async with `task_id`. Inputs by `path`/`url`/`base64` (max 16). Optional `quality` (auto/low/medium/high/xhigh/max), `output_format` (png/jpeg/webp/svg), `background` (auto/transparent/opaque), `output_compression` (0-100, webp/jpeg only) and `provider` (routing `order`/`only`/`ignore`/`allow_fallbacks`/`sort` plus `options` keyed by provider slug, e.g. `{"options": {"black-forest-labs": {"steps": 28}}}`) pass through to the provider. **No defaults** for `model`, `prompt`, and either `size` (`"WIDTHxHEIGHT"` or a tier) or both `aspect_ratio` and `image_size` - checked at runtime, the call fails naming what is missing; `output` is optional (auto-named under `OPENROUTER_MCP_OUTPUT_DIR`). |
 | `generate_video` | write | Text-to-video / image-to-video / reference-to-video with an OpenRouter video model; async, poll by `task_id`. Required: `model`, `duration`, `with_audio` (renamed from `generate_audio` in 0.6.0); `prompt` is required unless a `first_frame`/`last_frame` or a reference (`reference_images`, `reference_audio`, `reference_videos`) is given. Optional `creativity` and `upscale_factor` (upscaling models), `provider.options` keyed by provider slug. |
-| `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. `voice` is provider-dependent (optional in the schema, but most models fail without it); voice cloning via `voice_reference_path`/`voice_reference_base64` (+ `voice_reference_format`, `voice_reference_text`); `provider.options` e.g. `{"openai": {"instructions": "..."}}`, `{"azure": {"style": "cheerful"}}`. |
+| `generate_audio` | write | Text-to-speech with an OpenRouter TTS model; saves audio to disk. `voice` is provider-dependent (optional in the schema, but most models fail without it); voice cloning via the `voice_reference` object (`{"path"|"base64", "format"?}`) plus `voice_reference_text`; `provider.options` e.g. `{"openai": {"instructions": "..."}}`, `{"azure": {"style": "cheerful"}}`. |
 | `generate_music` | write | Text-to-music with an OpenRouter music model (Google Lyria 3) via streamed `/api/v1/chat/completions` audio output; synchronous; saves the track to disk (extension from the returned bytes, MP3 for Lyria), returns the model's text (lyrics or `<instrumental>`), `cost_usd`, the manifest path, and a `warnings` entry if the stream ended before its `[DONE]` sentinel (the track may be cut short). Required: `model`, `prompt`; optional `format` (audio.format passthrough), `seed`, `output`, `provider` (routing only). Find models with `list_models` + `output_modalities="audio"`. |
 | `transcribe_audio` | read-only | Speech-to-text via `/api/v1/audio/transcriptions`: audio by `path` or `base64` (wav/mp3/flac/m4a/ogg/webm/aac, local 25 MiB limit for files and inline data), optional ISO-639-1 `language`, `response_format` (json/verbose_json), `timestamp_granularities` (segment/word - verbose_json + OpenAI-compatible providers only), `temperature`, and `provider.options` (e.g. `{"deepgram": {"diarize": true}}` - segments/words then carry `speaker`); returns the transcript. Find models with `list_models` + `output_modalities="transcription"`. |
 | `chat_completion` | read-only | Send a prompt to any OpenRouter chat/text model and return its text reply; route a sub-task to a different model. Sampling: `system`, `temperature`, `max_tokens`, `seed`, `top_p`, `top_k`, `stop`, `frequency_penalty`, `presence_penalty`, `verbosity`. Structured output: `json_mode` or `json_schema` (strict). `web_search` plugin (citations as `annotations`), `pdf_engine`, `reasoning_effort`/`reasoning_max_tokens`/`reasoning_exclude`, `provider` routing. Multimodal: `images`, `files`, `audio`, `videos`, each gated on the model's declared input modalities. Reply text is `content[0]`; a second JSON block with reasoning/annotations/finish_reason/usage is appended only when present. |
@@ -372,7 +372,7 @@ fields they were missing, and three tools are new (`embed_text`,
   schema (removed from the JSON Schema `required` array and from the runtime
   no-defaults check). It is provider-dependent: most TTS models still have no
   default voice and fail upstream without one; only voice-cloning models (e.g.
-  fish-audio, driven by `voice_reference_*`) take none. The description and
+  fish-audio, driven by `voice_reference`) take none. The description and
   field doc keep the warning.
 - CLI `audio`: `--voice` is now optional (was a required flag); a run without
   it and without `--voice-reference` is accepted locally and rejected by the
@@ -454,7 +454,7 @@ matters):
   Workspaces/Guardrails/BYOK/Analytics management APIs, the Responses and
   Anthropic Messages endpoints.
 - Speech: a CLI `--voice-reference-format` override (the CLI infers the format
-  from the file extension; the MCP tool has `voice_reference_format`); a
+  from the file extension; the MCP tool takes `voice_reference.format`); a
   `voice_reference` flag in the tool result JSON (the manifest records it;
   `audio.voice` in the result is `null` when no voice was sent).
 - `list_models` CLI: flags for `model_authors`, `arch`, the price bounds,

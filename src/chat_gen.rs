@@ -86,7 +86,6 @@ fn reasoning(inputs: &ChatInputs<'_>) -> Option<Reasoning> {
         effort: non_blank(inputs.reasoning_effort),
         max_tokens: inputs.reasoning_max_tokens,
         exclude: inputs.reasoning_exclude,
-        enabled: None,
     };
     (block.effort.is_some() || block.max_tokens.is_some() || block.exclude.is_some())
         .then_some(block)
