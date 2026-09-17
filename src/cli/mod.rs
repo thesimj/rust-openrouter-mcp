@@ -185,12 +185,12 @@ pub(crate) struct VideoArgs {
     #[arg(long = "reference-image")]
     reference_images: Vec<String>,
     /// Reference audio clip (repeatable): an https URL or a local file
-    /// (mp3/wav/flac/m4a/ogg/aac/weba, inlined as a data URL, 20 MiB each).
+    /// (mp3/wav/flac/m4a/ogg/aac/webm, inlined as a data URL, 20 MiB each).
     /// Ignored, with a warning, when a frame is given.
     #[arg(long = "reference-audio")]
     reference_audio: Vec<String>,
     /// Reference video clip (repeatable): an https URL or a local file
-    /// (mp4/webm/mov, inlined as a data URL, 20 MiB each). Ignored, with a
+    /// (mp4/webm/mov/mkv, inlined as a data URL, 20 MiB each). Ignored, with a
     /// warning, when a frame is given.
     #[arg(long = "reference-video")]
     reference_videos: Vec<String>,

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail};
 
 use crate::openrouter::ProviderOptions;
 
@@ -20,57 +20,6 @@ pub(crate) use job::run_job;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 /// Default ceiling on the background poll loop (env `OPENROUTER_VIDEO_POLL_TIMEOUT`).
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 600;
-/// Local byte cap for one audio/video reference read from disk (same cap as an
-/// input image). URLs are not fetched, so they are not measured.
-const MAX_MEDIA_REFERENCE_BYTES: usize = 20 * 1024 * 1024;
-
-/// MIME type for a local audio/video reference, from its file extension. Only
-/// containers the video providers document are mapped; anything else must be
-/// passed as a URL.
-fn media_mime_for_extension(ext: &str) -> Option<&'static str> {
-    Some(match ext.to_ascii_lowercase().as_str() {
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "flac" => "audio/flac",
-        "m4a" => "audio/mp4",
-        "ogg" => "audio/ogg",
-        "aac" => "audio/aac",
-        "weba" => "audio/webm",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        _ => return None,
-    })
-}
-
-/// Resolve one audio/video reference for `input_references`: an `http(s)://`
-/// or `data:` URL passes through untouched (providers fetch it), a local path
-/// is read (capped at [`MAX_MEDIA_REFERENCE_BYTES`]) and inlined as a data URL
-/// whose MIME comes from the extension. Shared by the CLI and the MCP tool.
-pub(crate) async fn resolve_media_reference(source: &str) -> Result<String> {
-    let source = source.trim();
-    ensure!(!source.is_empty(), "a media reference is blank");
-    let lower = source.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:") {
-        return Ok(source.to_string());
-    }
-    let path = PathBuf::from(source);
-    let ext = path.extension().unwrap_or_default().to_string_lossy();
-    let mime = media_mime_for_extension(&ext).with_context(|| {
-        format!(
-            "cannot tell the media type of {} from its extension; use mp3/wav/flac/m4a/ogg/\
-             aac/weba for audio or mp4/webm/mov for video, or pass a URL",
-            path.display()
-        )
-    })?;
-    crate::resources::run_blocking(move || {
-        let bytes = crate::resources::read_file_limited(&path, MAX_MEDIA_REFERENCE_BYTES)?;
-        ensure!(!bytes.is_empty(), "{} is empty", path.display());
-        Ok(crate::image_io::data_url(&bytes, mime))
-    })
-    .await
-}
-
 /// A local image used as a video frame (first/last). `frame_type` is
 /// `first_frame` or `last_frame`.
 #[derive(Debug, Clone)]
@@ -98,9 +47,10 @@ pub struct VideoGenRequest {
     pub frames: Vec<VideoInput>,
     /// Reference images for reference-to-video.
     pub references: Vec<PathBuf>,
-    /// Reference audio clips: URLs or local paths (see [`resolve_media_reference`]).
+    /// Reference audio clips: URLs or local paths, resolved at submit time by
+    /// [`crate::server::media::resolve_media_reference`].
     pub reference_audio: Vec<String>,
-    /// Reference video clips: URLs or local paths (see [`resolve_media_reference`]).
+    /// Reference video clips: URLs or local paths, resolved like `reference_audio`.
     pub reference_videos: Vec<String>,
     /// Upscaling models only.
     pub creativity: Option<u32>,
@@ -230,59 +180,6 @@ mod tests {
         assert_eq!(parse_secs(Some("9"), 5), 9);
         assert_eq!(parse_secs(Some("0"), 5), 1, "floors at 1, never busy-loops");
         assert_eq!(parse_secs(Some("nope"), 5), 5, "garbage -> default");
-    }
-
-    /// URLs pass through untouched; local files become data URLs typed by
-    /// extension; an unknown extension is refused rather than guessed.
-    #[tokio::test]
-    async fn media_reference_passes_urls_through_and_inlines_local_files() {
-        for url in [
-            "https://cdn/beat.mp3",
-            "http://cdn/clip.mp4",
-            "data:audio/wav;base64,AAAA",
-        ] {
-            assert_eq!(resolve_media_reference(url).await.unwrap(), url);
-        }
-        // Surrounding whitespace is trimmed, not sent.
-        assert_eq!(
-            resolve_media_reference("  https://cdn/x.mp3 ")
-                .await
-                .unwrap(),
-            "https://cdn/x.mp3"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let mp3 = dir.path().join("beat.MP3");
-        std::fs::write(&mp3, b"ABC").unwrap();
-        assert_eq!(
-            resolve_media_reference(&mp3.to_string_lossy())
-                .await
-                .unwrap(),
-            "data:audio/mpeg;base64,QUJD"
-        );
-        let mov = dir.path().join("ref.mov");
-        std::fs::write(&mov, b"ABC").unwrap();
-        assert_eq!(
-            resolve_media_reference(&mov.to_string_lossy())
-                .await
-                .unwrap(),
-            "data:video/quicktime;base64,QUJD"
-        );
-
-        let txt = dir.path().join("notes.txt");
-        std::fs::write(&txt, b"ABC").unwrap();
-        let err = resolve_media_reference(&txt.to_string_lossy())
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("media type"), "got: {err}");
-        assert!(resolve_media_reference("   ").await.is_err());
-        let missing = dir.path().join("missing.mp4");
-        assert!(
-            resolve_media_reference(&missing.to_string_lossy())
-                .await
-                .is_err()
-        );
     }
 
     fn request() -> VideoGenRequest {

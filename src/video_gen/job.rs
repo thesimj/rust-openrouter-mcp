@@ -8,8 +8,17 @@ use anyhow::{Context, Result};
 use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
 use crate::openrouter::{FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoSubmitBody};
+use crate::server::media::InputKind;
 
 use super::{VideoGenRequest, VideoJobSummary, VideoSummary};
+
+/// One audio/video reference as a URL or data URL, through the shared media
+/// resolver (the same caps and MIME tables as the chat inputs).
+async fn resolve_media_reference(kind: InputKind, source: &str) -> Result<String> {
+    crate::server::media::resolve_media_reference(kind, source)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
 
 /// File extension for a video/audio MIME type. Falls back to `mp4`.
 fn extension_for(mime: &str) -> &'static str {
@@ -146,7 +155,7 @@ pub async fn run_job(
         }
         for source in &req.reference_audio {
             input_references.push(InputReference::audio(
-                super::resolve_media_reference(source)
+                resolve_media_reference(InputKind::Audio, source)
                     .await
                     .with_context(|| format!("reference_audio {source}"))?,
             ));
@@ -154,7 +163,7 @@ pub async fn run_job(
         }
         for source in &req.reference_videos {
             input_references.push(InputReference::video(
-                super::resolve_media_reference(source)
+                resolve_media_reference(InputKind::Video, source)
                     .await
                     .with_context(|| format!("reference_videos {source}"))?,
             ));

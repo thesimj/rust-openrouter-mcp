@@ -572,6 +572,93 @@ fn video_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
     .to_string()
 }
 
+/// The MIME type for an inline audio reference: sniffed (RIFF/WAVE, ID3 or an
+/// MPEG frame sync, fLaC, OggS, an `ftyp` box, EBML) first, then a declared
+/// data-URL type, then the extension, else `audio/mpeg`.
+fn audio_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return "audio/wav".to_string();
+    }
+    let mpeg_sync = bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0;
+    if bytes.starts_with(b"ID3") || mpeg_sync {
+        return "audio/mpeg".to_string();
+    }
+    if bytes.starts_with(b"fLaC") {
+        return "audio/flac".to_string();
+    }
+    if bytes.starts_with(b"OggS") {
+        return "audio/ogg".to_string();
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return "audio/mp4".to_string();
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return "audio/webm".to_string();
+    }
+    if let Some(d) = present(declared) {
+        return d.to_ascii_lowercase();
+    }
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "aac" => "audio/aac",
+        "webm" | "weba" => "audio/webm",
+        _ => "audio/mpeg",
+    }
+    .to_string()
+}
+
+/// Resolve one audio/video reference for a video job's `input_references`
+/// (`kind` is [`InputKind::Audio`] or [`InputKind::Video`]): an `http(s)://`
+/// URL passes through untouched (the provider fetches it), a `data:` URL is
+/// decoded, capped at [`MAX_MEDIA_BYTES`] and re-issued, and a local path is
+/// read (same cap) and inlined as a data URL typed from its bytes, declared
+/// type, or extension. Shared by the CLI and the MCP tool through
+/// `video_gen`, and with the chat inputs above through [`resolve_source`].
+pub(crate) async fn resolve_media_reference(
+    kind: InputKind,
+    source: &str,
+) -> Result<String, ErrorData> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(ErrorData::invalid_params(
+            format!("a {} reference is blank", kind.noun()),
+            None,
+        ));
+    }
+    let lower = source.to_ascii_lowercase();
+    let (path, url, base64) = if lower.starts_with("http://") || lower.starts_with("https://") {
+        (None, Some(source.to_string()), None)
+    } else if lower.starts_with("data:") {
+        (None, None, Some(source.to_string()))
+    } else {
+        (Some(source.to_string()), None, None)
+    };
+    let resolved = resolve_source(kind, path, url, base64, MAX_MEDIA_BYTES, false).await?;
+    let media = match resolved {
+        Resolved::Url(url) => return Ok(url),
+        other => into_bytes(kind, other, MAX_MEDIA_BYTES).await?,
+    };
+    if media.bytes.is_empty() {
+        return Err(ErrorData::invalid_params(
+            format!("{} reference {} is empty", kind.noun(), media.name),
+            None,
+        ));
+    }
+    let declared = media.declared_mime.as_deref();
+    let mime = match kind {
+        InputKind::Audio => audio_mime(&media.bytes, &media.name, declared),
+        _ => video_mime(&media.bytes, &media.name, declared),
+    };
+    Ok(crate::image_io::data_url(&media.bytes, &mime))
+}
+
 /// The file name a URL or path implies: its last segment without a query.
 fn implied_filename(name: &str) -> Option<String> {
     let trimmed = name.split(['?', '#']).next().unwrap_or(name);
@@ -1039,6 +1126,104 @@ mod tests {
             .collect();
         let err = resolve_video_inputs(many).await.unwrap_err();
         assert!(err.message.contains("at most"), "{}", err.message);
+    }
+
+    /// Video-job references (`reference_audio`/`reference_videos`) go through
+    /// the same resolver, caps and MIME tables as the chat inputs: URLs pass
+    /// through untouched, `data:` URLs are decoded, capped and re-issued, local
+    /// files are read and typed from their bytes, then their extension.
+    #[tokio::test]
+    async fn media_references_pass_urls_through_and_inline_local_and_data_sources() {
+        for url in ["https://cdn/beat.mp3", "http://cdn/clip.mp4"] {
+            assert_eq!(
+                resolve_media_reference(InputKind::Audio, url)
+                    .await
+                    .unwrap(),
+                url
+            );
+        }
+        assert_eq!(
+            resolve_media_reference(InputKind::Audio, "  https://cdn/x.mp3 ")
+                .await
+                .unwrap(),
+            "https://cdn/x.mp3"
+        );
+        // A data URL keeps its declared type once decoded and re-encoded.
+        assert_eq!(
+            resolve_media_reference(InputKind::Audio, "data:audio/wav;base64,AAAA")
+                .await
+                .unwrap(),
+            "data:audio/wav;base64,AAAA"
+        );
+
+        let dir = std::env::temp_dir().join("openrouter-mcp-media-reference");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        // Extension-typed audio and video, including containers the old
+        // video-only table lacked (mkv, webm audio).
+        for (kind, name, expected) in [
+            (InputKind::Audio, "beat.MP3", "data:audio/mpeg;base64,QUJD"),
+            (
+                InputKind::Audio,
+                "voice.webm",
+                "data:audio/webm;base64,QUJD",
+            ),
+            (
+                InputKind::Video,
+                "ref.mov",
+                "data:video/quicktime;base64,QUJD",
+            ),
+            (
+                InputKind::Video,
+                "ref.mkv",
+                "data:video/x-matroska;base64,QUJD",
+            ),
+        ] {
+            let path = write(name, b"ABC");
+            assert_eq!(
+                resolve_media_reference(kind, &path).await.unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        // Sniffed bytes beat a misleading extension.
+        let wav = write("sample.bin", b"RIFF   WAVEfmt ");
+        assert!(
+            resolve_media_reference(InputKind::Audio, &wav)
+                .await
+                .unwrap()
+                .starts_with("data:audio/wav;base64,"),
+        );
+
+        // Blank, missing, empty, and oversized inline sources are refused.
+        assert!(
+            resolve_media_reference(InputKind::Audio, "   ")
+                .await
+                .is_err()
+        );
+        let missing = dir.join("missing.mp4");
+        assert!(
+            resolve_media_reference(InputKind::Video, &missing.to_string_lossy())
+                .await
+                .is_err()
+        );
+        let empty = write("empty.mp3", b"");
+        let err = resolve_media_reference(InputKind::Audio, &empty)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("empty"), "{}", err.message);
+        let huge = format!(
+            "data:video/mp4;base64,{}",
+            "A".repeat(MAX_MEDIA_BYTES.div_ceil(3) * 4 + 4)
+        );
+        let err = resolve_media_reference(InputKind::Video, &huge)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exceeds"), "{}", err.message);
     }
 
     /// Each nested input advertises its own "at least one source" branches

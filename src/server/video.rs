@@ -85,14 +85,15 @@ pub(crate) struct GenerateVideoArgs {
     #[serde(default)]
     pub reference_images: Vec<String>,
     /// Reference audio clips (models that honor them, e.g. Seedance gen 2+): each
-    /// an https URL (fetched by the provider) or a local path (mp3/wav/flac/m4a/
-    /// ogg/aac/weba, inlined as a data URL, 20 MiB each). Ignored, with a
-    /// warning, when a frame is given.
+    /// an https URL (fetched by the provider), a data: URL, or a local path
+    /// (mp3/wav/flac/m4a/ogg/aac/webm, inlined as a data URL typed from its
+    /// bytes or extension, 20 MiB each). Ignored, with a warning, when a frame
+    /// is given.
     #[serde(default)]
     pub reference_audio: Vec<String>,
-    /// Reference video clips: each an https URL or a local path (mp4/webm/mov,
-    /// inlined as a data URL, 20 MiB each). Ignored, with a warning, when a
-    /// frame is given.
+    /// Reference video clips: each an https URL, a data: URL, or a local path
+    /// (mp4/webm/mov/mkv, inlined as a data URL typed from its bytes or
+    /// extension, 20 MiB each). Ignored, with a warning, when a frame is given.
     #[serde(default)]
     pub reference_videos: Vec<String>,
     /// Upscaling models only: creativity level (integer; range is model-specific,
