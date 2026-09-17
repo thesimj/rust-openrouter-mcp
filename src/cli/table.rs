@@ -214,8 +214,7 @@ mod tests {
                 tokenizer: None,
             }),
             pricing: None,
-            reasoning: None,
-            supported_voices: None,
+            ..Default::default()
         }
     }
 
@@ -314,8 +313,7 @@ mod tests {
             context_length: None,
             architecture: None,
             pricing: None,
-            reasoning: None,
-            supported_voices: None,
+            ..Default::default()
         };
         assert_eq!(primary_modality(&no_arch), "text");
     }
