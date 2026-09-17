@@ -37,14 +37,21 @@ impl OpenRouterClient {
     ///
     /// `query` carries OpenRouter's server-side filters (modalities, sort,
     /// free-text, price/context bounds, ...) so the API does the filtering.
+    /// Returns the models only; use [`list_models_page`](Self::list_models_page)
+    /// when the pagination envelope (`total_count`, `links.next`) matters.
     pub async fn list_models(&self, query: &ModelsQuery) -> Result<Vec<Model>> {
+        Ok(self.list_models_page(query).await?.data)
+    }
+
+    /// `GET /api/v1/models` keeping the whole response: the page of models plus
+    /// `total_count` (matches before `limit`/`offset`) and `links.next`.
+    pub async fn list_models_page(&self, query: &ModelsQuery) -> Result<ModelsResponse> {
         let rb = self
             .http
             .get(format!("{}/models", self.base_url))
             .bearer_auth(&self.api_key)
             .query(query);
-        let parsed: ModelsResponse = self.send_json(rb, "/models").await?;
-        Ok(parsed.data)
+        self.send_json(rb, "/models").await
     }
 
     /// `GET /api/v1/models/{model_id}/endpoints` - the full record for one model:
@@ -147,12 +154,146 @@ mod tests {
             output_modalities: Some("image,text".to_string()),
             supported_parameters: Some("tools".to_string()),
             context: Some(128_000),
-            input_modalities: None,
+            ..Default::default()
         };
         let models = client.list_models(&query).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "openai/gpt");
         assert_eq!(models[0].context_length, Some(128_000));
+    }
+
+    /// The documented `GET /models` filters, each with the exact query name
+    /// OpenRouter expects and a wire rendering of a representative value.
+    /// Shared by the "sent" and "omitted when None" tests below.
+    const DOCUMENTED_FILTERS: &[(&str, &str)] = &[
+        ("category", "programming"),
+        ("providers", "OpenAI,Anthropic"),
+        ("model_authors", "openai,anthropic"),
+        ("arch", "Claude"),
+        ("min_price", "0.5"),
+        ("max_price", "2.5"),
+        ("min_output_price", "1.5"),
+        ("max_output_price", "10.5"),
+        ("zdr", "true"),
+        ("region", "eu"),
+        ("distillable", "false"),
+        ("min_age_days", "7"),
+        ("max_age_days", "365"),
+        ("limit", "50"),
+        ("offset", "100"),
+        ("min_intelligence_index", "40.5"),
+        ("max_intelligence_index", "70.5"),
+        ("min_coding_index", "30.5"),
+        ("max_coding_index", "60.5"),
+        ("min_agentic_index", "20.5"),
+        ("max_agentic_index", "50.5"),
+        ("min_tool_success_rate", "0.9"),
+        ("max_tool_success_rate", "0.99"),
+    ];
+
+    /// A query with every documented filter set, matching DOCUMENTED_FILTERS.
+    fn fully_filtered_query() -> ModelsQuery {
+        ModelsQuery {
+            category: Some("programming".to_string()),
+            providers: Some("OpenAI,Anthropic".to_string()),
+            model_authors: Some("openai,anthropic".to_string()),
+            arch: Some("Claude".to_string()),
+            min_price: Some(0.5),
+            max_price: Some(2.5),
+            min_output_price: Some(1.5),
+            max_output_price: Some(10.5),
+            zdr: Some(true),
+            region: Some("eu".to_string()),
+            distillable: Some(false),
+            min_age_days: Some(7),
+            max_age_days: Some(365),
+            limit: Some(50),
+            offset: Some(100),
+            min_intelligence_index: Some(40.5),
+            max_intelligence_index: Some(70.5),
+            min_coding_index: Some(30.5),
+            max_coding_index: Some(60.5),
+            min_agentic_index: Some(20.5),
+            max_agentic_index: Some(50.5),
+            min_tool_success_rate: Some(0.9),
+            max_tool_success_rate: Some(0.99),
+            ..Default::default()
+        }
+    }
+
+    /// Every documented filter reaches the wire under exactly its API name.
+    /// `zdr`/`distillable` render as the strings "true"/"false" the docs list.
+    /// The mock only matches when *all* params are present, so a renamed or
+    /// dropped field surfaces as a 404 from wiremock.
+    #[tokio::test]
+    async fn list_models_sends_every_documented_filter_under_its_query_name() {
+        let server = MockServer::start().await;
+        let mut mock = Mock::given(method("GET")).and(path("/models"));
+        for (name, value) in DOCUMENTED_FILTERS {
+            mock = mock.and(query_param(*name, *value));
+        }
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        client.list_models(&fully_filtered_query()).await.unwrap();
+    }
+
+    /// Unset filters are omitted, not sent empty; and `zdr: Some(false)` is
+    /// omitted too, because the API only accepts `zdr=true` (a `false` would
+    /// be rejected, and "no ZDR filter" is what the caller meant).
+    #[tokio::test]
+    async fn list_models_omits_unset_filters_and_a_false_zdr() {
+        let server = MockServer::start().await;
+        let mut mock = Mock::given(method("GET")).and(path("/models"));
+        for (name, _) in DOCUMENTED_FILTERS {
+            mock = mock.and(query_param_is_missing(*name));
+        }
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let query = ModelsQuery {
+            zdr: Some(false),
+            ..Default::default()
+        };
+        client.list_models(&query).await.unwrap();
+    }
+
+    /// `list_models_page` keeps the pagination envelope (`total_count`,
+    /// `links.next`) that `list_models` strips.
+    #[tokio::test]
+    async fn list_models_page_keeps_total_count_and_next_link() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "openai/gpt"}],
+                "total_count": 546,
+                "links": {"next": "/api/v1/models?offset=1&limit=1"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let page = client
+            .list_models_page(&ModelsQuery {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.total_count, Some(546));
+        assert_eq!(
+            page.links.and_then(|l| l.next).as_deref(),
+            Some("/api/v1/models?offset=1&limit=1")
+        );
     }
 
     /// Pins that we ask for compression. OpenRouter serves gzip and the payloads

@@ -373,12 +373,35 @@ pub(crate) struct ModelsArgs {
     /// Required supported parameters (comma-separated), e.g. "tools".
     #[arg(long)]
     supported_parameters: Option<String>,
-    /// Sort order (default: top-weekly). See --help for all values.
+    /// Sort order (default: top-weekly): most-popular, newest, top-weekly,
+    /// pricing-low-to-high, pricing-high-to-low, context-high-to-low,
+    /// throughput-high-to-low, latency-low-to-high, intelligence-high-to-low,
+    /// coding-high-to-low, agentic-high-to-low, design-arena-elo-high-to-low.
     #[arg(long)]
     sort: Option<String>,
     /// Minimum context length in tokens.
     #[arg(long)]
     min_context: Option<u64>,
+    /// Use-case category: programming, roleplay, marketing, marketing/seo,
+    /// technology, science, translation, legal, finance, health, trivia, academia.
+    #[arg(long)]
+    category: Option<String>,
+    /// Hosting providers (comma-separated), e.g. "OpenAI,Anthropic".
+    #[arg(long)]
+    providers: Option<String>,
+    /// Server-side page size (1..=1000). The local 20-row cap still applies
+    /// unless --all is given.
+    #[arg(long)]
+    limit: Option<u64>,
+    /// Server-side records to skip (pair with --limit to page).
+    #[arg(long)]
+    offset: Option<u64>,
+    /// Only models with zero-data-retention endpoints.
+    #[arg(long)]
+    zdr: bool,
+    /// Data region of the model's endpoints: eu or us.
+    #[arg(long)]
+    region: Option<String>,
     /// Return all matching models instead of just the first 20.
     #[arg(long)]
     all: bool,

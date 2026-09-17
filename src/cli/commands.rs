@@ -366,10 +366,21 @@ pub(crate) async fn run_models(args: ModelsArgs) -> anyhow::Result<()> {
         supported_parameters: args.supported_parameters,
         sort: Some(args.sort.unwrap_or_else(|| "top-weekly".to_string())),
         context: args.min_context,
+        category: args.category,
+        providers: args.providers,
+        limit: args.limit,
+        offset: args.offset,
+        // The flag is presence-only; the DTO omits a `false` zdr from the wire.
+        zdr: Some(args.zdr),
+        region: args.region,
+        ..Default::default()
     };
 
-    let raw = client.list_models(&query).await?;
-    let filtered = openrouter::apply_filters(raw, args.search.as_deref(), args.all);
+    let page = client.list_models_page(&query).await?;
+    if let Some(note) = page.pagination_note() {
+        eprintln!("{note}");
+    }
+    let filtered = openrouter::apply_filters(page.data, args.search.as_deref(), args.all);
     let (models, total) = (filtered.models, filtered.total);
 
     if !args.table {
