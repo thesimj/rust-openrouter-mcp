@@ -141,7 +141,8 @@ pub(crate) struct VideoArgs {
     /// Model id, e.g. google/veo-3.1.
     #[arg(short, long)]
     model: String,
-    /// Prompt text. Use --prompt-file to read from a file/stdin instead.
+    /// Prompt text. Use --prompt-file to read from a file/stdin instead. Optional
+    /// when a frame or a reference is given (image-only models take no text).
     #[arg(short, long)]
     prompt: Option<String>,
     /// Read the prompt from a file (use '-' for stdin).
@@ -150,7 +151,7 @@ pub(crate) struct VideoArgs {
     /// Clip duration in seconds.
     #[arg(long)]
     duration: Option<u32>,
-    /// Resolution, e.g. 480p, 720p, 1080p, 1K, 2K, 4K.
+    /// Resolution, e.g. 480p, 720p, 768p, 1080p, 1K, 2K, 4K.
     #[arg(long)]
     resolution: Option<String>,
     /// Aspect ratio, e.g. 16:9, 9:16, 1:1.
@@ -175,6 +176,24 @@ pub(crate) struct VideoArgs {
     /// warning, when a first/last frame is given (frames win).
     #[arg(long = "reference-image")]
     reference_images: Vec<String>,
+    /// Reference audio clip (repeatable): an https URL or a local file
+    /// (mp3/wav/flac/m4a/ogg/aac/weba, inlined as a data URL, 20 MiB each).
+    /// Ignored, with a warning, when a frame is given.
+    #[arg(long = "reference-audio")]
+    reference_audio: Vec<String>,
+    /// Reference video clip (repeatable): an https URL or a local file
+    /// (mp4/webm/mov, inlined as a data URL, 20 MiB each). Ignored, with a
+    /// warning, when a frame is given.
+    #[arg(long = "reference-video")]
+    reference_videos: Vec<String>,
+    /// Upscaling models only: creativity level (model-specific integer range).
+    #[arg(long)]
+    creativity: Option<u32>,
+    /// Upscaling models only: output scale factor, > 0 (e.g. 2 for 2x).
+    #[arg(long)]
+    upscale_factor: Option<f64>,
+    #[command(flatten)]
+    provider: ProviderFlags,
     /// Longest-side cap (px) for input frame/reference images (default 1536, max 4096).
     #[arg(long)]
     max_image_dimension: Option<u32>,
@@ -666,6 +685,54 @@ mod tests {
                 .into_image_provider()
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// `video` takes the new reference kinds, the upscaling knobs and
+    /// `--provider`, and no longer demands `--prompt` (image-only models).
+    #[test]
+    fn video_flags_parse_references_upscaling_knobs_and_provider() {
+        use crate::server::provider::ProviderOptionsArgs;
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "video",
+            "-m",
+            "bytedance/seedance-2.0",
+            "--reference-audio",
+            "beat.mp3",
+            "--reference-audio",
+            "https://cdn/song.mp3",
+            "--reference-video",
+            "ref.mp4",
+            "--creativity",
+            "3",
+            "--upscale-factor",
+            "2",
+            "--provider",
+            "{\"options\":{\"google-vertex\":{\"negativePrompt\":\"blurry\"}}}",
+        ])
+        .unwrap();
+        let Some(Command::Video(args)) = cli.command else {
+            panic!("expected video")
+        };
+        assert_eq!(args.prompt, None);
+        assert_eq!(
+            args.reference_audio,
+            vec!["beat.mp3".to_string(), "https://cdn/song.mp3".to_string()]
+        );
+        assert_eq!(args.reference_videos, vec!["ref.mp4".to_string()]);
+        assert_eq!(args.creativity, Some(3));
+        assert_eq!(args.upscale_factor, Some(2.0));
+        let block = args
+            .provider
+            .parse::<ProviderOptionsArgs>()
+            .unwrap()
+            .into_options()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block.options["google-vertex"],
+            serde_json::json!({"negativePrompt": "blurry"})
         );
     }
 

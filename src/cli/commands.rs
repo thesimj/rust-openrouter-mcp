@@ -177,7 +177,19 @@ pub(crate) async fn run_image(args: ImageArgs) -> anyhow::Result<()> {
 /// synchronously through the submit + poll loop (unlike the async MCP tool).
 pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
-    let (prompt, prompt_source) = resolve_prompt(args.prompt, args.prompt_file)?;
+    // The prompt is optional for image-only models; run_job enforces "prompt
+    // or a frame/reference" so the rule is not repeated here.
+    let (prompt, prompt_source) = if args.prompt.is_none() && args.prompt_file.is_none() {
+        (None, "none".to_string())
+    } else {
+        let (text, source) = resolve_prompt(args.prompt, args.prompt_file)?;
+        (Some(text), source)
+    };
+    let provider = args
+        .provider
+        .parse::<crate::server::provider::ProviderOptionsArgs>()?
+        .into_options()
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let base = resolve_base_output(args.output, args.output_dir, args.output_name)?;
 
     let mut frames = Vec::new();
@@ -209,6 +221,11 @@ pub(crate) async fn run_video(args: VideoArgs) -> anyhow::Result<()> {
             .iter()
             .map(std::path::PathBuf::from)
             .collect(),
+        reference_audio: args.reference_audio,
+        reference_videos: args.reference_videos,
+        creativity: args.creativity,
+        upscale_factor: args.upscale_factor,
+        provider,
         max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
         poll_interval_secs: video_gen::resolve_poll_interval(),
         poll_timeout_secs: video_gen::resolve_poll_timeout(),
