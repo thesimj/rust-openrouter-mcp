@@ -86,9 +86,14 @@ pub(crate) struct ImageArgs {
     /// Aspect ratio, e.g. 1:1, 16:9 (Images API `aspect_ratio`).
     #[arg(long)]
     aspect_ratio: Option<String>,
-    /// Resolution tier, e.g. 1K, 2K, 4K (Images API `resolution`).
+    /// Resolution tier, e.g. 512, 1K, 2K, 4K (Images API `resolution`).
     #[arg(long)]
     image_size: Option<String>,
+    /// Output size: WIDTHxHEIGHT pixels (e.g. 2048x2048) or a tier. Alternative
+    /// to --aspect-ratio + --image-size; a pixel size combined with either is
+    /// rejected (OpenRouter returns 400 for it).
+    #[arg(long)]
+    size: Option<String>,
     /// Base seed; variant N uses seed+N (provider support varies).
     #[arg(long)]
     seed: Option<u64>,
@@ -113,7 +118,8 @@ pub(crate) struct ImageArgs {
     /// Output base name (used with --output-dir).
     #[arg(long)]
     output_name: Option<String>,
-    /// Output quality: auto, low, medium, or high. Provider support varies.
+    /// Output quality: auto, low, medium, high, xhigh, or max. Provider support
+    /// varies.
     #[arg(long)]
     quality: Option<String>,
     /// Output file format: png, jpeg, webp, or svg. Provider support varies.
@@ -125,6 +131,8 @@ pub(crate) struct ImageArgs {
     /// Output compression 0-100 (webp/jpeg only). Provider support varies.
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
     output_compression: Option<u32>,
+    #[command(flatten)]
+    provider: ProviderFlags,
 }
 
 /// CLI flags for `video`, mirroring the `generate_video` MCP tool.
@@ -607,6 +615,57 @@ mod tests {
                 .unwrap()
                 .into_options()
                 .is_err()
+        );
+    }
+
+    /// `image --provider` takes the `/images` block (routing subset + options)
+    /// and `--size` the pixel/tier string, parsed like the MCP tool.
+    #[test]
+    fn image_provider_and_size_flags_parse_like_the_tool() {
+        use crate::server::provider::ImageProviderArgs;
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "image",
+            "-m",
+            "black-forest-labs/flux.2-pro",
+            "-p",
+            "an owl",
+            "--size",
+            "2048x2048",
+            "--provider",
+            "{\"order\":[\"black-forest-labs\"],\"options\":{\"black-forest-labs\":{\"steps\":28}}}",
+        ])
+        .unwrap();
+        let Some(Command::Image(args)) = cli.command else {
+            panic!("expected image")
+        };
+        assert_eq!(args.size.as_deref(), Some("2048x2048"));
+        let block = args
+            .provider
+            .parse::<ImageProviderArgs>()
+            .unwrap()
+            .into_image_provider()
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.order, vec!["black-forest-labs".to_string()]);
+        assert_eq!(
+            block.options["black-forest-labs"],
+            serde_json::json!({"steps": 28})
+        );
+
+        // Absent flags -> nothing sent.
+        let cli = Cli::try_parse_from(["openrouter-mcp", "image", "-m", "m", "-p", "p"]).unwrap();
+        let Some(Command::Image(args)) = cli.command else {
+            panic!("expected image")
+        };
+        assert!(args.size.is_none());
+        assert!(
+            args.provider
+                .parse::<ImageProviderArgs>()
+                .unwrap()
+                .into_image_provider()
+                .unwrap()
+                .is_none()
         );
     }
 

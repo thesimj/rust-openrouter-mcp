@@ -17,11 +17,12 @@ use serde_json::json;
 
 use crate::image_gen::{self, GenerateRequest};
 use crate::server::naming;
+use crate::server::provider::ImageProviderArgs;
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
 };
 use crate::server::schema::{
-    AtLeastOneOf, RequireFields, de_opt_uint, require_all, scalarize_nullable,
+    AtLeastOneOf, de_lenient, de_opt_uint, require_all, scalarize_nullable,
 };
 use crate::tasks::TaskKind;
 
@@ -299,22 +300,36 @@ pub(crate) async fn resolve_image_inputs(
 }
 
 /// Arguments for the `generate_image` tool.
+///
+/// `aspect_ratio` and `image_size` are required unless `size` is given, so
+/// they are conditional like `generate_video.aspect_ratio` and stay out of the
+/// schema's unconditional `required` list; `run_generate` enforces the rule.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-#[schemars(transform = RequireFields(&["aspect_ratio", "image_size"]))]
 pub(crate) struct GenerateImageArgs {
     /// Image model id, e.g. "google/gemini-3.1-flash-image-preview".
     pub model: String,
     /// Prompt text describing the image to generate (or the edit to apply).
     pub prompt: String,
-    /// REQUIRED (no default): aspect ratio, e.g. "1:1", "16:9", "9:16"
-    /// (maps to image_config.aspect_ratio).
+    /// REQUIRED unless `size` is given (no default): aspect ratio, e.g. "1:1",
+    /// "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "2.35:1", "5:2",
+    /// "9:19.5", "19.5:9", "9:20", "20:9" (maps to the Images API
+    /// `aspect_ratio`). Provider support varies. Cannot be combined with a
+    /// pixel-form `size`.
     #[serde(default)]
     pub aspect_ratio: Option<String>,
-    /// REQUIRED (no default): resolution TIER (not pixel dimensions), e.g.
-    /// "1K", "2K", "4K" (maps to image_config.image_size).
+    /// REQUIRED unless `size` is given (no default): resolution TIER (not
+    /// pixel dimensions), e.g. "512" (or "0.5K"), "1K", "2K", "4K" (maps to
+    /// the Images API `resolution`). Cannot be combined with a pixel-form
+    /// `size`.
     #[serde(default)]
     pub image_size: Option<String>,
+    /// Output size as "WIDTHxHEIGHT" pixels (e.g. "2048x2048") or a tier
+    /// (e.g. "2K"). Alternative to aspect_ratio + image_size: a pixel-form
+    /// size together with either of them is rejected locally, because
+    /// OpenRouter returns 400 for that combination. Provider support varies.
+    #[serde(default)]
+    pub size: Option<String>,
     /// Seed for reproducible-ish generation (provider support varies).
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub seed: Option<u64>,
@@ -346,7 +361,8 @@ pub(crate) struct GenerateImageArgs {
     /// (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
-    /// Output quality: "auto", "low", "medium", or "high". Provider support varies.
+    /// Output quality: "auto", "low", "medium", "high", "xhigh", or "max".
+    /// Provider support varies.
     #[serde(default)]
     pub quality: Option<String>,
     /// Output file format: "png", "jpeg", "webp", or "svg". Provider support
@@ -361,6 +377,16 @@ pub(crate) struct GenerateImageArgs {
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(min = 0, max = 100))]
     pub output_compression: Option<u32>,
+    /// Provider routing and per-provider passthrough for the Images API:
+    /// {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks": bool,
+    /// "sort": "price"|"throughput"|"latency"|"exacto", "sort_partition":
+    /// "model"|"none", "options": {"<provider-slug>": {...}}}. `options` is
+    /// keyed by provider slug and holds that provider's own parameters -
+    /// describe_model lists each endpoint's `allowed_passthrough_parameters` -
+    /// e.g. {"options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}}.
+    /// Only the slug that serves the request is forwarded.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub provider: ImageProviderArgs,
 }
 
 /// Arguments for the `describe_image` tool.
@@ -437,19 +463,26 @@ impl OpenRouterServer {
         local path, an http(s) url, or base64/data-URL (order preserved; optional per-image \
         label) - the prompt becomes the edit instruction. \
         Set variants>1 to generate several in parallel (seed-stepped). Optional `quality` \
-        (auto/low/medium/high), `output_format` (png/jpeg/webp/svg), `background` \
+        (auto/low/medium/high/xhigh/max), `output_format` (png/jpeg/webp/svg), `background` \
         (auto/transparent/opaque), and `output_compression` (0-100, webp/jpeg only) are passed \
         straight through to the provider - support for each varies by model, and whatever \
         format actually comes back is what gets saved (the extension always matches the real \
-        result, not the request). Returns a compact \
+        result, not the request). Provider routing and provider-specific parameters go in \
+        `provider`: routing keys order/only/ignore/allow_fallbacks/sort, and `provider.options` \
+        keyed by provider slug with that provider's own parameters - describe_model lists each \
+        endpoint's `allowed_passthrough_parameters` - e.g. \
+        {\"options\": {\"black-forest-labs\": {\"steps\": 28, \"guidance\": 3.5}}}. Returns a compact \
         result: saved image paths, decoded width/height, requested vs actual \
         aspect_ratio/image_size, seeds, a path to the sidecar manifest, and any mismatch \
         warnings. Works with any OpenRouter image model (Nano Banana, Grok, \
         Seedream, FLUX, GPT Image, Recraft, ...) via the dedicated image endpoint. No defaults \
-        for the required fields: model, prompt, aspect_ratio and image_size must all be \
-        specified, or the call fails with an error naming what is missing (every other \
-        param - seed, images, max_image_dimension, variants, wait_seconds, output, quality, \
-        output_format, background, output_compression - is optional). To analyze or caption \
+        for the required fields: model, prompt, and either `size` (\"WIDTHxHEIGHT\" pixels \
+        such as \"2048x2048\", or a tier) or both aspect_ratio and image_size must be \
+        specified, or the call fails with an error naming what is missing; a pixel-form `size` \
+        combined with aspect_ratio or image_size is rejected locally because OpenRouter \
+        returns 400 for it. Every other param - seed, images (max 16), max_image_dimension, \
+        variants, wait_seconds, output, quality, output_format, background, \
+        output_compression, provider - is optional. To analyze or caption \
         an existing image instead of creating one, use describe_image.",
         annotations(
             title = "Generate Image",
@@ -481,26 +514,38 @@ impl OpenRouterServer {
         let args = GenerateImageArgs {
             aspect_ratio: non_blank(args.aspect_ratio),
             image_size: non_blank(args.image_size),
+            size: non_blank(args.size),
             quality: non_blank(args.quality),
             output_format: non_blank(args.output_format),
             background: non_blank(args.background),
             ..args
         };
-        // No defaults: the agent must choose these explicitly.
-        let mut missing: Vec<&str> = Vec::new();
-        if args.aspect_ratio.is_none() {
-            missing.push("aspect_ratio (e.g. \"1:1\", \"16:9\", \"9:16\")");
+        // No defaults: the agent must choose the output geometry explicitly -
+        // either `size` alone, or aspect_ratio + image_size.
+        if args.size.is_none() {
+            let mut missing: Vec<&str> = Vec::new();
+            if args.aspect_ratio.is_none() {
+                missing.push("aspect_ratio (e.g. \"1:1\", \"16:9\", \"9:16\")");
+            }
+            if args.image_size.is_none() {
+                missing.push("image_size (e.g. \"1K\", \"2K\", \"4K\")");
+            }
+            require_all("generate_image", "image", &missing)?;
         }
-        if args.image_size.is_none() {
-            missing.push("image_size (e.g. \"1K\", \"2K\", \"4K\")");
-        }
-        require_all("generate_image", "image", &missing)?;
+        image_gen::check_size_conflict(
+            args.size.as_deref(),
+            args.image_size.as_deref(),
+            args.aspect_ratio.as_deref(),
+        )
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let provider = args.provider.into_image_provider()?;
 
         let Some(reservation) = self.tasks.reserve(TaskKind::Image) else {
             return Ok(Self::admission_error());
         };
         let aspect_ratio = args.aspect_ratio.clone();
         let image_size = args.image_size.clone();
+        let size = args.size.clone();
         let images = resolve_image_inputs(args.images).await?;
         let req = GenerateRequest {
             model: args.model.clone(),
@@ -516,6 +561,8 @@ impl OpenRouterServer {
             // The schema range is advisory only (rmcp does not validate), so
             // clamp here the way variants/wait_seconds already do.
             output_compression: args.output_compression.map(|c| c.min(100)),
+            size: args.size,
+            provider,
         };
 
         let variants = args.variants.unwrap_or(1).clamp(1, 16);
@@ -528,6 +575,9 @@ impl OpenRouterServer {
             config.push(a);
         }
         if let Some(s) = &image_size {
+            config.push(s);
+        }
+        if let Some(s) = &size {
             config.push(s);
         }
         let base = naming::resolve_output_base(
@@ -750,6 +800,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         // Fast mock completes within the wait window -> inline completed result.
         // inline_previews=true mirrors a Claude Desktop client.
@@ -819,6 +871,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"));
@@ -844,6 +898,8 @@ mod tests {
             output_format: None,
             background: None,
             output_compression: None,
+            size: None,
+            provider: Default::default(),
         };
         let err = server.run_generate(args, true).await.unwrap_err();
         assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
@@ -884,6 +940,8 @@ mod tests {
             output_format: Some("webp".to_string()),
             background: Some("opaque".to_string()),
             output_compression: Some(50),
+            size: None,
+            provider: Default::default(),
         };
         let res = server.run_generate(args, false).await.unwrap();
         let v = tool_result_json(&res);
@@ -903,6 +961,134 @@ mod tests {
                     && w.as_str().unwrap().contains("image/png")),
             "got: {warnings:?}"
         );
+    }
+
+    /// The `/images` `provider` block (routing subset + `options` keyed by
+    /// slug) and `size` reach the wire nested exactly as OpenRouter documents
+    /// them, deserialized the way a client sends them (lenient nested object).
+    /// With `size` given, `aspect_ratio` and `image_size` are not required.
+    #[tokio::test]
+    async fn generate_image_forwards_provider_and_size_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "black-forest-labs/flux.2-pro",
+                "size": "2048x2048",
+                "provider": {
+                    "order": ["black-forest-labs"],
+                    "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "b64_json": valid_png_b64() }]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_for(mock.uri());
+        let out = std::env::temp_dir().join("openrouter-mcp-provider-test.png");
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "black-forest-labs/flux.2-pro",
+            "prompt": "p",
+            "size": "2048x2048",
+            "wait_seconds": 30,
+            "output": out.to_string_lossy(),
+            "provider": {
+                "order": ["black-forest-labs"],
+                "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
+            }
+        }))
+        .unwrap();
+        let res = server.run_generate(args, false).await.unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(v["status"], "completed", "got: {v}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(body.get("resolution").is_none(), "got: {body}");
+        assert!(body.get("aspect_ratio").is_none(), "got: {body}");
+        // The manifest records the provider block that was sent.
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(v["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["size"], "2048x2048");
+        assert_eq!(manifest["provider"]["order"], json!(["black-forest-labs"]));
+    }
+
+    /// A pixel-form `size` together with `image_size` or `aspect_ratio` is the
+    /// combination OpenRouter rejects with 400; it is refused locally as
+    /// invalid_params before any HTTP call, naming the conflict.
+    #[tokio::test]
+    async fn generate_image_rejects_pixel_size_combined_with_tier_or_ratio() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args = |size: &str, image_size: Option<&str>, aspect_ratio: Option<&str>| {
+            serde_json::from_value::<GenerateImageArgs>(json!({
+                "model": "m", "prompt": "p", "output": "out.png",
+                "size": size, "image_size": image_size, "aspect_ratio": aspect_ratio,
+            }))
+            .unwrap()
+        };
+        let err = server
+            .run_generate(args("2048x2048", Some("2K"), None), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("size"), "got: {}", err.message);
+        assert!(err.message.contains("image_size"), "got: {}", err.message);
+        assert!(err.message.contains("400"), "got: {}", err.message);
+
+        let err = server
+            .run_generate(args("1024x768", None, Some("4:3")), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
+    }
+
+    /// Without `size`, aspect_ratio and image_size stay required (unchanged
+    /// semantics); a blank `size` counts as absent.
+    #[tokio::test]
+    async fn generate_image_blank_size_keeps_ratio_and_tier_required() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "output": "out.png", "size": "  ",
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert!(err.message.contains("aspect_ratio"), "got: {}", err.message);
+        assert!(err.message.contains("image_size"), "got: {}", err.message);
+    }
+
+    /// More than 16 input images is refused as invalid_params at the tool
+    /// boundary, before any source is decoded or fetched.
+    #[tokio::test]
+    async fn generate_image_rejects_more_than_16_input_images() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let images: Vec<_> = (0..17).map(|_| json!({"base64": "invalid!"})).collect();
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "aspect_ratio": "1:1", "image_size": "1K",
+            "output": "out.png", "images": images,
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("16"), "got: {}", err.message);
+    }
+
+    /// An invalid provider block (a scalar where a per-slug object is due) is
+    /// rejected before any HTTP call.
+    #[tokio::test]
+    async fn generate_image_rejects_bad_provider_options_before_http() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let args: GenerateImageArgs = serde_json::from_value(json!({
+            "model": "m", "prompt": "p", "aspect_ratio": "1:1", "image_size": "1K",
+            "output": "out.png", "provider": {"options": {"acme": true}},
+        }))
+        .unwrap();
+        let err = server.run_generate(args, true).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("acme"), "got: {}", err.message);
     }
 
     /// Defense in depth: even with a scalar schema, clients that stringify all
