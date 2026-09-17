@@ -75,6 +75,8 @@ pub(crate) struct DescribeArgs {
     /// Omit to keep the model's own default.
     #[arg(long)]
     reasoning_effort: Option<String>,
+    #[command(flatten)]
+    provider: ProviderFlags,
 }
 
 /// CLI flags for `image`, mirroring the `generate_image` MCP tool.
@@ -276,6 +278,8 @@ pub(crate) struct MusicArgs {
     /// Output path (extension corrected to the returned container, e.g. .mp3).
     #[arg(short, long)]
     output: PathBuf,
+    #[command(flatten)]
+    provider: ProviderFlags,
 }
 
 /// The `--provider <json>` flag shared by the subcommands whose MCP tool takes
@@ -405,6 +409,60 @@ pub(crate) struct ChatArgs {
     /// Omit to keep the model's own default.
     #[arg(long)]
     reasoning_effort: Option<String>,
+    /// Ask for a JSON object reply (response_format json_object). Not with
+    /// --json-schema.
+    #[arg(long)]
+    json_mode: bool,
+    /// JSON Schema the reply must conform to (strict structured output): inline
+    /// JSON, or the path of a file holding it. Not with --json-mode.
+    #[arg(long, value_name = "FILE-OR-JSON")]
+    json_schema: Option<String>,
+    /// Attach the OpenRouter web-search plugin with its defaults.
+    #[arg(long)]
+    web_search: bool,
+    /// PDF parsing engine for file inputs: mistral-ocr, cloudflare-ai, or native.
+    #[arg(long)]
+    pdf_engine: Option<String>,
+    /// Local document (PDF etc.) to send as a `file` part (repeatable, order
+    /// preserved). Needs a model with file input.
+    #[arg(long = "file")]
+    files: Vec<PathBuf>,
+    /// Local audio clip (wav/mp3/flac/m4a/ogg/webm/aac) to send as an
+    /// `input_audio` part (repeatable). Needs a model with audio input.
+    #[arg(long = "audio")]
+    audio: Vec<PathBuf>,
+    /// Video to send as a `video_url` part (repeatable): an http(s) URL is
+    /// passed through for the provider to fetch, anything else is a local
+    /// file sent as a data URL. Needs a model with video input.
+    #[arg(long = "video")]
+    videos: Vec<String>,
+    #[command(flatten)]
+    provider: ProviderFlags,
+}
+
+/// `--video` value -> a [`crate::server::media::VideoInput`]: URLs pass
+/// through, everything else is a local path.
+pub(crate) fn parse_video_arg(value: &str) -> crate::server::media::VideoInput {
+    let is_url = value.starts_with("http://") || value.starts_with("https://");
+    crate::server::media::VideoInput {
+        url: is_url.then(|| value.to_string()),
+        path: (!is_url).then(|| value.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Read `--json-schema`: the value itself when it parses as a JSON object,
+/// otherwise the contents of the file it names.
+fn read_json_schema(
+    value: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    let text = if value.trim_start().starts_with('{') {
+        value.to_string()
+    } else {
+        std::fs::read_to_string(value)
+            .with_context(|| format!("could not read --json-schema file {value}"))?
+    };
+    serde_json::from_str(&text).context("--json-schema is not a JSON object")
 }
 
 /// CLI flags for `models`, mirroring the `list_models` MCP tool.
@@ -895,6 +953,90 @@ mod tests {
             panic!("expected generation")
         };
         assert_eq!(args.generation_id, "gen-1");
+    }
+
+    /// The chat-family subcommands take `--provider` as the routing block, and
+    /// `chat` parses its structured-output / plugin flags the way the tool does.
+    #[test]
+    fn chat_family_flags_parse_like_the_tools() {
+        use crate::server::provider::ProviderRoutingArgs;
+        let schema_file = std::env::temp_dir().join("openrouter-mcp-cli-schema.json");
+        std::fs::write(&schema_file, r#"{"title":"Answer","type":"object"}"#).unwrap();
+        let cli = Cli::try_parse_from([
+            "openrouter-mcp",
+            "chat",
+            "-m",
+            "openai/gpt-5.4",
+            "-p",
+            "hi",
+            "--json-schema",
+            &schema_file.to_string_lossy(),
+            "--web-search",
+            "--pdf-engine",
+            "native",
+            "--file",
+            "report.pdf",
+            "--audio",
+            "clip.mp3",
+            "--video",
+            "https://example.com/v.mp4",
+            "--video",
+            "local.mp4",
+            "--provider",
+            "{\"order\":[\"openai\"]}",
+        ])
+        .unwrap();
+        let Some(Command::Chat(args)) = cli.command else {
+            panic!("expected chat")
+        };
+        assert!(args.web_search);
+        assert!(!args.json_mode);
+        assert_eq!(args.pdf_engine.as_deref(), Some("native"));
+        assert_eq!(args.files, vec![PathBuf::from("report.pdf")]);
+        assert_eq!(args.audio, vec![PathBuf::from("clip.mp3")]);
+        let videos: Vec<_> = args.videos.iter().map(|v| parse_video_arg(v)).collect();
+        assert_eq!(videos[0].url.as_deref(), Some("https://example.com/v.mp4"));
+        assert_eq!(videos[0].path, None);
+        assert_eq!(videos[1].path.as_deref(), Some("local.mp4"));
+        assert_eq!(videos[1].url, None);
+        let schema = read_json_schema(args.json_schema.as_deref().unwrap()).unwrap();
+        assert_eq!(schema["title"], "Answer");
+        // Inline JSON works too, and garbage is an error.
+        assert_eq!(
+            read_json_schema(r#"{"type":"object"}"#).unwrap()["type"],
+            "object"
+        );
+        assert!(read_json_schema("no-such-file.json").is_err());
+        let routing = args
+            .provider
+            .parse::<ProviderRoutingArgs>()
+            .unwrap()
+            .into_routing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.order, vec!["openai".to_string()]);
+
+        for sub in [
+            vec!["describe", "-m", "m", "--image", "a.png"],
+            vec!["music", "-m", "m", "-p", "x", "-o", "t.mp3"],
+        ] {
+            let mut argv = vec!["openrouter-mcp"];
+            argv.extend(sub);
+            argv.extend(["--provider", "{\"only\":[\"google-vertex\"]}"]);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let flags = match cli.command {
+                Some(Command::Describe(a)) => a.provider,
+                Some(Command::Music(a)) => a.provider,
+                _ => panic!("unexpected subcommand"),
+            };
+            let routing = flags
+                .parse::<ProviderRoutingArgs>()
+                .unwrap()
+                .into_routing()
+                .unwrap()
+                .unwrap();
+            assert_eq!(routing.only, vec!["google-vertex".to_string()]);
+        }
     }
 
     #[test]

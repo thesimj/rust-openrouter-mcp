@@ -472,7 +472,7 @@ fn decode_generated(
 }
 
 /// Inputs for an image-description (vision) request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DescribeRequest {
     pub model: String,
     /// Instruction or question about the image(s).
@@ -481,6 +481,12 @@ pub struct DescribeRequest {
     pub max_image_dimension: u32,
     /// Reasoning effort passed straight through; `None` keeps the model default.
     pub reasoning_effort: Option<String>,
+    /// Optional system instruction (blank counts as none).
+    pub system: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u64>,
+    /// Provider routing, already validated (chat takes routing fields only).
+    pub provider: Option<crate::openrouter::ProviderRouting>,
 }
 
 /// Describe (or answer a question about) one or more images: sends them with an
@@ -499,13 +505,15 @@ pub async fn describe_image(
         client,
         &chat_gen::ChatInputs {
             model: &req.model,
-            system: None,
+            system: req.system.as_deref(),
             prompt: &assemble_prompt(&req.prompt, &req.images),
-            temperature: None,
-            max_tokens: None,
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
             images: &req.images,
             max_image_dimension: req.max_image_dimension,
             reasoning_effort: req.reasoning_effort.as_deref(),
+            provider: req.provider.clone(),
+            ..Default::default()
         },
     )
     .await

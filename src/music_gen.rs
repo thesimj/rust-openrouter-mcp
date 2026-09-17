@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::manifest::{self, AudioOutputMeta, MusicManifest};
-use crate::openrouter::{AudioConfig, ChatRequest, Content, Message, OpenRouterClient};
+use crate::openrouter::{
+    AudioConfig, ChatRequest, Content, Message, OpenRouterClient, ProviderRouting,
+};
 
 /// Inputs for one music generation (domain struct; the wire body is
 /// [`crate::openrouter::ChatRequest`] with `modalities: ["text", "audio"]`).
@@ -30,6 +32,9 @@ pub struct MusicGenRequest {
     /// only when set; whether a model honors it is model-specific.
     pub format: Option<String>,
     pub seed: Option<u64>,
+    /// Provider routing, already validated. Music is a chat call, so it takes
+    /// the routing block and no per-provider `options` passthrough.
+    pub provider: Option<ProviderRouting>,
 }
 
 /// The saved track plus what the model said about it.
@@ -149,13 +154,11 @@ pub async fn run_job(
             content: Content::Text(req.prompt.clone()),
         }],
         modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-        image_config: None,
         seed: req.seed,
-        temperature: None,
-        max_tokens: None,
-        reasoning: None,
+        provider: req.provider.clone(),
         audio: format.clone().map(|format| AudioConfig { format }),
         stream: true,
+        ..Default::default()
     };
 
     let result = client.chat_completion_audio(&body).await?;
@@ -200,6 +203,7 @@ pub async fn run_job(
         prompt_source: prompt_source.to_string(),
         format: format.clone(),
         seed: req.seed,
+        provider: req.provider.clone(),
         text: text.clone(),
         transcript: transcript.clone(),
         cost: result.cost,
@@ -324,6 +328,7 @@ mod tests {
             prompt: "upbeat lo-fi loop".to_string(),
             format: format.map(str::to_string),
             seed: Some(7),
+            provider: None,
         }
     }
 

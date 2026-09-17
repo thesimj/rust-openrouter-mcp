@@ -80,7 +80,8 @@ pub struct TranscriptionBody {
 
 /// Inline audio payload. `data` is **raw** base64 - a `data:` URL prefix is
 /// rejected upstream - and `format` is required so the model can decode it.
-#[derive(Debug, Serialize)]
+/// Also the body of a chat `input_audio` content part.
+#[derive(Debug, Clone, Serialize)]
 pub struct InputAudio {
     pub data: String,
     pub format: String,

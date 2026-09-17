@@ -330,21 +330,34 @@ mod tests {
 
     /// The permanent guard: every tool-arg struct, root and `$defs`, is free of
     /// nullable unions and bare `true` schemas. Add new arg structs here.
+    /// Nested types that carry `AtLeastOneOf` (ImageInput, FileInput,
+    /// AudioInput, VideoInput) are unions *by design* and may never be a
+    /// tool-args root, so they are linted through the `$defs` of the roots
+    /// that embed them (ChatCompletionArgs here) rather than listed directly.
     #[test]
     fn every_tool_args_schema_is_client_safe() {
         use super::schema_json;
         use crate::server::account::{GetResultArgs, ResetUsageStatsArgs};
         use crate::server::audio::TranscribeAudioArgs;
+        use crate::server::chat::WebSearchArgs;
         use crate::server::embeddings::{EmbedTextArgs, GetGenerationArgs, RerankDocumentsArgs};
         use crate::server::models::DescribeModelArgs;
         use crate::server::provider::{
             ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
         };
+        let chat = schema_json::<ChatCompletionArgs>();
+        for nested in ["ImageInput", "FileInput", "AudioInput", "VideoInput"] {
+            assert!(
+                chat["$defs"][nested].is_object(),
+                "{nested} must be linted through ChatCompletionArgs.$defs"
+            );
+        }
         let schemas: Vec<(&str, serde_json::Value)> = vec![
             ("EmbedTextArgs", schema_json::<EmbedTextArgs>()),
             ("RerankDocumentsArgs", schema_json::<RerankDocumentsArgs>()),
             ("GetGenerationArgs", schema_json::<GetGenerationArgs>()),
-            ("ChatCompletionArgs", schema_json::<ChatCompletionArgs>()),
+            ("ChatCompletionArgs", chat),
+            ("WebSearchArgs", schema_json::<WebSearchArgs>()),
             ("DescribeImageArgs", schema_json::<DescribeImageArgs>()),
             ("GenerateImageArgs", schema_json::<GenerateImageArgs>()),
             ("GenerateVideoArgs", schema_json::<GenerateVideoArgs>()),

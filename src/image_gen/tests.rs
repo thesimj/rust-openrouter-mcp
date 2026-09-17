@@ -229,7 +229,7 @@ async fn describe_image_sends_image_and_returns_text() {
             None,
         )],
         max_image_dimension: 800,
-        reasoning_effort: None,
+        ..Default::default()
     };
     let result = describe_image(&client, &req).await.unwrap();
     assert_eq!(result.text, "A small green lizard.");
@@ -280,6 +280,7 @@ async fn captured_describe_body(
         )],
         max_image_dimension,
         reasoning_effort: reasoning_effort.map(str::to_string),
+        ..Default::default()
     };
     describe_image(&client, &req).await.unwrap();
     server.received_requests().await.unwrap()[0]
@@ -351,9 +352,50 @@ async fn describe_image_requires_an_image() {
         prompt: "p".to_string(),
         images: vec![],
         max_image_dimension: 800,
-        reasoning_effort: None,
+        ..Default::default()
     };
     assert!(describe_image(&client, &req).await.is_err());
+}
+
+/// The knobs `describe_image` used to hardcode to `None` now reach the wire:
+/// a system message ahead of the user turn, temperature, max_tokens, and
+/// the provider routing block.
+#[tokio::test]
+async fn describe_image_forwards_system_sampling_and_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "messages": [{ "role": "system", "content": "be brief" }, { "role": "user" }],
+            "temperature": 0.2,
+            "max_tokens": 50,
+            "provider": { "only": ["google-vertex"] }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+    let req = DescribeRequest {
+        model: "google/gemini-2.5-flash".to_string(),
+        prompt: "What is this?".to_string(),
+        images: vec![InputImage::from_path(
+            temp_png("openrouter-mcp-test-describe-knobs.png"),
+            None,
+        )],
+        max_image_dimension: 800,
+        system: Some("be brief".to_string()),
+        temperature: Some(0.2),
+        max_tokens: Some(50),
+        provider: Some(crate::openrouter::ProviderRouting {
+            only: vec!["google-vertex".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    describe_image(&client, &req).await.unwrap();
 }
 
 #[tokio::test]

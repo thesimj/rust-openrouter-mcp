@@ -228,6 +228,9 @@ pub struct MusicManifest {
     pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// The provider routing block sent, when one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::openrouter::ProviderRouting>,
     /// What the model streamed as `content` (lyrics or `<instrumental>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,

@@ -114,8 +114,9 @@ pub async fn read_audio_file(
 
 /// Validate encoded input before upload, including MIME aliases from data URLs.
 /// Whitespace inside the base64 (line-wrapping encoders) is removed so the
-/// payload sent upstream is the compact form; padding is optional.
-fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
+/// payload sent upstream is the compact form; padding is optional. Shared
+/// with the chat `input_audio` parts (`server::media`).
+pub(crate) fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
     let (data, format) =
         validate_inline_audio_within(data, Some(format), MAX_TRANSCRIBE_BYTES, "transcription")?;
     Ok((data, format.unwrap_or_default()))
