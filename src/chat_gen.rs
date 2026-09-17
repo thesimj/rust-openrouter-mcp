@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 
 use crate::image_gen::{self, InputImage};
 use crate::openrouter::{
-    ChatRequest, Choice, Content, ContentPart, ImageUrl, Message, OpenRouterClient, Plugin,
-    ProviderRouting, Reasoning, ResponseFormat, WebSearchOptions,
+    ChatRequest, Choice, Content, ContentPart, FilePart, ImageUrl, InputAudio, Message,
+    OpenRouterClient, Plugin, ProviderRouting, Reasoning, ResponseFormat, VideoUrl,
+    WebSearchOptions,
 };
 
 /// A chat reply: the assistant text plus what came with it - the reported USD
@@ -42,6 +43,12 @@ pub struct ChatInputs<'a> {
     pub max_tokens: Option<u64>,
     pub images: &'a [InputImage],
     pub max_image_dimension: u32,
+    /// Documents, already resolved to `file` parts (data URLs).
+    pub files: &'a [FilePart],
+    /// Audio clips, already resolved to `input_audio` parts.
+    pub audio: &'a [InputAudio],
+    /// Videos, already resolved to `video_url` parts (URL or data URL).
+    pub videos: &'a [VideoUrl],
     /// Reasoning effort (max, xhigh, high, medium, low, minimal, none). With
     /// `reasoning_max_tokens` and `reasoning_exclude` all unset, no `reasoning`
     /// object is sent, so the model keeps its catalog default.
@@ -92,13 +99,19 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
             content: Content::Text(system.to_string()),
         });
     }
-    let user_content = if inputs.images.is_empty() {
+    let multimodal = !inputs.images.is_empty()
+        || !inputs.files.is_empty()
+        || !inputs.audio.is_empty()
+        || !inputs.videos.is_empty();
+    let user_content = if !multimodal {
         Content::Text(inputs.prompt.to_string())
     } else {
         // Multimodal user message: `prompt` verbatim, then each normalized input
-        // image. Callers wanting the labeled-reference preamble (image_gen's
-        // "Reference images:" block) apply `assemble_prompt` themselves - it does
-        // not belong in a plain Q&A chat.
+        // image, then files, audio and videos - a fixed order so a prompt that
+        // says "the second file" means the same thing on every call. Callers
+        // wanting the labeled-reference preamble (image_gen's "Reference
+        // images:" block) apply `assemble_prompt` themselves - it does not
+        // belong in a plain Q&A chat.
         let prepared =
             image_gen::prepare_inputs_async(inputs.images, inputs.max_image_dimension).await?;
         let mut parts = vec![ContentPart::Text {
@@ -113,6 +126,27 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
                 },
             });
         }
+        parts.extend(
+            inputs
+                .files
+                .iter()
+                .cloned()
+                .map(|file| ContentPart::File { file }),
+        );
+        parts.extend(
+            inputs
+                .audio
+                .iter()
+                .cloned()
+                .map(|input_audio| ContentPart::InputAudio { input_audio }),
+        );
+        parts.extend(
+            inputs
+                .videos
+                .iter()
+                .cloned()
+                .map(|video_url| ContentPart::VideoUrl { video_url }),
+        );
         Content::Parts(parts)
     };
     messages.push(Message {

@@ -1,9 +1,6 @@
 //! Image tools (`generate_image`, `describe_image`), their argument structs, the
 //! shared `ImageInput` type, and the image-job result builder.
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-
-use base64::Engine;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -28,15 +25,7 @@ use crate::server::schema::{
 use crate::tasks::TaskKind;
 
 use super::OpenRouterServer;
-
-/// Hard ceiling for images fetched from third-party URLs. Input images are
-/// downscaled to the resolved dimension cap before use, so accepting
-/// arbitrarily large source bodies only increases memory pressure.
-const MAX_REMOTE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-
-/// Total deadline for one remote-image fetch, sized against the ceiling above:
-/// 20 MB inside 30s is ~5 Mbit/s, slower than any host worth waiting for.
-const REMOTE_IMAGE_TIMEOUT_SECS: u64 = 30;
+use super::media;
 
 /// An input image for editing / image-to-image / vision. Exactly one of
 /// `path`, `url`, or `base64` must be set. Order is preserved.
@@ -58,218 +47,41 @@ pub(crate) struct ImageInput {
     pub label: Option<String>,
 }
 
-/// Decode an inline `base64`/data-URL argument to raw bytes.
-fn decode_inline(data: &str) -> Result<Vec<u8>, ErrorData> {
-    let data = data.trim();
-    let payload = if data.starts_with("data:") {
-        data.split_once(',').map(|(_, body)| body).unwrap_or(data)
-    } else {
-        data
-    };
-    if payload.len() > crate::resources::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-        return Err(ErrorData::invalid_params(
-            "inline image exceeds 20 MiB",
-            None,
-        ));
-    }
-    let bytes = if data.starts_with("data:") {
-        crate::image_io::parse_data_url(data)
-            .map(|(_mime, bytes)| bytes)
-            .map_err(|e| ErrorData::invalid_params(format!("invalid data URL: {e}"), None))
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| ErrorData::invalid_params(format!("invalid base64 image data: {e}"), None))
-    }?;
-    if bytes.len() > crate::resources::MAX_IMAGE_BYTES {
-        return Err(ErrorData::invalid_params(
-            "inline image exceeds 20 MiB",
-            None,
-        ));
-    }
-    Ok(bytes)
-}
-
-/// True for IPs a fetched URL must never reach (SSRF guard): loopback, private
-/// (RFC1918), CGNAT (100.64/10), link-local (incl. cloud metadata 169.254.169.254),
-/// unspecified, broadcast, documentation, multicast, and IPv6 ULA/link-local.
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                || o[0] == 0
-                || o[0] >= 240
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(v4));
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-        }
-    }
-}
-
-/// Fetch an image URL's bytes with a plain client. Deliberately does NOT use the
-/// OpenRouter-authenticated client, so the API key is never sent to a
-/// third-party URL. SSRF-hardened: only http/https; the host is resolved and
-/// rejected if it points at a private/loopback/link-local address; redirects are
-/// disabled; and the connection is pinned to the validated IP so DNS can't be
-/// rebound between the check and the request.
-async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
-    let invalid = |msg: String| ErrorData::invalid_params(msg, None);
-
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| invalid(format!("invalid image url: {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid(format!("image url must be http(s): {url}")));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| invalid("image url has no host".to_string()))?
-        .to_string();
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS);
-
-    // Resolve off the async runtime, then refuse internal/private targets.
-    let lookup = host.clone();
-    let addrs: Vec<SocketAddr> = tokio::time::timeout_at(
-        deadline,
-        crate::resources::run_blocking(move || {
-            Ok((lookup.as_str(), port)
-                .to_socket_addrs()?
-                .collect::<Vec<_>>())
-        }),
-    )
-    .await
-    .map_err(|_| invalid("image URL DNS lookup timed out".to_string()))?
-    .map_err(|e| invalid(format!("could not resolve image url host: {e}")))?;
-
-    if addrs.is_empty() {
-        return Err(invalid("image url host did not resolve".to_string()));
-    }
-    if addrs.iter().any(|a| is_blocked_ip(a.ip())) {
-        return Err(invalid(
-            "image url resolves to a private/loopback/link-local address; refused".to_string(),
-        ));
-    }
-
-    // Pin to the validated IP (no second DNS lookup -> no rebinding) and forbid
-    // redirects (a 30x could otherwise bounce to an internal host).
-    //
-    // A total deadline is right here, unlike the shared OpenRouter client: this
-    // fetches a URL the *model* supplied, and the body is capped at
-    // MAX_REMOTE_IMAGE_BYTES, so there is no legitimate slow-but-large transfer
-    // to protect. Without it, a host that accepts and then dribbles bytes hangs
-    // the tool call forever - the size cap never trips on a drip.
-    //
-    // `no_gzip` because enabling reqwest's `gzip` feature turns auto-decompression
-    // on for every client in the process. Decoded responses lose Content-Length,
-    // which would silently kill the early size check below; image bytes are
-    // already compressed, so there is nothing to win here anyway.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .tls_backend_rustls()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, addrs[0])
-        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
-        .no_gzip()
-        .build()
-        .map_err(|e| ErrorData::internal_error(format!("http client build failed: {e}"), None))?;
-
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| invalid(format!("could not fetch image url: {e}")))?;
-    if resp.status().is_redirection() {
-        return Err(invalid(
-            "image url returned a redirect; refused (SSRF guard)".to_string(),
-        ));
-    }
-    let mut resp = resp
-        .error_for_status()
-        .map_err(|e| invalid(format!("image url returned an error: {e}")))?;
-    let content_length = resp.content_length();
-    if let Some(length) = content_length
-        && length > MAX_REMOTE_IMAGE_BYTES
-    {
-        return Err(invalid(format!(
-            "image url body is too large ({length} bytes; maximum is {MAX_REMOTE_IMAGE_BYTES})"
-        )));
-    }
-
-    // Enforce the limit while streaming as Content-Length may be absent or
-    // inaccurate. `Response::bytes()` would buffer an unbounded body first.
-    let capacity = content_length.unwrap_or(0).min(MAX_REMOTE_IMAGE_BYTES) as usize;
-    let mut bytes = Vec::with_capacity(capacity);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        ErrorData::internal_error(format!("could not read image url body: {e}"), None)
-    })? {
-        let next_len = bytes.len().saturating_add(chunk.len());
-        if next_len as u64 > MAX_REMOTE_IMAGE_BYTES {
-            return Err(invalid(format!(
-                "image url body exceeds the {MAX_REMOTE_IMAGE_BYTES}-byte maximum"
-            )));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
 /// Validate that an image spec carries exactly one source (path/url/base64),
 /// cheaply and without any network fetch. Lets a caller (e.g. `chat_completion`)
 /// surface a malformed-image error before running the network-bound model-
 /// capability gate.
 pub(crate) fn check_image_input(img: &ImageInput) -> Result<(), ErrorData> {
-    let count = [&img.path, &img.url, &img.base64]
-        .iter()
-        .filter(|o| o.as_ref().is_some_and(|s| !s.trim().is_empty()))
-        .count();
-    if count != 1 {
-        return Err(ErrorData::invalid_params(
-            "each image needs exactly one of: path, url, or base64".to_string(),
-            None,
-        ));
-    }
-    Ok(())
+    media::check_exactly_one(
+        media::InputKind::Image,
+        img.path.as_deref(),
+        img.url.as_deref(),
+        img.base64.as_deref(),
+    )
 }
 
-/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`],
-/// fetching URLs and decoding base64/data-URL inputs. Requires exactly one source.
+/// Resolve one tool-level [`ImageInput`] to a generator [`image_gen::InputImage`]
+/// through the shared source resolver: a path stays lazy (read in
+/// `prepare_inputs`), URLs are fetched (SSRF-guarded) and base64/data-URL
+/// inputs decoded, both capped at 20 MiB. Requires exactly one source.
 async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, ErrorData> {
-    check_image_input(&img)?;
     let label = img.label;
-    if let Some(p) = img.path.filter(|s| !s.trim().is_empty()) {
-        Ok(image_gen::InputImage::from_path(p, label))
-    } else if let Some(b64) = img.base64.filter(|s| !s.trim().is_empty()) {
-        let bytes = crate::resources::run_blocking(move || {
-            decode_inline(&b64).map_err(|e| anyhow::anyhow!(e.to_string()))
-        })
-        .await
-        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(image_gen::InputImage::inline(bytes, "inline", label))
-    } else {
-        let url = img.url.unwrap();
-        let bytes = fetch_url(&url).await?;
-        Ok(image_gen::InputImage::inline(bytes, url, label))
-    }
+    let resolved = media::resolve_source(
+        media::InputKind::Image,
+        img.path,
+        img.url,
+        img.base64,
+        crate::resources::MAX_IMAGE_BYTES,
+        true,
+    )
+    .await?;
+    Ok(match resolved {
+        media::Resolved::Path(p) => image_gen::InputImage::from_path(p, label),
+        media::Resolved::Bytes(b) => image_gen::InputImage::inline(b.bytes, b.name, label),
+        media::Resolved::Url(_) => {
+            return Err(ErrorData::internal_error("image url was not fetched", None));
+        }
+    })
 }
 
 /// Resolve a list of tool-level [`ImageInput`]s to generator inputs, in order.
@@ -652,96 +464,10 @@ impl OpenRouterServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_gen::ImageSource;
     use crate::server::test_support::{server_for, tool_result_json, valid_png_b64};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn img_input(path: Option<&str>, url: Option<&str>, base64: Option<&str>) -> ImageInput {
-        ImageInput {
-            path: path.map(str::to_string),
-            url: url.map(str::to_string),
-            base64: base64.map(str::to_string),
-            label: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_image_input_decodes_base64_and_data_url() {
-        // Raw base64 -> inline bytes.
-        let resolved = resolve_image_input(img_input(None, None, Some(&valid_png_b64())))
-            .await
-            .unwrap();
-        match resolved.source {
-            ImageSource::Inline { bytes, .. } => assert!(!bytes.is_empty()),
-            _ => panic!("expected inline bytes from base64"),
-        }
-
-        // A full data: URL also decodes to inline bytes.
-        let data_url = format!("data:image/png;base64,{}", valid_png_b64());
-        let resolved = resolve_image_input(img_input(None, None, Some(&data_url)))
-            .await
-            .unwrap();
-        assert!(matches!(resolved.source, ImageSource::Inline { .. }));
-    }
-
-    #[tokio::test]
-    async fn resolve_image_input_keeps_path_and_rejects_bad_input() {
-        let resolved = resolve_image_input(img_input(Some("/tmp/a.png"), None, None))
-            .await
-            .unwrap();
-        assert!(matches!(resolved.source, ImageSource::Path(_)));
-
-        // No source -> error.
-        let err = resolve_image_input(img_input(None, None, None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("exactly one of"));
-
-        // Two sources -> error.
-        let err = resolve_image_input(img_input(Some("/tmp/a.png"), None, Some("x")))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("exactly one of"));
-
-        // Non-http url -> rejected (never sent anywhere).
-        let err = resolve_image_input(img_input(None, Some("file:///etc/passwd"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("http"));
-    }
-
-    #[test]
-    fn is_blocked_ip_blocks_internal_allows_public() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-        // Blocked: loopback, private, link-local (incl. cloud metadata), CGNAT.
-        assert!(is_blocked_ip(Ipv4Addr::new(127, 0, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(10, 0, 0, 5).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(192, 168, 1, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(172, 16, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(169, 254, 169, 254).into())); // metadata
-        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into())); // CGNAT
-        assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
-        // Allowed: public addresses.
-        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
-        assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
-    }
-
-    #[tokio::test]
-    async fn fetch_url_refuses_loopback_and_metadata_targets() {
-        // SSRF guard: a loopback URL is refused before any connection.
-        let err = resolve_image_input(img_input(None, Some("http://127.0.0.1:9/pic.png"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("private/loopback"));
-
-        // The cloud metadata endpoint is link-local and likewise refused.
-        let err = resolve_image_input(img_input(None, Some("http://169.254.169.254/latest"), None))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("private/loopback"));
-    }
 
     #[tokio::test]
     async fn generate_image_runs_async_and_get_result_fetches_it() {

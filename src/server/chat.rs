@@ -26,6 +26,10 @@ use crate::server::schema::{
 
 use super::OpenRouterServer;
 use super::image::{ImageInput, check_image_input, resolve_image_inputs};
+use super::media::{
+    AudioInput, FileInput, InputKind, VideoInput, check_audio_input, check_file_input,
+    check_video_input, resolve_audio_inputs, resolve_file_inputs, resolve_video_inputs,
+};
 
 /// Accepted `pdf_engine` values (the file-parser plugin's `pdf.engine`).
 const PDF_ENGINES: [&str; 3] = ["mistral-ocr", "cloudflare-ai", "native"];
@@ -57,6 +61,24 @@ pub(crate) struct ChatCompletionArgs {
     #[serde(default, deserialize_with = "de_opt_uint")]
     #[schemars(range(max = 4096))]
     pub max_image_dimension: Option<u32>,
+    /// Optional documents (PDF etc.) for a model with file input. Each takes
+    /// exactly one of path / url (fetched) / base64 (needs `filename`); sent
+    /// as `file` parts (data URL, 20 MiB each). Pair with `pdf_engine` to
+    /// choose the parser. Gated like `images` on the model's input_modalities
+    /// ("file").
+    #[serde(default)]
+    pub files: Vec<FileInput>,
+    /// Optional audio clips for a model with audio input. Each takes exactly
+    /// one of path / base64 (+ `format` unless inferable); sent as
+    /// `input_audio` parts (25 MiB each). Gated on input_modalities ("audio").
+    #[serde(default)]
+    pub audio: Vec<AudioInput>,
+    /// Optional videos for a model with video input. Each takes exactly one of
+    /// url (passed through for the provider to fetch) / path / base64 (data
+    /// URL, 20 MiB each), plus an optional `processing` hint; sent as
+    /// `video_url` parts. Gated on input_modalities ("video").
+    #[serde(default)]
+    pub videos: Vec<VideoInput>,
     /// Optional sampling temperature.
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
@@ -367,10 +389,15 @@ impl OpenRouterServer {
         `reasoning_effort` OR `reasoning_max_tokens` (not both), plus `reasoning_exclude` to \
         keep the reasoning text out of the reply. `provider` takes routing fields only (order, \
         only, ignore, allow_fallbacks, require_parameters, zdr, sort) - chat completions have \
-        no per-provider `options` passthrough. Optionally pass `images` (path/url/base64) to \
-        ask a VISION-capable model about them; the call is rejected only when the model is \
-        known not to accept image input (use list_models with input_modalities=image to find \
-        one). Returns the assistant's text as the first content block; when the response \
+        no per-provider `options` passthrough. Multimodal input: `images` (path/url/base64) \
+        for a VISION-capable model, `files` (PDF and other documents; path/url/base64 + \
+        filename; use `pdf_engine` to pick the parser), `audio` (path/base64 + format) and \
+        `videos` (url passed through, or path/base64 as a data URL). Parts are sent in the \
+        order text, images, files, audio, videos. Each kind is gated on the model's declared \
+        input_modalities: the call is rejected only when the catalog says the model does NOT \
+        accept that kind (find models with list_models input_modalities=image|file|audio|\
+        video); unknown capabilities are let through. Returns the assistant's text as the \
+        first content block; when the response \
         carries reasoning, annotations (url_citation: url, title, content, start_index, \
         end_index), or a finish_reason other than \"stop\" (e.g. \"length\" = truncated), a \
         second JSON block follows with those plus prompt/completion token counts. Not \
@@ -416,18 +443,43 @@ impl OpenRouterServer {
         let plugins: Vec<Plugin> = web_plugin.into_iter().chain(pdf_plugin).collect();
         let provider = args.provider.into_routing()?;
 
-        // Validate each image's shape cheaply (no fetch) so a malformed entry
+        // Validate each input's shape cheaply (no fetch) so a malformed entry
         // reports the accurate "exactly one of ..." error rather than being
-        // masked by the capability gate below. Then gate image input on the
-        // model's declared capabilities before any network-bound resolution.
-        // Both are skipped for text-only calls.
+        // masked by the capability gate below. Then gate each present kind on
+        // the model's declared capabilities before any network-bound
+        // resolution. All of it is skipped for text-only calls.
         if !args.images.is_empty() {
             for img in &args.images {
                 check_image_input(img)?;
             }
-            self.ensure_image_input_supported(&args.model).await?;
+            self.ensure_input_modality(&args.model, InputKind::Image)
+                .await?;
+        }
+        if !args.files.is_empty() {
+            for f in &args.files {
+                check_file_input(f)?;
+            }
+            self.ensure_input_modality(&args.model, InputKind::File)
+                .await?;
+        }
+        if !args.audio.is_empty() {
+            for a in &args.audio {
+                check_audio_input(a)?;
+            }
+            self.ensure_input_modality(&args.model, InputKind::Audio)
+                .await?;
+        }
+        if !args.videos.is_empty() {
+            for v in &args.videos {
+                check_video_input(v)?;
+            }
+            self.ensure_input_modality(&args.model, InputKind::Video)
+                .await?;
         }
         let images = resolve_image_inputs(args.images).await?;
+        let files = resolve_file_inputs(args.files).await?;
+        let audio = resolve_audio_inputs(args.audio).await?;
+        let videos = resolve_video_inputs(args.videos).await?;
         // The dimension cap only matters when there are images to normalize.
         let max_dim = if images.is_empty() {
             0
@@ -448,6 +500,9 @@ impl OpenRouterServer {
                 max_tokens: args.max_tokens,
                 images: &images,
                 max_image_dimension: max_dim,
+                files: &files,
+                audio: &audio,
+                videos: &videos,
                 reasoning_effort: args.reasoning_effort.as_deref(),
                 reasoning_max_tokens: args.reasoning_max_tokens,
                 reasoning_exclude: args.reasoning_exclude,
@@ -482,19 +537,20 @@ impl OpenRouterServer {
         }
     }
 
-    /// Best-effort early rejection when `model` is *known* not to accept image
-    /// input. The model's input modalities are looked up via list_models and
-    /// cached (after the first call completes; a burst of concurrent first-time
-    /// calls for the same model may each fetch).
+    /// Best-effort early rejection when `model` is *known* not to accept
+    /// `kind` input (image, file, audio, video). The model's input modalities
+    /// are looked up via list_models and cached (after the first call
+    /// completes; a burst of concurrent first-time calls for the same model
+    /// may each fetch).
     ///
     /// This is deliberately fail-open: the lookup is a fuzzy catalog search, so
     /// if it errors (network blip, an id the search doesn't surface, a routing-
     /// suffixed id like `:nitro`/`:floor`) or reports no modality metadata, the
     /// request is allowed through and the actual `/chat/completions` call remains
     /// the authority on compatibility. We reject only when the catalog positively
-    /// reports input modalities that don't include images — the common, clear
+    /// reports input modalities that don't include `kind` — the common, clear
     /// case (e.g. sending an image to a text-only model).
-    async fn ensure_image_input_supported(&self, model: &str) -> Result<(), ErrorData> {
+    async fn ensure_input_modality(&self, model: &str, kind: InputKind) -> Result<(), ErrorData> {
         let modalities = match self.model_caps.get(model).await {
             Some(cached) => cached,
             None => match self.client.model_input_modalities(model).await {
@@ -511,11 +567,12 @@ impl OpenRouterServer {
                 Err(_) => return Ok(()),
             },
         };
-        if !modalities.is_empty() && !modalities.iter().any(|m| m == "image") {
+        let noun = kind.noun();
+        if !modalities.is_empty() && !modalities.iter().any(|m| m == noun) {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "model '{model}' does not accept image input (input modalities: [{}]). \
-                     Use list_models with input_modalities=image to find a vision-capable model.",
+                    "model '{model}' does not accept {noun} input (input modalities: [{}]). \
+                     Use list_models with input_modalities={noun} to find a model that does.",
                     modalities.join(", ")
                 ),
                 None,
@@ -1132,8 +1189,143 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "described");
     }
 
+    /// Mock `GET /models` so `id` reports every input modality.
+    async fn mock_omni_model(mock: &MockServer, id: &str) {
+        mock_model_modalities(mock, id, &["text", "image", "file", "audio", "video"]).await;
+    }
+
+    /// Every multimodal kind reaches the wire as its documented part, in the
+    /// fixed order text, images, files, audio, videos; local bytes become data
+    /// URLs with the right MIME, a video URL passes through untouched.
+    #[tokio::test]
+    async fn chat_completion_sends_file_audio_and_video_parts_in_order() {
+        let mock = MockServer::start().await;
+        mock_omni_model(&mock, "google/gemini-2.5-pro").await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "summarize"},
+                    {"type": "image_url"},
+                    {"type": "file", "file": {"filename": "doc.pdf"}},
+                    {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}},
+                    {"type": "video_url", "video_url": {
+                        "url": "https://example.com/v.mp4", "processing": "low"}}
+                ]}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&mock)
+            .await;
+        let pdf_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"%PDF-1.4 fake");
+        let args: ChatCompletionArgs = serde_json::from_value(serde_json::json!({
+            "model": "google/gemini-2.5-pro",
+            "prompt": "summarize",
+            "images": [{"base64": valid_png_b64()}],
+            "files": [{"base64": pdf_b64, "filename": "doc.pdf"}],
+            "audio": [{"base64": "data:audio/mp3;base64,QUJD"}],
+            "videos": [{"url": "https://example.com/v.mp4", "processing": "low"}]
+        }))
+        .unwrap();
+        let res = server_for(mock.uri())
+            .run_chat_completion(args)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&res).unwrap()["content"][0]["text"],
+            "done"
+        );
+        let sent: serde_json::Value = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.url.path() == "/chat/completions")
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let parts = sent["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 5, "{parts:?}");
+        assert!(
+            parts[2]["file"]["file_data"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:application/pdf;base64,"),
+            "{}",
+            parts[2]
+        );
+    }
+
+    /// The capability gate is per kind: a model whose catalog entry lists only
+    /// text+image rejects file, audio and video inputs before any chat call,
+    /// each naming the modality to look for.
+    #[tokio::test]
+    async fn chat_completion_gates_each_input_modality() {
+        let mock = MockServer::start().await;
+        mock_model_modalities(&mock, "openai/gpt-5.4", &["text", "image"]).await;
+        let server = server_for(mock.uri());
+        let cases = [
+            (
+                serde_json::json!({"files": [{"base64": "JVBERi0=", "filename": "a.pdf"}]}),
+                "file",
+            ),
+            (
+                serde_json::json!({"audio": [{"base64": "QUJD", "format": "mp3"}]}),
+                "audio",
+            ),
+            (
+                serde_json::json!({"videos": [{"url": "https://example.com/v.mp4"}]}),
+                "video",
+            ),
+        ];
+        for (extra, kind) in cases {
+            let mut v = serde_json::json!({"model": "openai/gpt-5.4", "prompt": "hi"});
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            let args: ChatCompletionArgs = serde_json::from_value(v).unwrap();
+            let err = server.run_chat_completion(args).await.unwrap_err();
+            assert!(
+                err.message
+                    .contains(&format!("does not accept {kind} input")),
+                "{kind}: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&format!("input_modalities={kind}")),
+                "{kind}: {}",
+                err.message
+            );
+        }
+        // Nothing reached /chat/completions.
+        assert!(
+            mock.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path() == "/models")
+        );
+        // A malformed entry is reported before the gate runs (no fetch, no catalog).
+        let bad: ChatCompletionArgs = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "files": [{"filename": "a.pdf"}]
+        }))
+        .unwrap();
+        let err = server_for("http://127.0.0.1:9".to_string())
+            .run_chat_completion(bad)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("exactly one of"),
+            "got: {}",
+            err.message
+        );
+    }
+
     /// The nested `web_search` and `provider` blocks are optional `$ref`s on
-    /// the root, and `json_schema` is an open object (never a bare `true`).
+    /// the root, `json_schema` is an open object (never a bare `true`), and
+    /// the multimodal lists are arrays of their own `$defs` types.
     #[test]
     fn nested_blocks_are_optional_refs_and_json_schema_is_an_open_object() {
         let schema = crate::server::schema::schema_json::<ChatCompletionArgs>();
@@ -1145,6 +1337,21 @@ mod tests {
             schema["properties"]["provider"]["$ref"],
             serde_json::json!("#/$defs/ProviderRoutingArgs")
         );
+        for (field, def) in [
+            ("images", "ImageInput"),
+            ("files", "FileInput"),
+            ("audio", "AudioInput"),
+            ("videos", "VideoInput"),
+        ] {
+            let prop = &schema["properties"][field];
+            assert_eq!(prop["type"], "array", "{field}: {prop}");
+            assert_eq!(
+                prop["items"]["$ref"],
+                serde_json::json!(format!("#/$defs/{def}")),
+                "{field}: {prop}"
+            );
+            assert!(schema["$defs"][def].is_object(), "{def} missing");
+        }
         assert_eq!(schema["properties"]["json_schema"]["type"], "object");
         assert_eq!(
             schema["properties"]["json_schema"]["additionalProperties"],

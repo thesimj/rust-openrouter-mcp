@@ -331,8 +331,32 @@ pub(crate) struct ChatArgs {
     /// PDF parsing engine for file inputs: mistral-ocr, cloudflare-ai, or native.
     #[arg(long)]
     pdf_engine: Option<String>,
+    /// Local document (PDF etc.) to send as a `file` part (repeatable, order
+    /// preserved). Needs a model with file input.
+    #[arg(long = "file")]
+    files: Vec<PathBuf>,
+    /// Local audio clip (wav/mp3/flac/m4a/ogg/webm/aac) to send as an
+    /// `input_audio` part (repeatable). Needs a model with audio input.
+    #[arg(long = "audio")]
+    audio: Vec<PathBuf>,
+    /// Video to send as a `video_url` part (repeatable): an http(s) URL is
+    /// passed through for the provider to fetch, anything else is a local
+    /// file sent as a data URL. Needs a model with video input.
+    #[arg(long = "video")]
+    videos: Vec<String>,
     #[command(flatten)]
     provider: ProviderFlags,
+}
+
+/// `--video` value -> a [`crate::server::media::VideoInput`]: URLs pass
+/// through, everything else is a local path.
+pub(crate) fn parse_video_arg(value: &str) -> crate::server::media::VideoInput {
+    let is_url = value.starts_with("http://") || value.starts_with("https://");
+    crate::server::media::VideoInput {
+        url: is_url.then(|| value.to_string()),
+        path: (!is_url).then(|| value.to_string()),
+        ..Default::default()
+    }
 }
 
 /// Read `--json-schema`: the value itself when it parses as a JSON object,
@@ -569,6 +593,14 @@ mod tests {
             "--web-search",
             "--pdf-engine",
             "native",
+            "--file",
+            "report.pdf",
+            "--audio",
+            "clip.mp3",
+            "--video",
+            "https://example.com/v.mp4",
+            "--video",
+            "local.mp4",
             "--provider",
             "{\"order\":[\"openai\"]}",
         ])
@@ -579,6 +611,13 @@ mod tests {
         assert!(args.web_search);
         assert!(!args.json_mode);
         assert_eq!(args.pdf_engine.as_deref(), Some("native"));
+        assert_eq!(args.files, vec![PathBuf::from("report.pdf")]);
+        assert_eq!(args.audio, vec![PathBuf::from("clip.mp3")]);
+        let videos: Vec<_> = args.videos.iter().map(|v| parse_video_arg(v)).collect();
+        assert_eq!(videos[0].url.as_deref(), Some("https://example.com/v.mp4"));
+        assert_eq!(videos[0].path, None);
+        assert_eq!(videos[1].path.as_deref(), Some("local.mp4"));
+        assert_eq!(videos[1].url, None);
         let schema = read_json_schema(args.json_schema.as_deref().unwrap()).unwrap();
         assert_eq!(schema["title"], "Answer");
         // Inline JSON works too, and garbage is an error.

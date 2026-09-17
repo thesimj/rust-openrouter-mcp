@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::provider::ProviderRouting;
+use super::speech::InputAudio;
 
 /// A chat-completions request. Every optional control is omitted when unset
 /// (`None` / empty), so the bare request is exactly `model`, `messages`,
@@ -160,7 +161,7 @@ pub struct Message {
 }
 
 /// Message content: either a plain string or an ordered list of parts
-/// (text-first, then images) for editing/multi-image requests.
+/// (text first, then images, files, audio, videos) for multimodal requests.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Content {
@@ -168,6 +169,7 @@ pub enum Content {
     Parts(Vec<ContentPart>),
 }
 
+/// One multimodal content part, discriminated by `type`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
@@ -175,6 +177,33 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    /// A document (PDF and friends) as a data URL, parsed upstream by the
+    /// file-parser plugin or the model's own file input.
+    #[serde(rename = "file")]
+    File { file: FilePart },
+    /// Inline audio (raw base64 + container format), same shape as the
+    /// transcription endpoint's `input_audio`.
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    /// A video by URL (providers fetch it) or as a data URL.
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+}
+
+/// `file` part body: `file_data` is a data URL (or an https URL upstream).
+#[derive(Debug, Clone, Serialize)]
+pub struct FilePart {
+    pub filename: String,
+    pub file_data: String,
+}
+
+/// `video_url` part body. `processing` is a provider hint (e.g. Gemini's
+/// media resolution), passed through untouched and omitted when unset.
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing: Option<String>,
 }
 
 /// `image_config` block controlling aspect ratio and resolution tier.
@@ -459,6 +488,53 @@ mod tests {
         assert_eq!(
             serde_json::to_value(budget).unwrap(),
             json!({"max_tokens": 2000, "exclude": true, "enabled": true})
+        );
+    }
+
+    /// Serde lock for the multimodal parts OpenRouter documents beyond
+    /// `image_url`: `file`, `input_audio`, `video_url` (processing omitted when unset).
+    #[test]
+    fn content_parts_serialize_file_audio_and_video_shapes() {
+        let file = ContentPart::File {
+            file: FilePart {
+                filename: "doc.pdf".into(),
+                file_data: "data:application/pdf;base64,JVBERi0=".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(file).unwrap(),
+            json!({"type": "file", "file": {"filename": "doc.pdf",
+                   "file_data": "data:application/pdf;base64,JVBERi0="}})
+        );
+        let audio = ContentPart::InputAudio {
+            input_audio: InputAudio {
+                data: "QUJD".into(),
+                format: "mp3".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(audio).unwrap(),
+            json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}})
+        );
+        let video = ContentPart::VideoUrl {
+            video_url: VideoUrl {
+                url: "https://example.com/v.mp4".into(),
+                processing: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(video).unwrap(),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/v.mp4"}})
+        );
+        let processed = ContentPart::VideoUrl {
+            video_url: VideoUrl {
+                url: "data:video/mp4;base64,AAAA".into(),
+                processing: Some("low".into()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(processed).unwrap()["video_url"]["processing"],
+            "low"
         );
     }
 

@@ -23,6 +23,7 @@ mod audio;
 mod caps;
 pub(crate) mod chat;
 mod image;
+pub(crate) mod media;
 mod models;
 mod music;
 mod naming;
