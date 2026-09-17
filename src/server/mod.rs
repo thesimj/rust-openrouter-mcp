@@ -7,7 +7,7 @@
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     tool_handler,
     transport::stdio,
 };
@@ -86,8 +86,8 @@ impl ServerHandler for OpenRouterServer {
     /// default to it: over stdio those changes buy us nothing, and naming a
     /// version ahead of what clients speak only risks a failed handshake.
     /// Opting in is a deliberate change - see the test below.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "MCP server for OpenRouter. Use `list_models` to discover models, \
                 their capabilities, and pricing, then `generate_image` to create \
