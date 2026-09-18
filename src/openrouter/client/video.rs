@@ -1,24 +1,13 @@
-//! Asynchronous video-generation endpoints: list, submit, poll, download.
+//! Asynchronous video-generation endpoints: submit, poll, download.
 
 use anyhow::{Context, Result};
 
 use crate::openrouter::{
-    OpenRouterClient, VideoModel, VideoModelsResponse, VideoPollResponse, VideoSubmitBody,
-    VideoSubmitResponse, content_type, generation_id,
+    OpenRouterClient, VideoPollResponse, VideoSubmitBody, VideoSubmitResponse, content_type,
+    generation_id,
 };
 
 impl OpenRouterClient {
-    /// `GET /api/v1/videos/models` - video-generation models with `pricing_skus`
-    /// (per video-second / per video-token), resolutions, durations, etc.
-    pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
-        let rb = self
-            .http
-            .get(format!("{}/videos/models", self.base_url))
-            .bearer_auth(&self.api_key);
-        let parsed: VideoModelsResponse = self.send_json(rb, "/videos/models").await?;
-        Ok(parsed.data)
-    }
-
     /// `POST /api/v1/videos` - submit an asynchronous video-generation job. This
     /// is **not** the chat endpoint: it returns `202` with a job id to poll. On a
     /// non-2xx status the upstream error body is surfaced verbatim.
@@ -78,32 +67,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{OpenRouterClient, VideoSubmitBody};
-
-    #[tokio::test]
-    async fn list_video_models_parses_pricing_skus() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/videos/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    {"id": "google/veo", "pricing_skus": {"duration_seconds": "0.1"}}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let vms = client.list_video_models().await.unwrap();
-        assert_eq!(vms.len(), 1);
-        assert_eq!(vms[0].id, "google/veo");
-        assert_eq!(
-            vms[0]
-                .pricing_skus
-                .get("duration_seconds")
-                .map(String::as_str),
-            Some("0.1")
-        );
-    }
 
     #[tokio::test]
     async fn submit_video_posts_body_and_parses_job_id() {

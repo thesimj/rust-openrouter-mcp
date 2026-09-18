@@ -1,4 +1,4 @@
-//! Retrieval helpers shared by the MCP tools and the CLI: text embeddings
+//! Retrieval helpers for the MCP tools: text embeddings
 //! (`POST /embeddings`) and document reranking (`POST /rerank`).
 //!
 //! Like [`crate::audio_gen`], this is the single path both front ends use:
@@ -41,7 +41,7 @@ impl EmbedResult {
         self.embeddings.first().map_or(0, Vec::len)
     }
 
-    /// The result envelope both the MCP tool and the CLI print.
+    /// The result envelope returned by the MCP tool.
     pub fn to_json(&self) -> Value {
         json!({
             "model": self.model,
@@ -90,7 +90,7 @@ pub struct RerankResult {
 }
 
 impl RerankResult {
-    /// The result envelope both the MCP tool and the CLI print.
+    /// The result envelope returned by the MCP tool.
     pub fn to_json(&self) -> Value {
         let results: Vec<Value> = self
             .results

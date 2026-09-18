@@ -138,8 +138,7 @@ fn non_blank(s: String) -> Option<String> {
 }
 
 /// Run a music job: stream the completion, decode the audio, save it with the
-/// extension its bytes call for, and write the sidecar manifest. Shared by the
-/// CLI and the MCP tool.
+/// extension its bytes call for, and write the sidecar manifest.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &MusicGenRequest,

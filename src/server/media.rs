@@ -630,8 +630,8 @@ fn audio_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
 /// URL passes through untouched (the provider fetches it), a `data:` URL is
 /// decoded, capped at [`MAX_MEDIA_BYTES`] and re-issued, and a local path is
 /// read (same cap) and inlined as a data URL typed from its bytes, declared
-/// type, or extension. Shared by the CLI and the MCP tool through
-/// `video_gen`, and with the chat inputs above through [`resolve_source`].
+/// type, or extension. Used by `video_gen` and the chat inputs above
+/// through [`resolve_source`].
 pub(crate) async fn resolve_media_reference(
     kind: InputKind,
     source: &str,

@@ -1,29 +1,13 @@
 //! DTOs for the asynchronous video-generation endpoints (`/videos`,
-//! `/videos/models`, `/videos/{id}`).
+//! `/videos/{id}`).
 //!
 //! `FrameImage`/`InputReference` reuse the canonical [`ImageUrl`] from
 //! `dto::chat`, reachable here as `super::ImageUrl` via the flat re-export.
-
-use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::ImageUrl;
 use super::provider::ProviderOptions;
-
-#[derive(Debug, Deserialize)]
-pub struct VideoModelsResponse {
-    pub data: Vec<VideoModel>,
-}
-
-/// A video-generation model from `/videos/models`. `pricing_skus` maps a SKU
-/// name (e.g. `duration_seconds_with_audio`, `video_tokens`) to a price string.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VideoModel {
-    pub id: String,
-    #[serde(default, deserialize_with = "super::null_as_default")]
-    pub pricing_skus: BTreeMap<String, String>,
-}
 
 /// Request body for `POST /api/v1/videos`. Optional fields are omitted when
 /// unset (named `*Body` to avoid colliding with the domain `video_gen` struct).
@@ -169,6 +153,7 @@ pub struct VideoUsage {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     // Locks the exact `/videos` image-to-video wire shape documented by OpenRouter:
     // each frame is an OpenAI-style content part with a `type`, an `image_url`
@@ -284,16 +269,6 @@ mod tests {
 #[cfg(test)]
 mod audit_regression {
     use super::*;
-    #[test]
-    fn catalog_accepts_null_missing_and_populated_pricing_together() {
-        let response: VideoModelsResponse = serde_json::from_value(serde_json::json!({"data":[
-            {"id":"a","pricing_skus":null}, {"id":"b"}, {"id":"c","pricing_skus":{"duration_seconds":"0.1"}}
-        ]})).unwrap();
-        assert_eq!(response.data.len(), 3);
-        assert!(response.data[0].pricing_skus.is_empty());
-        assert!(response.data[1].pricing_skus.is_empty());
-        assert_eq!(response.data[2].pricing_skus["duration_seconds"], "0.1");
-    }
     #[test]
     fn poll_error_accepts_string_object_and_null() {
         let parse = |error: serde_json::Value| -> VideoPollResponse {

@@ -126,9 +126,8 @@ fn is_pixel_size(size: &str) -> bool {
 }
 
 /// Refuse the request shape OpenRouter answers with 400: a pixel-form `size`
-/// sent alongside `image_size` (wire `resolution`) or `aspect_ratio`. Shared by
-/// the MCP tool and the CLI so the check lives once. Blank strings count as
-/// absent; a tier-form `size` never conflicts.
+/// sent alongside `image_size` (wire `resolution`) or `aspect_ratio`.
+/// Blank strings count as absent. A tier-form `size` never conflicts.
 pub fn check_size_conflict(
     size: Option<&str>,
     image_size: Option<&str>,

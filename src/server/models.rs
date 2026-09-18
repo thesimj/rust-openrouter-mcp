@@ -229,8 +229,7 @@ impl OpenRouterServer {
 
         let filtered = apply_filters(page.data, search.as_deref(), all);
 
-        // Shared enrichment: attach a human-readable pricing_human to each
-        // model (same path the CLI uses, so the two never diverge).
+        // Attach human-readable pricing_human to each model.
         let mut json = serde_json::to_string_pretty(&models_to_json(&filtered.models))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         if filtered.truncated() > 0 {

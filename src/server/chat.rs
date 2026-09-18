@@ -1,7 +1,6 @@
 //! The `chat_completion` text tool, its argument struct, and the conversions
 //! from tool arguments to the chat wire controls (`response_format`,
-//! `plugins`, `web_search_options`, `reasoning`). The CLI `chat` subcommand
-//! reuses those conversions so the two never normalize differently.
+//! `plugins`, `web_search_options`, `reasoning`).
 
 use std::collections::BTreeMap;
 

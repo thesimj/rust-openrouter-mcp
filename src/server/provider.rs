@@ -1,7 +1,7 @@
 //! Tool-argument shapes for the OpenRouter `provider` request block and their
 //! conversion to the wire types in [`crate::openrouter`].
 //!
-//! This is the one place tool arguments (MCP or CLI `--provider <json>`) become
+//! This is the one place MCP tool arguments become
 //! [`ProviderRouting`] / [`ImageProvider`] / [`ProviderOptions`], so the
 //! vocabulary checks live here once. Three arg structs mirror the three wire
 //! types because the endpoints differ in what they accept (see the DTO docs).

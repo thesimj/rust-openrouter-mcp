@@ -1,6 +1,6 @@
 //! Shared chat-completion (text/vision in -> text out): the single place the
 //! `/chat/completions` request envelope is built and its response extracted.
-//! Used by the `chat_completion` MCP tool, the `chat` CLI subcommand, and
+//! Used by the `chat_completion` MCP tool and
 //! [`crate::image_gen::describe_image`], which delegates here.
 
 use anyhow::{Context, Result};

@@ -1,5 +1,5 @@
 //! Image-generation job orchestration: fan out variants, save outputs, write the
-//! sidecar manifest, and return a lean summary. Shared by the CLI and the MCP tool.
+//! sidecar manifest, and return a lean summary.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -151,7 +151,7 @@ pub struct JobSummary {
 
 /// Run a generation job: fan out `variants` in parallel, save each output (with
 /// the provider's actual format), write the sidecar manifest, and return a lean
-/// summary. Shared by the CLI and the MCP tool.
+/// summary.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &GenerateRequest,

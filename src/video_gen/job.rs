@@ -1,5 +1,5 @@
 //! Video job orchestration: submit, poll, download each clip, write the sidecar
-//! manifest, and return a lean summary. Shared by the CLI and the MCP tool.
+//! manifest, and return a lean summary.
 
 use std::path::{Path, PathBuf};
 
@@ -78,7 +78,7 @@ fn clip_output_path(base: &Path, index_zero_based: usize, total: usize, ext: &st
 
 /// Run a video generation job: normalize any frame/reference images, submit the
 /// job, poll until terminal, download each clip, save it, write the sidecar
-/// manifest, and return a lean summary. Shared by the CLI and the MCP tool.
+/// manifest, and return a lean summary.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &VideoGenRequest,

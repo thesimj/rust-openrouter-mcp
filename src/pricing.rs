@@ -1,9 +1,6 @@
-//! Shared price formatting for OpenRouter prices, used by both the CLI table
-//! renderer and the MCP `list_models`/`describe_model` tools so the two never
-//! diverge. OpenRouter reports prices as USD-per-unit decimal strings; negative
-//! values are sentinels (e.g. `openrouter/auto` uses `-1` = "varies").
-
-use std::collections::BTreeMap;
+//! Price formatting for the MCP `list_models` and `describe_model` tools.
+//! OpenRouter reports prices as USD-per-unit decimal strings.
+//! Negative values are sentinels (e.g. `openrouter/auto` uses `-1` = "varies").
 
 use serde_json::{Map, Value};
 
@@ -13,65 +10,6 @@ use crate::openrouter::Model;
 pub(crate) fn trim_num(v: f64) -> String {
     let s = format!("{v:.8}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// Format an OpenRouter per-token price string as USD per 1M tokens, with the
-/// compact 4-decimal precision used by the table view. Returns "-" when
-/// missing/unparseable/negative and "0" for zero.
-pub(crate) fn per_million(price: &Option<String>) -> String {
-    match price.as_deref().and_then(|s| s.parse::<f64>().ok()) {
-        Some(0.0) => "0".to_string(),
-        // Negative values are sentinels (e.g. openrouter/auto uses -1 = "varies").
-        Some(p) if p < 0.0 => "-".to_string(),
-        Some(p) if p.is_finite() => {
-            let s = format!("{:.4}", p * 1_000_000.0);
-            let s = s.trim_end_matches('0').trim_end_matches('.');
-            format!("${s}")
-        }
-        _ => "-".to_string(),
-    }
-}
-
-/// Render a list of prices as `$x<unit>` or `$min-max<unit>`.
-pub(crate) fn range_str(vals: &[f64], unit: &str) -> String {
-    let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < f64::EPSILON {
-        format!("${}{}", trim_num(min), unit)
-    } else {
-        format!("${}-{}{}", trim_num(min), trim_num(max), unit)
-    }
-}
-
-/// Derive a concise price for a video model from its heterogeneous
-/// `pricing_skus`: dollars-per-second, cents-per-second, or per-1M video tokens.
-pub(crate) fn video_price(skus: &BTreeMap<String, String>) -> String {
-    let mut groups: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-    let mut unknown = Vec::new();
-    for (key, raw) in skus {
-        let Some(value) = raw
-            .parse::<f64>()
-            .ok()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        else {
-            continue;
-        };
-        if let Some((scale, unit)) = video_unit(key) {
-            groups.entry(unit).or_default().push(value * scale);
-        } else {
-            unknown.push(format!("{key}: ${} (unit unknown)", trim_num(value)));
-        }
-    }
-    let mut prices: Vec<String> = groups
-        .iter()
-        .map(|(unit, values)| range_str(values, unit))
-        .collect();
-    prices.extend(unknown);
-    if prices.is_empty() {
-        "-".to_string()
-    } else {
-        prices.join("; ")
-    }
 }
 
 /// Known video SKU families. Unknown names retain their names and raw rate.
@@ -234,8 +172,7 @@ pub(crate) fn attach_image_pricing_human(endpoint: &mut Value) {
 }
 
 /// Serialize a model list to JSON, attaching a `pricing_human` sibling to each
-/// model. Shared by the CLI `models` JSON output and the `list_models` MCP tool
-/// so both render pricing identically.
+/// model for the `list_models` MCP tool.
 pub(crate) fn models_to_json(models: &[Model]) -> Value {
     let mut v = serde_json::to_value(models).unwrap_or_else(|_| Value::Array(Vec::new()));
     if let Some(arr) = v.as_array_mut() {
@@ -290,49 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn per_million_formats_prices_and_sentinels() {
-        assert_eq!(per_million(&Some("0".to_string())), "0");
-        assert_eq!(per_million(&Some("-1".to_string())), "-");
-        assert_eq!(per_million(&Some("0.00000075".to_string())), "$0.75");
-        assert_eq!(per_million(&Some("0.00003".to_string())), "$30");
-        assert_eq!(per_million(&Some("not-a-number".to_string())), "-");
-        assert_eq!(per_million(&None), "-");
-    }
-
-    #[test]
     fn trim_num_drops_trailing_zeros_and_caps_precision() {
         assert_eq!(trim_num(1.0), "1");
         assert_eq!(trim_num(1.50), "1.5");
         assert_eq!(trim_num(0.12000000), "0.12");
         assert_eq!(trim_num(0.123456789), "0.12345679");
-    }
-
-    #[test]
-    fn range_str_collapses_equal_bounds_and_renders_ranges() {
-        assert_eq!(range_str(&[0.02], "/s"), "$0.02/s");
-        assert_eq!(range_str(&[0.5, 0.5], "/s"), "$0.5/s");
-        assert_eq!(range_str(&[0.02, 0.03], "/s"), "$0.02-0.03/s");
-        assert_eq!(range_str(&[0.03, 0.02], "/s"), "$0.02-0.03/s");
-    }
-
-    #[test]
-    fn video_price_prefers_seconds_then_cents_then_video_tokens() {
-        let mut skus = BTreeMap::new();
-        skus.insert("duration_seconds".to_string(), "0.12".to_string());
-        skus.insert("video_tokens".to_string(), "0.01".to_string());
-        assert_eq!(video_price(&skus), "$10000/M vid-tok; $0.12/s");
-
-        let mut skus = BTreeMap::new();
-        skus.insert("second_with_audio".to_string(), "3".to_string());
-        skus.insert("second_without_audio".to_string(), "2".to_string());
-        assert_eq!(video_price(&skus), "$0.02-0.03/s");
-
-        // Video tokens now normalize to per-1M for readability.
-        let mut skus = BTreeMap::new();
-        skus.insert("video_tokens".to_string(), "0.000007".to_string());
-        assert_eq!(video_price(&skus), "$7/M vid-tok");
-
-        assert_eq!(video_price(&BTreeMap::new()), "-");
     }
 
     #[test]
@@ -503,22 +402,18 @@ mod audit_regression {
         );
     }
     #[test]
-    fn video_rates_keep_megapixel_factors_and_unknown_sku_names() {
-        let skus = BTreeMap::from([
-            ("cents_per_megapixel_second_precise".into(), "7.5".into()),
-            ("cents_per_megapixel_second_creative".into(), "10.5".into()),
-        ]);
-        assert_eq!(video_price(&skus), "$0.075-0.105/MP-s");
+    fn video_rates_keep_megapixel_factors_and_unknown_units() {
         assert_eq!(
             humanize_price("cents_per_megapixel_second_precise", "7.5").as_deref(),
             Some("$0.075/MP-s")
         );
         assert_eq!(
-            video_price(&BTreeMap::from([(
-                "unrecognized_second_unit".into(),
-                "2".into()
-            )])),
-            "unrecognized_second_unit: $2 (unit unknown)"
+            humanize_price("cents_per_megapixel_second_creative", "10.5").as_deref(),
+            Some("$0.105/MP-s")
+        );
+        assert_eq!(
+            humanize_price("unrecognized_second_unit", "2").as_deref(),
+            Some("$2/unit (unit unknown)")
         );
     }
     #[test]

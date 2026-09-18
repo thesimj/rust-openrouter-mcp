@@ -82,8 +82,7 @@ impl VideoGenRequest {
     }
 
     /// Invariants the endpoint enforces only after accepting (and billing) the
-    /// job, checked here before any HTTP call. The single implementation for
-    /// the CLI and the MCP tool.
+    /// job, checked here before any HTTP call.
     pub fn validate(&self) -> Result<()> {
         if self.prompt_text().is_none() && !self.has_visual_or_media_input() {
             bail!(

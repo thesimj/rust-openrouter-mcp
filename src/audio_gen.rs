@@ -154,7 +154,7 @@ fn validate_inline_audio_within(
 
 /// A validated stateless voice-cloning reference for `/audio/speech`: one
 /// audio sample plus an optional transcript of it. Built through [`Self::new`]
-/// so the documented caps are enforced once, for the MCP tool and the CLI alike.
+/// so every voice reference obeys the documented caps.
 #[derive(Debug, Clone)]
 pub struct VoiceReference {
     /// Raw base64 of the sample (no `data:` prefix).
@@ -216,8 +216,7 @@ pub async fn transcribe(
     client: &OpenRouterClient,
     req: &TranscribeRequest,
 ) -> Result<TranscribeResult> {
-    // Normalized once here, so every caller (MCP tool, CLI) gets the same
-    // blank-filtering and case-insensitive gating without duplicating it:
+    // Normalize blank values and case before checking the format:
     // trim+lowercase response_format so "Verbose_json"/" json " both work, and
     // trim+lowercase+drop-blank timestamp_granularities entries the same way
     // before they reach the wire ("Word"/" segment " both work too).
@@ -350,18 +349,15 @@ fn extension_for(mime: &str, response_format: &str) -> &'static str {
 }
 
 /// Run a TTS job: synthesize the speech, save the bytes (extension from the
-/// content-type / requested format), and write the sidecar manifest. Shared by
-/// the CLI and the MCP tool.
+/// content-type / requested format), and write the sidecar manifest.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &SpeechGenRequest,
     output: &Path,
     input_source: &str,
 ) -> Result<AudioJobResult> {
-    // Default response_format to mp3 so the extension is deterministic. Fixed
-    // here (not in each caller) because both the MCP tool and the CLI route
-    // through this one function: a blank/whitespace-only value must behave as
-    // absent, not reach the wire as a literal "  " (same class of bug as the
+    // Default response_format to mp3 so the extension is deterministic.
+    // Treat blank values as absent instead of sending a literal "  " (like the
     // transcribe_audio response_format/timestamp_granularities blank-filter).
     let response_format = req
         .response_format

@@ -19,6 +19,11 @@ editor can use it. This guide gives the exact config for the popular ones.
 
 ## The launch contract (same everywhere)
 
+Launch the binary with the `mcp` subcommand. The bare `openrouter-mcp` with no
+arguments starts the same server, so `"args": []` works too. Existing configs
+from earlier versions need no change.
+Use `openrouter-mcp --version` or `openrouter-mcp -V` to check the installed version.
+
 | Field | Value |
 | --- | --- |
 | command | `openrouter-mcp` |

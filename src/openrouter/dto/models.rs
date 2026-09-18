@@ -91,8 +91,7 @@ impl ModelsResponse {
     /// One-line pagination summary for a caller paging with `limit`/`offset`:
     /// the server's `total_count` and, when there is another page, its
     /// `links.next` URL. `None` when the response carries no `total_count`.
-    /// Shared by the `list_models` tool header and the CLI footer so the two
-    /// never diverge.
+    /// Used by the `list_models` tool header.
     pub fn pagination_note(&self) -> Option<String> {
         let total = self.total_count?;
         let mut note =
@@ -151,7 +150,7 @@ pub struct Model {
 
 impl Model {
     /// Case-insensitive match of `needle` against the model id, name, and
-    /// description. Used by the `search` filter in both the CLI and MCP tool.
+    /// description. Used by the MCP `search` filter.
     pub fn matches_search(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
         self.id.to_lowercase().contains(&needle)
@@ -306,7 +305,7 @@ mod tests {
         assert!(undated.get("knowledge_cutoff").is_none());
     }
 
-    /// The one-line pagination note shared by the MCP header and the CLI:
+    /// The one-line pagination note in the MCP header:
     /// nothing without `total_count`, the count alone on the last page, and
     /// the next-page link when the server says there is more.
     #[test]

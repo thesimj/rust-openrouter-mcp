@@ -351,7 +351,7 @@ async fn resolve_transcribe_request(
 /// when the object is empty. The sample is loaded like any other audio input
 /// ([`media::load_audio_input`]); its format may stay unknown for inline data
 /// (the endpoint does not require it) and [`audio_gen::VoiceReference::new`]
-/// applies the 15 MiB / 10000-character caps. Shared with the CLI.
+/// applies the 15 MiB / 10000-character caps.
 pub(crate) async fn resolve_voice_reference(
     reference: media::AudioInput,
     text: Option<String>,

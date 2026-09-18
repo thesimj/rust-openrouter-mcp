@@ -369,8 +369,7 @@ impl FilteredModels {
 
 /// Apply the local case-insensitive `search` filter (across id/name/description)
 /// and, unless `all`, cap the result at [`DEFAULT_MODEL_LIMIT`]. Returns the
-/// models to display plus the pre-truncation match count. Shared by the CLI
-/// `models` command and the `list_models` MCP tool so the two never diverge.
+/// models to display plus the pre-truncation match count for `list_models`.
 pub fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) -> FilteredModels {
     if let Some(needle) = search {
         models.retain(|m| m.matches_search(needle));

@@ -61,9 +61,9 @@ OpenRouter's handling of this data is governed by OpenRouter's own
 ## Where data is stored
 
 - **API key**: when installed as a Claude Desktop extension, your API key is
-  stored by Claude Desktop in your operating system's secure keychain. When run
-  from the CLI it is read from the `OPENROUTER_API_KEY` environment variable (or
-  a local `.env` file you control).
+  stored by Claude Desktop in your operating system's secure keychain.
+  When an MCP client launches the binary directly, the binary reads
+  `OPENROUTER_API_KEY` from its environment or a local `.env` file.
 - **Generated images, video clips, speech and music files, and their manifests**:
   written to the path you specify, or, when you don't specify one,
   auto-named under `OPENROUTER_MCP_OUTPUT_DIR` if set, else

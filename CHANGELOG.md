@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.0
+
+- **Breaking:** the binary now serves MCP only. `openrouter-mcp mcp` starts the
+  server as before, and the bare `openrouter-mcp` with no arguments does the same.
+  Existing client configurations with `"args": ["mcp"]` keep working unchanged.
+- Removed the operational CLI commands (`models`, `image`, `video`, `audio`, `music`,
+  `transcribe`, `describe`, `chat`, `embed`, `rerank`, `generation`, `key`) and the
+  help flags. Use the corresponding MCP tools.
+  `--version` and `-V` remain available without credentials.
+  `mcp` and the version flags must appear alone. Other arguments exit with status 2
+  and a diagnostic on stderr.
+- Preserved all 16 MCP tools, their schemas, generation behavior, saved files, and usage accounting.
+  Clients must supply prompt text and schema objects directly, and poll `get_result` for unfinished jobs.
+  See [Launch and version](README.md#launch-and-version) for input and output migration details.
+- Removed Clap and unused CLI pricing and video catalog helpers.
+  The desktop bundle and installation links still launch with `mcp`.
+
 ## 0.10.1
 
 - Regenerated `Cargo.lock` to the latest Rust 1.88 compatible versions. rmcp

@@ -10,8 +10,7 @@
 
 One small Rust program that gives your AI assistant access to every model on
 [OpenRouter](https://openrouter.ai). It runs as an MCP server for Claude
-Desktop, Claude Code, Cursor and other clients, and it doubles as a
-command-line tool. Bring your own OpenRouter API key.
+Desktop, Claude Code, Cursor and other clients. Bring your own OpenRouter API key.
 
 ## What you can do with it
 
@@ -85,6 +84,7 @@ Generic MCP client config:
   "mcpServers": {
     "openrouter": {
       "command": "openrouter-mcp",
+      "args": ["mcp"],
       "env": { "OPENROUTER_API_KEY": "sk-or-v1-..." }
     }
   }
@@ -145,48 +145,29 @@ uses: `{"openai": {"instructions": "speak like a calm narrator"}}` on speech,
 Chat-family tools take routing only. OpenRouter's chat schema has no
 passthrough field.
 
-## Command line
+## Launch and version
 
-The same binary is a CLI. Subcommands: `models`, `image`, `video`, `audio`,
-`music`, `transcribe`, `describe`, `chat`, `embed`, `rerank`, `generation`,
-`key`, `mcp`. Every network subcommand takes `--provider '<json>'` with the same
-object the MCP tool takes. `--help` lists every flag.
+Run `openrouter-mcp mcp` to start the MCP stdio server. The bare
+`openrouter-mcp` with no arguments starts the same server, so both
+`"args": ["mcp"]` and `"args": []` work in client configs.
+Use `openrouter-mcp --version` or `openrouter-mcp -V` to print the installed version.
+Version checks need no API key. All other arguments exit with status 2 and
+print a usage line on stderr.
 
-```bash
-# Ask a model something
-openrouter-mcp chat -m anthropic/claude-sonnet-4.6 -p "Why Rust?" --temperature 0.3
+Existing client configurations from earlier versions keep working unchanged.
+The MCP tools replace the former CLI commands (`models`, `image`, `chat`, ...).
 
-# Read a PDF and answer as JSON matching a schema
-openrouter-mcp chat -m openai/gpt-5.4 -p "Extract the invoice total." \
-  --file ./invoice.pdf --pdf-engine mistral-ocr --json-schema ./invoice.schema.json
+For former CLI workflows:
 
-# Browse models
-openrouter-mcp models --output-modalities image --sort newest --table
-openrouter-mcp models --category programming --sort intelligence-high-to-low --table
+- Have the client read prompt files and send their text as `prompt` or `input`.
+- Send a JSON object in `json_schema` instead of a schema filename.
+- Combine the output directory and filename into one `output` path.
+- Poll `get_result` while an image or video job reports `pending`. Keep the MCP session open.
+- For images, specify `size`, or both `aspect_ratio` and `image_size`.
+- For video, specify `duration` and `with_audio`. Also specify `aspect_ratio` or `size` unless supplying a first or last frame.
+- Use `list_models` for discovery and `describe_model` for detailed pricing, including video SKUs.
 
-# Make an image, then four seed-stepped variants
-openrouter-mcp image -m google/gemini-3.1-flash-image-preview \
-  -p "a photorealistic owl with one cybernetic eye" --aspect-ratio 1:1 --image-size 1K -o ./out/owl.png
-openrouter-mcp image -m bytedance-seed/seedream-4.5 -p "a cute baby dragon" \
-  --aspect-ratio 1:1 --image-size 1K --seed 1490 --variants 4 -o ./out/dragon.png
-
-# Make a video from a still frame
-openrouter-mcp video -m bytedance/seedance-2.0 --first-frame ./out/owl.png --duration 5 -o ./out/owl.mp4
-
-# Speech, cloned voice, music
-openrouter-mcp audio -m hexgrad/kokoro-82m --voice af_heart --input "Hello." -o ./out/hello.mp3
-openrouter-mcp audio -m fish-audio/s1 --voice-reference ./sample.wav --input "Cloned hello." -o ./out/clone.mp3
-openrouter-mcp music -m google/lyria-3-clip-preview -p "warm lo-fi loop, soft piano, 80 bpm" -o ./out/loop.mp3
-
-# Transcribe with speaker labels
-openrouter-mcp transcribe -m deepgram/nova-3 --file ./meeting.mp3 --response-format verbose_json \
-  --provider '{"options":{"deepgram":{"diarize":true}}}'
-
-# Embeddings, rerank, and the real cost of a request
-openrouter-mcp embed -m openai/text-embedding-3-small -i "first text" -i "second text"
-openrouter-mcp rerank -m cohere/rerank-v3.5 -q "rust async runtime" -d "Tokio is..." -d "Sourdough..." --top-n 1
-openrouter-mcp generation --id gen-1234567890abcdef
-```
+Generated files and manifests still save to disk. MCP records prompt provenance as `inline`.
 
 ## Configuration
 
