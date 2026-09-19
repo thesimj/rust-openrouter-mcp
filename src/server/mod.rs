@@ -22,6 +22,7 @@ mod account;
 pub(crate) mod audio;
 mod caps;
 pub(crate) mod chat;
+pub(crate) mod decisions;
 mod embeddings;
 mod image;
 pub(crate) mod media;
@@ -73,6 +74,7 @@ impl OpenRouterServer {
                 + Self::music_router()
                 + Self::chat_router()
                 + Self::embeddings_router()
+                + Self::decisions_router()
                 + Self::account_router(),
         }
     }
@@ -100,9 +102,14 @@ impl ServerHandler for OpenRouterServer {
                 (all three synchronous). `chat_completion` sends a prompt (with \
                 optional images, files, audio, video) to any chat model; `embed_text` \
                 returns embedding vectors and `rerank_documents` ranks documents \
-                against a query. Every tool takes a `provider` object: routing \
-                (order/only/ignore/allow_fallbacks/sort) on chat, images, embeddings \
-                and rerank, and per-provider passthrough `provider.options` keyed by \
+                against a query. `make_decisions` asks a decisions model (TypeSafe \
+                Jev, typesafe/jev-1.13 - find them with list_models \
+                output_modalities=\"decisions\") typed noul/choice/score questions \
+                about a state and returns probabilities; these models are served on \
+                /api/alpha/decisions and cannot be used with chat_completion. Every \
+                tool takes a `provider` object: routing \
+                (order/only/ignore/allow_fallbacks/sort) on chat, images, embeddings, \
+                rerank and decisions, and per-provider passthrough `provider.options` keyed by \
                 provider slug on images, speech, transcription and video - \
                 `describe_model` lists each endpoint's allowed_passthrough_parameters, \
                 so check it before passing options. Every result carries a \

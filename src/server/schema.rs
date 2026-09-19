@@ -340,6 +340,7 @@ mod tests {
         use crate::server::account::{GetResultArgs, ResetUsageStatsArgs};
         use crate::server::audio::TranscribeAudioArgs;
         use crate::server::chat::WebSearchArgs;
+        use crate::server::decisions::{MakeDecisionsArgs, QuestionArgs};
         use crate::server::embeddings::{EmbedTextArgs, GetGenerationArgs, RerankDocumentsArgs};
         use crate::server::models::DescribeModelArgs;
         use crate::server::provider::{
@@ -356,6 +357,10 @@ mod tests {
             ("EmbedTextArgs", schema_json::<EmbedTextArgs>()),
             ("RerankDocumentsArgs", schema_json::<RerankDocumentsArgs>()),
             ("GetGenerationArgs", schema_json::<GetGenerationArgs>()),
+            // Guidance and Criteria (the anyOf newtypes) are linted through
+            // these two roots' $defs.
+            ("MakeDecisionsArgs", schema_json::<MakeDecisionsArgs>()),
+            ("QuestionArgs", schema_json::<QuestionArgs>()),
             ("ChatCompletionArgs", chat),
             ("WebSearchArgs", schema_json::<WebSearchArgs>()),
             ("DescribeImageArgs", schema_json::<DescribeImageArgs>()),

@@ -1,8 +1,8 @@
 //! `POST /api/v1/rerank`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::openrouter::{OpenRouterClient, RerankBody, RerankReply, generation_id};
+use crate::openrouter::{OpenRouterClient, RerankBody, RerankReply};
 
 impl OpenRouterClient {
     /// `POST /api/v1/rerank` - synchronous document reranking. Returns the
@@ -15,17 +15,7 @@ impl OpenRouterClient {
             .post(format!("{}/rerank", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let response = self.send_checked(rb, "/rerank").await?;
-        let generation_id = generation_id(&response);
-        let receipt = crate::billing::Receipt {
-            cost: None,
-            generation_id: generation_id.clone(),
-        };
-        let body = response
-            .json()
-            .await
-            .context("failed to decode OpenRouter /rerank response")
-            .map_err(|error| receipt.attach(error))?;
+        let (body, generation_id) = self.send_json_receipted(rb, "/rerank").await?;
         Ok(RerankReply {
             body,
             generation_id,

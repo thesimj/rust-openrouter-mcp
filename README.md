@@ -28,6 +28,9 @@ Desktop, Claude Code, Cursor and other clients. Bring your own OpenRouter API ke
   attached. Ask for JSON output. Turn on web search.
 - **Embed and rerank text.** Vectors for search, and best-first ranking of
   documents against a query.
+- **Ask a decision model.** Send TypeSafe Jev a state and typed questions
+  (true/false, pick one, score on a scale). Get calibrated probabilities back
+  in about a quarter of a second, with no text generation.
 - **Know what you paid.** Every result carries a generation id, and one tool
   looks up the real charge for it.
 
@@ -106,6 +109,7 @@ Generic MCP client config:
 | `describe_image` | Describe one or more images with a vision model. |
 | `embed_text` | Float vectors for a list of texts. |
 | `rerank_documents` | Rank documents against a query, best first. |
+| `make_decisions` | Ask a decisions model (TypeSafe Jev) named `noul`, `choice` and `score` questions about a `state`. Returns typed answers with probabilities and confidence. See [Decisions](#decisions). |
 | `get_generation` | The stored record for a `generation_id`: real cost, provider, tokens, latency. |
 | `get_result` | Fetch an async job by `task_id`. |
 | `get_account` | Your API key's label, credits, and limits. |
@@ -121,7 +125,7 @@ OpenRouter can route one model to several providers. The `provider` object on
 each tool lets you steer that.
 
 **Routing** (chat, describe_image, generate_music, embed_text, rerank_documents,
-generate_image): `order`, `only`, `ignore`, `allow_fallbacks`,
+make_decisions, generate_image): `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `zdr`, `sort`.
 
 ```json
@@ -144,6 +148,41 @@ uses: `{"openai": {"instructions": "speak like a calm narrator"}}` on speech,
 
 Chat-family tools take routing only. OpenRouter's chat schema has no
 passthrough field.
+
+## Decisions
+
+A decisions model does not write text. It reads a `state` and answers a set of
+questions you define, each with a probability. OpenRouter serves TypeSafe's Jev
+(`typesafe/jev-1.13`, alias `~typesafe/jev-latest` - the tilde is required) on
+`POST /api/alpha/decisions`, an alpha endpoint outside `/api/v1`.
+`chat_completion` cannot use these models. `make_decisions` can. Find them with
+`list_models` and `output_modalities="decisions"`.
+
+Three question types:
+
+| `type` | Asks | `criteria` | Answer |
+| --- | --- | --- | --- |
+| `noul` | Is it true? | optional `{"true": "...", "false": "..."}` | `{"noul": 0.96}` |
+| `choice` | Which label? | required `{label: description or null}` | `{"choice": "payments", "confidence": 0.75, "probabilities": {...}}` |
+| `score` | How much, on this scale? | required array of 2 to 10 levels, lowest first | `{"score": 1.99, "confidence": 0.99, "legend": {...}, "probabilities": {...}}` |
+
+```json
+{
+  "model": "typesafe/jev-1.13",
+  "state": { "customer_tier": "enterprise", "ticket": "Blank screen after I click Pay." },
+  "questions": {
+    "is_bug":  { "type": "noul",   "instructions": "Is the customer reporting a software defect?" },
+    "team":    { "type": "choice", "instructions": "Which team should own this ticket?",
+                 "criteria": { "payments": "Checkout or billing.", "frontend": "Rendering or layout." } },
+    "urgency": { "type": "score",  "instructions": "How urgent is this ticket?",
+                 "criteria": ["Can wait", "This week", "Blocking revenue now"] }
+  }
+}
+```
+
+The result has one answer per question name, `usage` with token counts and
+cost, and a `generation_id`. Jev bills input tokens only ($0.042 per million).
+The model never sees your question names.
 
 ## Launch and version
 

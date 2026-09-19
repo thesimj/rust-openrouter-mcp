@@ -41,6 +41,15 @@ const MAX_INLINE_MEDIA: usize = 4;
 /// (the file is always saved to disk regardless).
 pub(crate) const MAX_INLINE_AUDIO_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Render a JSON value as a tool's pretty-printed text result. The shape every
+/// synchronous, media-free tool returns (embeddings, rerank, decisions, the
+/// account and stats lookups).
+pub(crate) fn json_text_result(value: &serde_json::Value) -> Result<CallToolResult, ErrorData> {
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+}
+
 /// Append non-empty `warnings`/`errors` arrays to a job result object. Shared by
 /// the image, video, and audio envelope builders.
 pub(crate) fn attach_warnings_errors(

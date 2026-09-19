@@ -10,7 +10,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::server::result::{client_wants_inline_previews, job_call_result, snapshot_to_envelope};
+use crate::server::result::{
+    client_wants_inline_previews, job_call_result, json_text_result, snapshot_to_envelope,
+};
 use crate::server::schema::{de_bool, scalarize_nullable};
 
 use super::OpenRouterServer;
@@ -116,9 +118,7 @@ impl OpenRouterServer {
             map.insert("credits".to_string(), credits);
         }
 
-        let body = serde_json::to_string_pretty(&body)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+        json_text_result(&body)
     }
 
     #[tool(
@@ -127,8 +127,9 @@ impl OpenRouterServer {
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
         video_generations, videos_generated, audio_generations, audio_files (generate_audio \
         and generate_music), \
-        text_generations (describe_image, chat_completion, transcribe_audio, embed_text, and \
-        rerank_documents calls; get_generation lookups count only toward requests_total), \
+        text_generations (describe_image, chat_completion, transcribe_audio, embed_text, \
+        rerank_documents, and make_decisions calls; get_generation lookups count only toward \
+        requests_total), \
         actual_cost_usd (summed from usage.cost), \
         unknown_cost_count, and a by_model breakdown. Counters reset when the server restarts.",
         annotations(
@@ -139,10 +140,7 @@ impl OpenRouterServer {
         )
     )]
     pub(crate) async fn get_usage_stats(&self) -> Result<CallToolResult, ErrorData> {
-        let snapshot = self.stats.snapshot().await;
-        let body = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+        json_text_result(&self.stats.snapshot().await)
     }
 
     #[tool(

@@ -34,7 +34,8 @@ pub(crate) struct ListModelsArgs {
     /// Filter by output modalities. Comma-separated list of: text, image, audio
     /// (audio-output chat models, i.e. music such as google/lyria-3-*),
     /// embeddings, video, rerank, speech (text-to-speech), transcription
-    /// (speech-to-text) - or "all". Defaults to text on the API when omitted
+    /// (speech-to-text), decisions (structured decision models for
+    /// make_decisions) - or "all". Defaults to text on the API when omitted
     /// (so pass "all" or a value to see others).
     #[serde(default)]
     pub output_modalities: Option<String>,
@@ -201,7 +202,8 @@ impl OpenRouterServer {
         design-arena benchmarks; set a minimum context length; page with limit/offset \
         (the header line reports the server's total_count). Output modalities include \
         text, image, audio (audio-output chat models - music such as google/lyria-3-*), \
-        embeddings, video, rerank, speech (text-to-speech), transcription (speech-to-text); \
+        embeddings, video, rerank, speech (text-to-speech), transcription (speech-to-text), \
+        decisions (structured decision models such as typesafe/jev-1.13, for make_decisions); \
         the default is text only, so pass output_modalities=\"all\" or a specific value to \
         see the rest. Returns the first 20 models by default; set all=true for the \
         complete list.",

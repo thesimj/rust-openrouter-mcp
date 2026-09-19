@@ -3,10 +3,7 @@
 //! (`GET /generation?id=`), with their argument structs.
 
 use rmcp::{
-    ErrorData,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    tool, tool_router,
+    ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -14,6 +11,7 @@ use serde::Deserialize;
 use crate::embed_gen::{self, EmbedRequest, RerankRequest};
 use crate::openrouter::HttpFailure;
 use crate::server::provider::ProviderRoutingArgs;
+use crate::server::result::json_text_result;
 use crate::server::schema::{de_lenient, de_opt_uint, scalarize_nullable};
 
 use super::OpenRouterServer;
@@ -123,11 +121,10 @@ impl OpenRouterServer {
         match embed_gen::embed(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                pretty_json(&result.to_json())
+                json_text_result(&result.to_json())
             }
             Err(e) => {
-                self.stats.record_text(&model, false, None).await;
-                self.stats.record_failed_receipt(&model, &e).await;
+                self.stats.record_text_failure(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -170,11 +167,10 @@ impl OpenRouterServer {
         match embed_gen::rerank(&self.client, &req).await {
             Ok(result) => {
                 self.stats.record_text(&model, true, result.cost).await;
-                pretty_json(&result.to_json())
+                json_text_result(&result.to_json())
             }
             Err(e) => {
-                self.stats.record_text(&model, false, None).await;
-                self.stats.record_failed_receipt(&model, &e).await;
+                self.stats.record_text_failure(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -183,8 +179,8 @@ impl OpenRouterServer {
     #[tool(
         description = "Look up the stored record of one request by its generation id \
         (GET /api/v1/generation?id=). The id (\"gen-...\", from OpenRouter's X-Generation-Id \
-        header) is in the result of chat_completion, describe_image, generate_music, embed_text \
-        and rerank_documents, and in the sidecar manifest generate_image, generate_video and \
+        header) is in the result of chat_completion, describe_image, generate_music, embed_text, \
+        rerank_documents and make_decisions, and in the sidecar manifest generate_image, generate_video and \
         generate_audio write; this returns what OpenRouter recorded for it as \
         JSON, verbatim: total_cost (USD actually charged), provider_name, the model, native \
         token counts (native_tokens_prompt / native_tokens_completion / reasoning / cached), \
@@ -216,7 +212,7 @@ impl OpenRouterServer {
         match self.client.get_generation(id).await {
             Ok(record) => {
                 self.stats.record_lookup(true).await;
-                pretty_json(&record)
+                json_text_result(&record)
             }
             Err(e) => {
                 self.stats.record_lookup(false).await;
@@ -237,13 +233,6 @@ impl OpenRouterServer {
             }
         }
     }
-}
-
-/// Render a JSON value as the tool's pretty-printed text result.
-fn pretty_json(value: &serde_json::Value) -> Result<CallToolResult, ErrorData> {
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 #[cfg(test)]

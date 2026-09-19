@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.12.0
+
+- New tool `make_decisions` for OpenRouter's decisions models (TypeSafe Jev:
+  `typesafe/jev-1.13`, alias `~typesafe/jev-latest`). It calls
+  `POST /api/alpha/decisions`, the alpha endpoint outside `/api/v1`, with a
+  `state` (string, object or array) and named `noul` / `choice` / `score`
+  questions, and returns the typed answers (probabilities, confidence, legend),
+  `usage {input_tokens, output_tokens, cost}` and a `generation_id`. `provider`
+  takes the same routing subset as `embed_text` and `rerank_documents`.
+- Local validation before any HTTP call: a non-blank `state`, at least one
+  question, non-blank instructions and labels, `choice` criteria as a
+  label -> description object, `score` criteria as an array of at least two
+  levels (TypeSafe's documented minimum), `noul` criteria as `{"true", "false"}`.
+  Errors name the question (`questions["team"]: ...`).
+- `chat_completion` now points at `make_decisions` when OpenRouter rejects a
+  decisions model on `/chat/completions`.
+- `list_models` documents the `decisions` output modality; `get_usage_stats`
+  counts `make_decisions` under `text_generations`.
+- Client: `OpenRouterClient::api_root()` derives the server root above
+  `/api/v1` for endpoints served outside it.
+- Skipped on purpose: the `session_id`, `trace` and `user` request fields, and
+  the rest of `ProviderPreferences` (quantizations, max_price, preferred_*).
+
 ## 0.11.0
 
 - **Breaking:** the binary now serves MCP only. `openrouter-mcp mcp` starts the

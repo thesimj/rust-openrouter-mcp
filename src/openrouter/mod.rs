@@ -1,6 +1,7 @@
 //! Minimal async REST client for the OpenRouter HTTP API.
 //!
-//! Covers model discovery, account information, chat, images, audio, and video.
+//! Covers model discovery, account information, chat, images, audio, video,
+//! embeddings, rerank, and the alpha decisions endpoint.
 
 mod client;
 mod dto;
@@ -301,6 +302,15 @@ impl OpenRouterClient {
         }
     }
 
+    /// The server root above the `/api/v1` prefix `base_url` carries, for the
+    /// endpoints OpenRouter serves outside it (`/api/alpha/decisions`). In
+    /// production `https://openrouter.ai/api/v1` -> `https://openrouter.ai`;
+    /// a test mock's bare `http://127.0.0.1:N` is returned unchanged.
+    pub(in crate::openrouter) fn api_root(&self) -> &str {
+        let trimmed = self.base_url.trim_end_matches('/');
+        trimmed.strip_suffix("/api/v1").unwrap_or(trimmed)
+    }
+
     /// Hold shared admission from request send until body consumption finishes.
     async fn send_response(
         &self,
@@ -346,6 +356,30 @@ impl OpenRouterClient {
             .await
             .with_context(|| format!("failed to decode OpenRouter {label} response"))
     }
+
+    /// [`send_json`](Self::send_json) for the endpoints whose 2xx means the
+    /// provider may already have billed: a body that cannot be decoded keeps a
+    /// [`billing::Receipt`](crate::billing::Receipt) with the `X-Generation-Id`
+    /// header on the error, so the caller can still account the charge. Returns
+    /// the decoded body and that header.
+    pub(in crate::openrouter) async fn send_json_receipted<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+        label: &str,
+    ) -> Result<(T, Option<String>)> {
+        let response = self.send_checked(rb, label).await?;
+        let generation_id = generation_id(&response);
+        let receipt = crate::billing::Receipt {
+            cost: None,
+            generation_id: generation_id.clone(),
+        };
+        let body = response
+            .json()
+            .await
+            .with_context(|| format!("failed to decode OpenRouter {label} response"))
+            .map_err(|error| receipt.attach(error))?;
+        Ok((body, generation_id))
+    }
 }
 
 /// Default number of models returned by list queries unless `all` is requested.
@@ -384,6 +418,22 @@ pub fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `api_root` strips exactly the `/api/v1` prefix (and a trailing slash)
+    /// so alpha endpoints resolve under the same host; a mock's bare origin
+    /// stays as it is.
+    #[test]
+    fn api_root_strips_the_v1_prefix_only() {
+        for (base, root) in [
+            (BASE_URL, "https://openrouter.ai"),
+            ("https://openrouter.ai/api/v1/", "https://openrouter.ai"),
+            ("http://127.0.0.1:4321", "http://127.0.0.1:4321"),
+            ("http://127.0.0.1:4321/", "http://127.0.0.1:4321"),
+        ] {
+            let client = OpenRouterClient::with_base_url(base, "test-key");
+            assert_eq!(client.api_root(), root, "base {base}");
+        }
+    }
 
     #[test]
     fn truncate_error_body_bounds_long_bodies_only() {

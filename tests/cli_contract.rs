@@ -194,6 +194,7 @@ fn bare_binary_serves_all_tools_and_local_calls_then_exits_on_eof() {
             "get_result",
             "get_usage_stats",
             "list_models",
+            "make_decisions",
             "rerank_documents",
             "reset_usage_stats",
             "transcribe_audio",

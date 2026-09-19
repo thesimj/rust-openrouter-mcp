@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::openrouter::{
     OpenRouterClient, VideoPollResponse, VideoSubmitBody, VideoSubmitResponse, content_type,
-    generation_id,
 };
 
 impl OpenRouterClient {
@@ -17,16 +16,8 @@ impl OpenRouterClient {
             .post(format!("{}/videos", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let response = self.send_checked(rb, "/videos").await?;
-        let receipt = crate::billing::Receipt {
-            cost: None,
-            generation_id: generation_id(&response),
-        };
-        response
-            .json()
-            .await
-            .context("failed to decode OpenRouter /videos response")
-            .map_err(|error| receipt.attach(error))
+        let (body, _generation_id) = self.send_json_receipted(rb, "/videos").await?;
+        Ok(body)
     }
 
     /// `GET /api/v1/videos/{id}` - poll a submitted video job for its status and,

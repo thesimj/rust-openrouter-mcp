@@ -51,16 +51,10 @@ impl OpenRouterClient {
             .post(format!("{}/audio/transcriptions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let response = self.send_checked(rb, "/audio/transcriptions").await?;
-        let receipt = crate::billing::Receipt {
-            cost: None,
-            generation_id: generation_id(&response),
-        };
-        response
-            .json()
-            .await
-            .context("failed to decode OpenRouter /audio/transcriptions response")
-            .map_err(|error| receipt.attach(error))
+        let (body, _generation_id) = self
+            .send_json_receipted(rb, "/audio/transcriptions")
+            .await?;
+        Ok(body)
     }
 }
 

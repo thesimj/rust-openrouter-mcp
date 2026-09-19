@@ -1,8 +1,8 @@
 //! `POST /api/v1/embeddings`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::openrouter::{EmbeddingsBody, EmbeddingsReply, OpenRouterClient, generation_id};
+use crate::openrouter::{EmbeddingsBody, EmbeddingsReply, OpenRouterClient};
 
 impl OpenRouterClient {
     /// `POST /api/v1/embeddings` - synchronous text embeddings. Returns the
@@ -15,17 +15,7 @@ impl OpenRouterClient {
             .post(format!("{}/embeddings", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let response = self.send_checked(rb, "/embeddings").await?;
-        let generation_id = generation_id(&response);
-        let receipt = crate::billing::Receipt {
-            cost: None,
-            generation_id: generation_id.clone(),
-        };
-        let body = response
-            .json()
-            .await
-            .context("failed to decode OpenRouter /embeddings response")
-            .map_err(|error| receipt.attach(error))?;
+        let (body, generation_id) = self.send_json_receipted(rb, "/embeddings").await?;
         Ok(EmbeddingsReply {
             body,
             generation_id,

@@ -305,8 +305,7 @@ impl OpenRouterServer {
                 Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
             }
             Err(e) => {
-                self.stats.record_text(&model, false, None).await;
-                self.stats.record_failed_receipt(&model, &e).await;
+                self.stats.record_text_failure(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }

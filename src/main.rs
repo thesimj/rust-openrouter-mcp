@@ -8,6 +8,7 @@
 mod audio_gen;
 mod billing;
 mod chat_gen;
+mod decision_gen;
 mod embed_gen;
 mod image_gen;
 mod image_io;

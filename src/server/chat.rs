@@ -540,9 +540,16 @@ impl OpenRouterServer {
                 Ok(CallToolResult::success(blocks))
             }
             Err(e) => {
-                self.stats.record_text(&args.model, false, None).await;
-                self.stats.record_failed_receipt(&args.model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
+                self.stats.record_text_failure(&args.model, &e).await;
+                let mut message = format!("{e:#}");
+                // OpenRouter's 400 for a decisions model (TypeSafe Jev) names it
+                // as such; those models live on /api/alpha/decisions, which
+                // `make_decisions` reaches. A substring check is enough: the
+                // phrase does not occur in any other upstream error.
+                if message.to_ascii_lowercase().contains("decisions model") {
+                    message.push_str(" Use the make_decisions tool for this model.");
+                }
+                Err(ErrorData::internal_error(message, None))
             }
         }
     }
@@ -1003,6 +1010,39 @@ mod tests {
 
     /// Reasoning text, web citations, a truncation finish_reason and the token
     /// counts come back in a second JSON block; the reply stays block 0.
+    /// OpenRouter rejects a decisions model on `/chat/completions` with a 400
+    /// naming it as such; the error keeps the upstream text and points at
+    /// `make_decisions`. Other 400s get no hint.
+    #[tokio::test]
+    async fn chat_completion_points_a_decisions_model_at_make_decisions() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "typesafe/jev-1.13"})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"code": 400, "message": "typesafe/jev-1.13 is a decisions model and cannot be used with the chat/completions endpoint."}
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let err = server
+            .run_chat_completion(args("typesafe/jev-1.13", "hi"))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("decisions model"), "{}", err.message);
+        assert!(err.message.contains("make_decisions"), "{}", err.message);
+        let err = server
+            .run_chat_completion(args("other/model", "hi"))
+            .await
+            .unwrap_err();
+        assert!(!err.message.contains("make_decisions"), "{}", err.message);
+    }
+
     #[tokio::test]
     async fn chat_completion_surfaces_reasoning_annotations_and_truncation() {
         let mock = MockServer::start().await;

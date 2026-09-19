@@ -191,6 +191,15 @@ impl UsageStats {
         }
     }
 
+    /// Record one failed text-family request (chat, describe_image,
+    /// transcribe_audio, embed_text, rerank_documents, make_decisions): the
+    /// failure counters plus whatever receipt `error` carries. The two always
+    /// go together - a failed call that the provider answered is still billed.
+    pub async fn record_text_failure(&self, model: &str, error: &anyhow::Error) {
+        self.record_text(model, false, None).await;
+        self.record_failed_receipt(model, error).await;
+    }
+
     /// Account the receipt carried by a failed request, if the provider had
     /// already answered (and so billed) before the local failure. A receipt
     /// without usage counts as an unknown cost, not as free.
@@ -356,11 +365,22 @@ mod audit_regression {
             cost: Some(0.02),
             generation_id: None,
         });
-        stats.record_text("chat", false, None).await;
-        stats.record_failed_receipt("chat", &error).await;
+        stats.record_text_failure("chat", &error).await;
         let output = stats.snapshot().await;
         assert_eq!(output["requests_total"], 1);
         assert_eq!(output["requests_failed"], 1);
+        assert_eq!(output["text_generations"], 0);
         assert_eq!(output["actual_cost_usd"], 0.02);
+        assert_eq!(output["by_model"]["chat"]["requests"], 1);
+
+        // Without a receipt nothing is billed and nothing is unknown: the
+        // provider never answered.
+        stats
+            .record_text_failure("chat", &anyhow::anyhow!("connection reset"))
+            .await;
+        let output = stats.snapshot().await;
+        assert_eq!(output["requests_failed"], 2);
+        assert_eq!(output["actual_cost_usd"], 0.02);
+        assert_eq!(output["unknown_cost_count"], 0);
     }
 }
