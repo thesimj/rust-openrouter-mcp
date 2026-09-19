@@ -41,9 +41,9 @@ const MAX_INLINE_MEDIA: usize = 4;
 /// (the file is always saved to disk regardless).
 pub(crate) const MAX_INLINE_AUDIO_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Render a JSON value as a tool's pretty-printed text result. The shape every
-/// synchronous, media-free tool returns (embeddings, rerank, decisions, the
-/// account and stats lookups).
+/// Render `value` as a pretty-JSON text block: the first (often only)
+/// content block of a tool result. Media tools append their inline blocks
+/// to `content` afterwards.
 pub(crate) fn json_text_result(value: &serde_json::Value) -> Result<CallToolResult, ErrorData> {
     let body = serde_json::to_string_pretty(value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -198,9 +198,8 @@ pub(crate) async fn job_call_result(
     env: &serde_json::Value,
     inline_previews: bool,
 ) -> Result<CallToolResult, ErrorData> {
-    let body = serde_json::to_string_pretty(env)
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-    let mut blocks = vec![ContentBlock::text(body)];
+    let mut result = json_text_result(env)?;
+    let blocks = &mut result.content;
 
     if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
         static PREVIEW_CAPACITY: std::sync::OnceLock<tokio::sync::Semaphore> =
@@ -212,7 +211,7 @@ pub(crate) async fn job_call_result(
             blocks.push(ContentBlock::text(
                 "Inline preview capacity reached; use the saved paths above.",
             ));
-            return Ok(CallToolResult::success(blocks));
+            return Ok(result);
         };
         match env.get("kind").and_then(|k| k.as_str()) {
             Some("video") => {
@@ -246,7 +245,7 @@ pub(crate) async fn job_call_result(
             }
         }
     }
-    Ok(CallToolResult::success(blocks))
+    Ok(result)
 }
 
 /// Wrap a task snapshot into the response envelope returned by `generate_image`
@@ -434,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn job_call_result_emits_video_resource_link_when_inline() {
         // A completed video job with a clip on disk yields a file:// ResourceLink
-        // (rmcp 1.7 has no native video block) when the client wants inline media.
+        // (rmcp 3 has no native video block) when the client wants inline media.
         let clip = std::env::temp_dir().join("openrouter-mcp-clip.mp4");
         std::fs::write(&clip, b"FAKE-MP4-BYTES").unwrap();
         let env = json!({

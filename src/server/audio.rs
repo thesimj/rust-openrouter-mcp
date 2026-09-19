@@ -1,6 +1,6 @@
-//! The `generate_audio` text-to-speech tool and its argument struct.
+//! The `generate_audio` (text-to-speech) and `transcribe_audio` (speech-to-text)
+//! tools and their argument structs.
 
-use anyhow::Context;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -15,7 +15,9 @@ use serde_json::json;
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
 use crate::server::provider::ProviderOptionsArgs;
-use crate::server::result::{client_wants_inline_previews, inline_audio_block};
+use crate::server::result::{
+    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, json_text_result,
+};
 use crate::server::schema::{
     RequireFields, de_lenient, de_opt_f64, require_all, scalarize_nullable,
 };
@@ -196,21 +198,12 @@ impl OpenRouterServer {
             voice_reference,
             provider,
         };
-        // Same normalization run_job applies to the wire values, so the
-        // auto-filename tokens never diverge from what is actually sent.
-        let fmt = req
-            .response_format
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "mp3".to_string());
+        // The filename tokens are the normalized wire values, so they never
+        // diverge from what run_job actually sends.
+        let fmt = audio_gen::normalize_response_format(req.response_format.as_deref());
+        let voice = audio_gen::normalize_voice(req.voice.as_deref());
         let mut tokens: Vec<&str> = Vec::new();
-        if let Some(voice) = req.voice.as_deref().map(str::trim)
-            && !voice.is_empty()
-        {
-            tokens.push(voice);
-        }
+        tokens.extend(voice.as_deref());
         tokens.push(fmt.as_str());
         let output = naming::resolve_output_base(
             args.output,
@@ -220,9 +213,9 @@ impl OpenRouterServer {
             None,
         );
 
-        match audio_gen::run_job(&self.client, &req, &output, "inline").await {
+        match audio_gen::run_job(&self.client, &req, &output).await {
             Ok(result) => {
-                self.stats.record_audio(&model, true, None).await;
+                self.stats.record_audio(&model, None).await;
                 let mut env = json!({
                     "ok": true,
                     "kind": "audio",
@@ -235,25 +228,17 @@ impl OpenRouterServer {
                     },
                     "manifest": result.manifest_path.to_string_lossy(),
                 });
-                if !result.warnings.is_empty() {
-                    env["warnings"] = json!(result.warnings);
-                }
-                let body = serde_json::to_string_pretty(&env)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let mut blocks = vec![ContentBlock::text(body)];
-
+                attach_warnings_errors(&mut env, &result.warnings, &[]);
+                let mut res = json_text_result(&env)?;
                 // Inline native AudioContent for sandboxed clients, under the cap.
                 if inline_previews {
-                    blocks.extend(
-                        inline_audio_block(result.audio.path.clone(), result.audio.mime.clone())
-                            .await?,
-                    );
+                    res.content
+                        .extend(inline_audio_block(result.audio.path, result.audio.mime).await?);
                 }
-                Ok(CallToolResult::success(blocks))
+                Ok(res)
             }
             Err(e) => {
-                self.stats.record_audio(&model, false, None).await;
-                self.stats.record_failed_receipt(&model, &e).await;
+                self.stats.record_audio_failure(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -289,20 +274,18 @@ impl OpenRouterServer {
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
         let model = args.model.clone();
-        let req = resolve_transcribe_request(args)
-            .await
-            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        let req = resolve_transcribe_request(args).await?;
 
         match audio_gen::transcribe(&self.client, &req).await {
             Ok(result) => {
-                self.stats.record_text(&model, true, result.cost).await;
-                let body = match result.verbose {
+                self.stats.record_text(&model, result.cost).await;
+                match result.verbose {
                     // verbose_json: return the full response object, not just text.
-                    Some(v) => serde_json::to_string_pretty(&v)
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
-                    None => result.text,
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+                    Some(v) => json_text_result(&v),
+                    None => Ok(CallToolResult::success(vec![ContentBlock::text(
+                        result.text,
+                    )])),
+                }
             }
             Err(e) => {
                 self.stats.record_text_failure(&model, &e).await;
@@ -318,17 +301,19 @@ impl OpenRouterServer {
 /// through the same [`media::load_audio_input`] the chat `audio` parts use.
 async fn resolve_transcribe_request(
     args: TranscribeAudioArgs,
-) -> anyhow::Result<audio_gen::TranscribeRequest> {
+) -> Result<audio_gen::TranscribeRequest, ErrorData> {
     let source = media::AudioInput {
         path: args.path,
         base64: args.base64,
         format: args.format,
     };
-    let (data, format) = media::load_audio_input(source)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let format = format
-        .context("base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)")?;
+    let (data, format) = media::load_audio_input(source).await?;
+    let format = format.ok_or_else(|| {
+        ErrorData::invalid_params(
+            "base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)",
+            None,
+        )
+    })?;
 
     Ok(audio_gen::TranscribeRequest {
         model: args.model,
@@ -338,10 +323,7 @@ async fn resolve_transcribe_request(
         response_format: args.response_format,
         timestamp_granularities: args.timestamp_granularities,
         temperature: args.temperature,
-        provider: args
-            .provider
-            .into_options()
-            .map_err(|e| anyhow::anyhow!("{}", e.message))?,
+        provider: args.provider.into_options()?,
     })
 }
 

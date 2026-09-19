@@ -304,7 +304,7 @@ impl OpenRouterServer {
             wait,
             inline_previews,
             move |ctx| async move {
-                match video_gen::run_job(&ctx.client, &req, &base, "inline").await {
+                match video_gen::run_job(&ctx.client, &req, &base).await {
                     Ok(summary) => {
                         ctx.stats
                             .record_video(

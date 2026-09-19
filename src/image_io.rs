@@ -1,5 +1,6 @@
-//! Image byte helpers: decode the `data:` URLs OpenRouter returns, map MIME
-//! types to file extensions, and read image dimensions.
+//! Image byte helpers: decode base64 and `data:` URLs (inputs, and the
+//! `b64_json` OpenRouter returns), map MIME types to file extensions, read
+//! image dimensions, and normalize inputs for upload.
 //!
 //! The output format is provider-chosen and not stable (the same model has
 //! returned both JPEG and PNG for identical requests), so the format is always

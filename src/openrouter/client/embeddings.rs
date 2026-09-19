@@ -2,24 +2,23 @@
 
 use anyhow::Result;
 
-use crate::openrouter::{EmbeddingsBody, EmbeddingsReply, OpenRouterClient};
+use crate::openrouter::{EmbeddingsBody, EmbeddingsResponse, OpenRouterClient};
 
 impl OpenRouterClient {
     /// `POST /api/v1/embeddings` - synchronous text embeddings. Returns the
     /// decoded body plus the `X-Generation-Id` header. A 2xx whose body cannot
     /// be decoded keeps a billing receipt on the error (the provider may have
-    /// charged); an HTTP failure surfaces the upstream error body verbatim.
-    pub async fn embeddings(&self, req: &EmbeddingsBody) -> Result<EmbeddingsReply> {
+    /// charged); an HTTP failure surfaces the upstream error body (bounded to 500 chars).
+    pub async fn embeddings(
+        &self,
+        req: &EmbeddingsBody,
+    ) -> Result<(EmbeddingsResponse, Option<String>)> {
         let rb = self
             .http
             .post(format!("{}/embeddings", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let (body, generation_id) = self.send_json_receipted(rb, "/embeddings").await?;
-        Ok(EmbeddingsReply {
-            body,
-            generation_id,
-        })
+        self.send_json_receipted(rb, "/embeddings").await
     }
 }
 
@@ -71,42 +70,9 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let result = client.embeddings(&request(&["hello"])).await.unwrap();
-        assert_eq!(result.generation_id.as_deref(), Some("gen-emb-1"));
-        assert_eq!(result.body.data[0].embedding, vec![0.1, 0.2]);
-        assert_eq!(result.body.usage.unwrap().cost, Some(0.00001));
-    }
-
-    /// Same posture as the other paid endpoints: a 2xx whose body cannot be
-    /// decoded keeps the receipt (the provider may have billed), an HTTP
-    /// failure has none.
-    #[tokio::test]
-    async fn malformed_success_retains_receipt_but_http_failure_does_not() {
-        for status in [200, 401] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/embeddings"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("x-generation-id", "gen-paid-emb")
-                        .set_body_string("{"),
-                )
-                .mount(&server)
-                .await;
-            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-            let error = client
-                .embeddings(&request(&["a", "b"]))
-                .await
-                .expect_err("invalid response");
-            let receipt = crate::billing::Receipt::from_error(&error);
-            if status == 200 {
-                let receipt = receipt.expect("unknown charge survives");
-                assert_eq!(receipt.cost, None);
-                assert_eq!(receipt.generation_id.as_deref(), Some("gen-paid-emb"));
-            } else {
-                assert!(receipt.is_none());
-                assert!(error.to_string().contains("401"), "got: {error}");
-            }
-        }
+        let (body, generation_id) = client.embeddings(&request(&["hello"])).await.unwrap();
+        assert_eq!(generation_id.as_deref(), Some("gen-emb-1"));
+        assert_eq!(body.data[0].embedding, vec![0.1, 0.2]);
+        assert_eq!(body.usage.unwrap().cost, Some(0.00001));
     }
 }

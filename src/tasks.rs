@@ -1,12 +1,13 @@
 //! In-memory async job registry shared by the MCP tools.
 //!
 //! Generation jobs run on background tasks; this registry tracks their status
-//! and result so `generate_image` can hand back a task id when a job outlives
-//! the fast-return window, and `get_result` can fetch it later. It is
-//! kind-agnostic (image today, video later) so the same registry is reused.
+//! and result so `generate_image` and `generate_video` can hand back a task id
+//! when a job outlives the fast-return window, and `get_result` can fetch it
+//! later. It is kind-agnostic (image and video) so the same registry is reused.
 //!
 //! Tasks are per server process and are lost on restart (stdio MCP servers are
-//! per client session); any images already written stay on disk regardless.
+//! per client session); any images or clips already written stay on disk
+//! regardless.
 
 use std::collections::HashMap;
 use std::future::Future;

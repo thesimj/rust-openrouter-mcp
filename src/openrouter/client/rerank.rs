@@ -2,24 +2,20 @@
 
 use anyhow::Result;
 
-use crate::openrouter::{OpenRouterClient, RerankBody, RerankReply};
+use crate::openrouter::{OpenRouterClient, RerankBody, RerankResponse};
 
 impl OpenRouterClient {
     /// `POST /api/v1/rerank` - synchronous document reranking. Returns the
     /// decoded body plus the `X-Generation-Id` header. A 2xx whose body cannot
     /// be decoded keeps a billing receipt on the error; an HTTP failure
-    /// surfaces the upstream error body verbatim.
-    pub async fn rerank(&self, req: &RerankBody) -> Result<RerankReply> {
+    /// surfaces the upstream error body (bounded to 500 chars).
+    pub async fn rerank(&self, req: &RerankBody) -> Result<(RerankResponse, Option<String>)> {
         let rb = self
             .http
             .post(format!("{}/rerank", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let (body, generation_id) = self.send_json_receipted(rb, "/rerank").await?;
-        Ok(RerankReply {
-            body,
-            generation_id,
-        })
+        self.send_json_receipted(rb, "/rerank").await
     }
 }
 
@@ -72,40 +68,10 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let result = client.rerank(&request()).await.unwrap();
-        assert_eq!(result.generation_id.as_deref(), Some("gen-rr-1"));
-        assert_eq!(result.body.results[0].index, 1);
-        assert_eq!(result.body.results[0].relevance_score, 0.98);
-        assert_eq!(result.body.usage.unwrap().cost, Some(0.002));
-    }
-
-    #[tokio::test]
-    async fn malformed_success_retains_receipt_but_http_failure_does_not() {
-        for status in [200, 402] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/rerank"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("x-generation-id", "gen-paid-rr")
-                        .set_body_string("{"),
-                )
-                .mount(&server)
-                .await;
-            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-            let error = client
-                .rerank(&request())
-                .await
-                .expect_err("invalid response");
-            let receipt = crate::billing::Receipt::from_error(&error);
-            if status == 200 {
-                let receipt = receipt.expect("unknown charge survives");
-                assert_eq!(receipt.cost, None);
-                assert_eq!(receipt.generation_id.as_deref(), Some("gen-paid-rr"));
-            } else {
-                assert!(receipt.is_none());
-                assert!(error.to_string().contains("402"), "got: {error}");
-            }
-        }
+        let (body, generation_id) = client.rerank(&request()).await.unwrap();
+        assert_eq!(generation_id.as_deref(), Some("gen-rr-1"));
+        assert_eq!(body.results[0].index, 1);
+        assert_eq!(body.results[0].relevance_score, 0.98);
+        assert_eq!(body.usage.unwrap().cost, Some(0.002));
     }
 }

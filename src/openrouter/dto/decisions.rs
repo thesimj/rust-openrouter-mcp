@@ -27,7 +27,7 @@ pub struct DecisionsBody {
     /// Questions keyed by the caller's own names; answers come back under
     /// the same keys. The model never sees the keys.
     pub questions: BTreeMap<String, DecisionQuestion>,
-    /// Routing-only block, the same subset `/embeddings` and `/rerank` take.
+    /// Routing-only block, the same subset chat, `/embeddings` and `/rerank` take.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
 }
@@ -113,14 +113,6 @@ pub struct DecisionsUsage {
     pub output_tokens: Option<u64>,
     /// USD charge for the request, when OpenRouter reports it inline.
     pub cost: Option<f64>,
-}
-
-/// A decoded `/api/alpha/decisions` reply plus its generation id (the
-/// `X-Generation-Id` header, else the body `id`).
-#[derive(Debug)]
-pub struct DecisionsReply {
-    pub body: DecisionsResponse,
-    pub generation_id: Option<String>,
 }
 
 #[cfg(test)]

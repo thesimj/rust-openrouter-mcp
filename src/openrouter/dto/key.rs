@@ -11,7 +11,7 @@ pub struct KeyInfoResponse {
 /// optional/defaulted: the upstream schema evolves, and `limit`/`limit_remaining`
 /// are `null` for unlimited keys. Fields OpenRouter returns but we don't surface
 /// (e.g. `limit_reset`, `expires_at`, BYOK period breakdowns) are ignored.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct KeyInfo {
     /// Human-readable label, usually a masked key (e.g. "sk-or-v1-813...ca1").
     #[serde(default)]
@@ -56,7 +56,7 @@ pub struct KeyInfo {
 
 /// Legacy per-key rate limit. `requests` is signed because OpenRouter returns
 /// `-1` to mean "no limit"; the field is deprecated and safe to ignore.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RateLimit {
     #[serde(default)]
     pub requests: Option<i64>,
@@ -74,7 +74,7 @@ pub struct CreditsResponse {
 /// account's keys: `total_credits` is everything purchased/granted and
 /// `total_usage` is everything spent. `remaining` is derived (`total_credits -
 /// total_usage`) on the way out so callers don't have to do the subtraction.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Credits {
     /// Total credits ever purchased or granted to the account (USD).
     #[serde(default)]

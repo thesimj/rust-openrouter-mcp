@@ -4,7 +4,8 @@
 //!
 //! Unlike video generation (async job API), both return in one fast call - so
 //! these mirror the synchronous `describe_image` path (no task registry).
-//! Speech saves a file plus a sidecar manifest; transcription just returns text.
+//! Speech saves a file plus a sidecar manifest; transcription returns the text
+//! (or the whole `verbose_json` object when that format was requested).
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +56,8 @@ pub struct TranscribeRequest {
     pub model: String,
     /// Raw base64 audio bytes (no `data:` prefix - upstream rejects those).
     pub data: String,
-    /// Container format: one of [`TRANSCRIBE_FORMATS`].
+    /// Container format: one of [`TRANSCRIBE_FORMATS`], or a data-URL subtype
+    /// alias (`mpeg`, `x-wav`, ...) that [`validate_inline_audio`] normalizes.
     pub format: String,
     /// Optional ISO-639-1 language hint (e.g. "en").
     pub language: Option<String>,
@@ -348,33 +350,32 @@ fn extension_for(mime: &str, response_format: &str) -> &'static str {
     }
 }
 
+/// The `response_format` that goes on the wire: trimmed and lowercased,
+/// defaulting to `mp3` so the file extension is deterministic. Blank counts as
+/// absent, so a literal `"  "` is never sent. Shared with the MCP tool so its
+/// filename token matches what is sent.
+pub(crate) fn normalize_response_format(raw: Option<&str>) -> String {
+    crate::music_gen::normalize_format(raw).unwrap_or_else(|| "mp3".to_string())
+}
+
+/// The `voice` that goes on the wire and into the manifest: a blank voice is
+/// "no voice" (voice-cloning models take none), so it is omitted rather than
+/// sent as `"  "`. Shared with the MCP tool for the same reason.
+pub(crate) fn normalize_voice(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Run a TTS job: synthesize the speech, save the bytes (extension from the
 /// content-type / requested format), and write the sidecar manifest.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &SpeechGenRequest,
     output: &Path,
-    input_source: &str,
 ) -> Result<AudioJobResult> {
-    // Default response_format to mp3 so the extension is deterministic.
-    // Treat blank values as absent instead of sending a literal "  " (like the
-    // transcribe_audio response_format/timestamp_granularities blank-filter).
-    let response_format = req
-        .response_format
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "mp3".to_string());
-
-    // A blank voice is "no voice" (voice-cloning models take none), so it is
-    // omitted from the wire and the manifest rather than sent as "  ".
-    let voice = req
-        .voice
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let response_format = normalize_response_format(req.response_format.as_deref());
+    let voice = normalize_voice(req.voice.as_deref());
     let input_references = req
         .voice_reference
         .clone()
@@ -410,7 +411,7 @@ pub async fn run_job(
         endpoint: "/api/v1/audio/speech",
         model: req.model.clone(),
         input: req.input.clone(),
-        input_source: input_source.to_string(),
+        input_source: crate::manifest::PROMPT_SOURCE,
         voice: voice.clone(),
         voice_reference: req.voice_reference.is_some(),
         response_format: response_format.clone(),
@@ -492,7 +493,7 @@ mod tests {
         };
         // Pass an output with the "wrong" extension; the saved file is corrected.
         let base = std::env::temp_dir().join("openrouter-mcp-audio-test/speech.wav");
-        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        let result = run_job(&client, &req, &base).await.unwrap();
 
         assert_eq!(result.model, "openai/gpt-4o-mini-tts");
         assert_eq!(result.audio.mime, "audio/mpeg");
@@ -531,7 +532,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-blank-format/speech.mp3");
-        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        let result = run_job(&client, &req, &base).await.unwrap();
         assert_eq!(result.audio.response_format, "mp3");
     }
 
@@ -578,7 +579,7 @@ mod tests {
             provider: Some(ProviderOptions { options }),
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-ref/speech.mp3");
-        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        let result = run_job(&client, &req, &base).await.unwrap();
         assert_eq!(result.audio.voice, None);
 
         let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
@@ -623,7 +624,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-novoice/speech.mp3");
-        let result = run_job(&client, &req, &base, "test").await.unwrap();
+        let result = run_job(&client, &req, &base).await.unwrap();
         assert_eq!(result.audio.voice, None);
 
         let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
@@ -712,7 +713,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-err/speech.mp3");
-        let err = match run_job(&client, &req, &base, "test").await {
+        let err = match run_job(&client, &req, &base).await {
             Err(e) => e,
             Ok(_) => panic!("provider error should propagate"),
         };

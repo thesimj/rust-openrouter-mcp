@@ -87,24 +87,8 @@ pub struct ModelsResponse {
     pub links: Option<ModelsLinks>,
 }
 
-impl ModelsResponse {
-    /// One-line pagination summary for a caller paging with `limit`/`offset`:
-    /// the server's `total_count` and, when there is another page, its
-    /// `links.next` URL. `None` when the response carries no `total_count`.
-    /// Used by the `list_models` tool header.
-    pub fn pagination_note(&self) -> Option<String> {
-        let total = self.total_count?;
-        let mut note =
-            format!("server total_count: {total} models match this query before limit/offset");
-        if let Some(next) = self.links.as_ref().and_then(|l| l.next.as_deref()) {
-            note.push_str(&format!("; next page: {next}"));
-        }
-        Some(note)
-    }
-}
-
 /// The `links` block of a paginated `/models` response.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ModelsLinks {
     /// Relative URL of the next page (e.g. `/api/v1/models?offset=500&limit=500`).
     #[serde(default)]
@@ -146,23 +130,6 @@ pub struct Model {
     /// absent for non-speech models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_voices: Option<serde_json::Value>,
-}
-
-impl Model {
-    /// Case-insensitive match of `needle` against the model id, name, and
-    /// description. Used by the MCP `search` filter.
-    pub fn matches_search(&self, needle: &str) -> bool {
-        let needle = needle.to_lowercase();
-        self.id.to_lowercase().contains(&needle)
-            || self
-                .name
-                .as_deref()
-                .is_some_and(|n| n.to_lowercase().contains(&needle))
-            || self
-                .description
-                .as_deref()
-                .is_some_and(|d| d.to_lowercase().contains(&needle))
-    }
 }
 
 /// Capability descriptor: which input/output modalities a model supports.
@@ -229,24 +196,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matches_search_checks_id_name_and_description_case_insensitively() {
-        let model = Model {
-            id: "openai/gpt-audio-mini".to_string(),
-            name: Some("OpenAI: GPT Audio Mini".to_string()),
-            description: Some("A cost-efficient audio model.".to_string()),
-            context_length: None,
-            architecture: None,
-            pricing: None,
-            ..Default::default()
-        };
-
-        assert!(model.matches_search("OPENAI"));
-        assert!(model.matches_search("audio mini"));
-        assert!(model.matches_search("cost-efficient"));
-        assert!(!model.matches_search("anthropic"));
-    }
-
-    #[test]
     fn models_response_decodes_missing_optional_fields() {
         let json = r#"{
           "data": [
@@ -303,36 +252,6 @@ mod tests {
         let undated = serde_json::to_value(&parsed.data[1]).unwrap();
         assert!(undated.get("expiration_date").is_none());
         assert!(undated.get("knowledge_cutoff").is_none());
-    }
-
-    /// The one-line pagination note in the MCP header:
-    /// nothing without `total_count`, the count alone on the last page, and
-    /// the next-page link when the server says there is more.
-    #[test]
-    fn pagination_note_reports_total_count_and_next_link() {
-        let none: ModelsResponse = serde_json::from_str(r#"{"data": []}"#).unwrap();
-        assert!(none.pagination_note().is_none());
-
-        let last: ModelsResponse =
-            serde_json::from_str(r#"{"data": [], "total_count": 546, "links": {"next": null}}"#)
-                .unwrap();
-        assert_eq!(
-            last.pagination_note().as_deref(),
-            Some("server total_count: 546 models match this query before limit/offset")
-        );
-
-        let more: ModelsResponse = serde_json::from_str(
-            r#"{"data": [], "total_count": 546,
-                "links": {"next": "/api/v1/models?offset=20&limit=20"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            more.pagination_note().as_deref(),
-            Some(
-                "server total_count: 546 models match this query before limit/offset; \
-                 next page: /api/v1/models?offset=20&limit=20"
-            )
-        );
     }
 
     #[test]

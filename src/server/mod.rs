@@ -4,6 +4,8 @@
 //! contributes a `#[tool_router]`-generated router that [`OpenRouterServer::new`]
 //! combines into the single router the [`ServerHandler`] dispatches through.
 
+use std::collections::HashMap;
+
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
@@ -16,11 +18,8 @@ use crate::openrouter::OpenRouterClient;
 use crate::stats::UsageStats;
 use crate::tasks::TaskRegistry;
 
-use caps::ModelCapsCache;
-
 mod account;
 pub(crate) mod audio;
-mod caps;
 pub(crate) mod chat;
 pub(crate) mod decisions;
 mod embeddings;
@@ -44,9 +43,11 @@ pub struct OpenRouterServer {
     pub(crate) tasks: TaskRegistry,
     work: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) stats: UsageStats,
-    /// Cache of per-model input modalities, used to gate `chat_completion` image
-    /// inputs against what the target model supports.
-    pub(crate) model_caps: ModelCapsCache,
+    /// Per-model input modalities (e.g. `["text", "image"]`) looked up once per
+    /// process, so `chat_completion` can reject an image, file, audio or video
+    /// sent to a model that does not take it before any network call. See
+    /// `chat::ensure_input_modality` for the lookup rules.
+    pub(crate) model_caps: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -66,7 +67,7 @@ impl OpenRouterServer {
             tasks: TaskRegistry::new(),
             work: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             stats: UsageStats::new(),
-            model_caps: ModelCapsCache::new(),
+            model_caps: Default::default(),
             tool_router: Self::models_router()
                 + Self::image_router()
                 + Self::video_router()
@@ -92,32 +93,23 @@ impl ServerHandler for OpenRouterServer {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "MCP server for OpenRouter. Use `list_models` to discover models, \
-                their capabilities, and pricing, then `generate_image` to create \
-                images, `generate_video` to create videos (slow, async: it returns \
-                status \"pending\" with a task_id - poll `get_result` until \
-                \"completed\"), `generate_audio` for text-to-speech, \
-                `generate_music` for music with an audio-output model such as \
-                google/lyria-3-clip-preview (find them with list_models \
-                output_modalities=\"audio\"), and `transcribe_audio` for speech-to-text \
-                (all three synchronous). `chat_completion` sends a prompt (with \
-                optional images, files, audio, video) to any chat model; `embed_text` \
-                returns embedding vectors and `rerank_documents` ranks documents \
-                against a query. `make_decisions` asks a decisions model (TypeSafe \
-                Jev, typesafe/jev-1.13 - find them with list_models \
-                output_modalities=\"decisions\") typed noul/choice/score questions \
-                about a state and returns probabilities; these models are served on \
-                /api/alpha/decisions and cannot be used with chat_completion. Every \
-                tool takes a `provider` object: routing \
-                (order/only/ignore/allow_fallbacks/sort) on chat, images, embeddings, \
-                rerank and decisions, and per-provider passthrough `provider.options` keyed by \
-                provider slug on images, speech, transcription and video - \
-                `describe_model` lists each endpoint's allowed_passthrough_parameters, \
-                so check it before passing options. Every result carries a \
+                their capabilities, and pricing (`describe_model` for one model in \
+                full). Then: `generate_image` for images and `generate_video` for \
+                videos - both may return status \"pending\" with a task_id; poll \
+                `get_result` until \"completed\". `generate_audio` (text-to-speech), \
+                `generate_music` (audio-output models such as google/lyria-3-*) and \
+                `transcribe_audio` (speech-to-text) are synchronous. \
+                `chat_completion` sends a prompt (with optional images, files, audio, \
+                video) to any chat model; `describe_image` is the vision shortcut. \
+                `embed_text` returns vectors, `rerank_documents` ranks documents \
+                against a query, and `make_decisions` asks a decisions model (TypeSafe \
+                Jev) typed questions about a state - those models cannot be used with \
+                chat_completion. Every generation tool takes a `provider` object; each \
+                tool's description says whether it carries routing keys, per-provider \
+                `options`, or both. Every generation result (or its manifest) carries a \
                 generation_id; `get_generation` returns OpenRouter's stored cost and \
-                latency record for it. \
-                If `generate_image` or `generate_video` returns status \"pending\" with \
-                a task_id, poll `get_result` until it is \"completed\". \
-                `get_usage_stats` reports this process's spend and counts.",
+                latency record for it. `get_account` shows the key's credits and \
+                `get_usage_stats` this process's spend and counts.",
             );
         // rmcp's default `Implementation::from_build_env()` expands
         // `env!("CARGO_CRATE_NAME")` inside the rmcp crate, so it reports the SDK

@@ -20,16 +20,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::decision_gen::{self, DecideRequest};
-use crate::openrouter::{DecisionQuestion, NoulCriteria};
+use crate::decision_gen;
+use crate::openrouter::{DecisionQuestion, DecisionsBody, NoulCriteria};
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::json_text_result;
 use crate::server::schema::{de_lenient, scalarize_nullable};
 
 use super::OpenRouterServer;
 
-/// Accepted question `type` values, in the order the description lists them.
-const QUESTION_TYPES: [&str; 3] = ["noul", "choice", "score"];
 /// The one shape OpenRouter accepts for `noul` criteria.
 const NOUL_CRITERIA_SHAPE: &str =
     "noul criteria, when given, must be an object with exactly the keys \"true\" and \"false\"";
@@ -78,13 +76,6 @@ pub(crate) struct Criteria(pub Value);
 impl Default for Criteria {
     fn default() -> Self {
         Criteria(Value::Null)
-    }
-}
-
-impl Criteria {
-    #[cfg(test)]
-    fn is_absent(&self) -> bool {
-        self.0.is_null()
     }
 }
 
@@ -148,7 +139,7 @@ pub(crate) struct QuestionArgs {
 impl QuestionArgs {
     /// Check the vocabulary and the criteria shape for this question type,
     /// naming the question in every error. Content checks (blank text, level
-    /// counts) run later in [`DecideRequest::validate`].
+    /// counts) run later in [`decision_gen::validate`].
     fn into_question(self, name: &str) -> Result<DecisionQuestion, ErrorData> {
         let invalid =
             |msg: String| ErrorData::invalid_params(format!("questions[{name:?}]: {msg}"), None);
@@ -199,12 +190,7 @@ impl QuestionArgs {
                 )),
             },
             other => Err(invalid(format!(
-                "type must be one of {} (got {other:?})",
-                QUESTION_TYPES
-                    .iter()
-                    .map(|t| format!("{t:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "type must be one of \"noul\", \"choice\", \"score\" (got {other:?})"
             ))),
         }
     }
@@ -288,18 +274,18 @@ impl OpenRouterServer {
             .into_iter()
             .map(|(name, q)| q.into_question(&name).map(|q| (name, q)))
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let req = DecideRequest {
+        let body = DecisionsBody {
             model: args.model,
             state: args.state.0,
             questions,
             provider: args.provider.into_routing()?,
         };
-        req.validate()
+        decision_gen::validate(&body)
             .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
 
-        match decision_gen::decide(&self.client, &req).await {
+        match decision_gen::decide(&self.client, &body).await {
             Ok(result) => {
-                self.stats.record_text(&model, true, result.cost).await;
+                self.stats.record_text(&model, result.cost).await;
                 json_text_result(&result.to_json())
             }
             Err(e) => {
@@ -585,11 +571,11 @@ mod tests {
                 "type": "noul", "instructions": "x", "criteria": criteria
             }))
             .unwrap();
-            assert!(q.criteria.is_absent());
+            assert!(q.criteria.0.is_null());
         }
         let q: QuestionArgs =
             serde_json::from_value(json!({"type": "noul", "instructions": "x"})).unwrap();
-        assert!(q.criteria.is_absent());
+        assert!(q.criteria.0.is_null());
     }
 
     /// An upstream failure is an internal error that counts as a failed request.

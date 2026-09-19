@@ -65,7 +65,8 @@ pub struct MusicJobResult {
 }
 
 /// Trim + lowercase a requested format; blank counts as absent, so a literal
-/// `"  "` never reaches the wire (same rule as `audio_gen`). Shared with the
+/// `"  "` never reaches the wire; `audio_gen` builds its speech format on it too.
+/// Shared with the
 /// MCP tool so its filename token matches what is sent.
 pub(crate) fn normalize_format(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
@@ -143,7 +144,6 @@ pub async fn run_job(
     client: &OpenRouterClient,
     req: &MusicGenRequest,
     output: &Path,
-    prompt_source: &str,
 ) -> Result<MusicJobResult> {
     let format = normalize_format(req.format.as_deref());
     let body = ChatRequest {
@@ -199,7 +199,7 @@ pub async fn run_job(
         endpoint: "/api/v1/chat/completions",
         model: req.model.clone(),
         prompt: req.prompt.clone(),
-        prompt_source: prompt_source.to_string(),
+        prompt_source: crate::manifest::PROMPT_SOURCE,
         format: format.clone(),
         seed: req.seed,
         provider: req.provider.clone(),
@@ -360,9 +360,7 @@ mod tests {
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         // The caller's extension is a guess; the bytes decide.
         let base = std::env::temp_dir().join("openrouter-mcp-music-test/track.wav");
-        let result = run_job(&client, &request(None), &base, "test")
-            .await
-            .unwrap();
+        let result = run_job(&client, &request(None), &base).await.unwrap();
 
         assert_eq!(result.model, "google/lyria-3-clip-preview");
         assert_eq!(result.music.mime, "audio/mpeg");
@@ -407,7 +405,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let base = std::env::temp_dir().join("openrouter-mcp-music-wav/track.mp3");
-        let result = run_job(&client, &request(Some(" WAV ")), &base, "test")
+        let result = run_job(&client, &request(Some(" WAV ")), &base)
             .await
             .unwrap();
         assert_eq!(result.music.mime, "audio/wav");
@@ -438,7 +436,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let base = std::env::temp_dir().join("openrouter-mcp-music-none/track.mp3");
-        let error = run_job(&client, &request(None), &base, "test")
+        let error = run_job(&client, &request(None), &base)
             .await
             .expect_err("no audio is an error");
         let message = format!("{error:#}");
@@ -471,9 +469,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let base = std::env::temp_dir().join("openrouter-mcp-music-cut/track.mp3");
-        let result = run_job(&client, &request(None), &base, "test")
-            .await
-            .unwrap();
+        let result = run_job(&client, &request(None), &base).await.unwrap();
         assert_eq!(result.music.path.extension().unwrap(), "mp3");
         assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
         assert!(
@@ -497,7 +493,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let base = std::env::temp_dir().join("openrouter-mcp-music-err/track.mp3");
-        let error = run_job(&client, &request(None), &base, "test")
+        let error = run_job(&client, &request(None), &base)
             .await
             .expect_err("provider error should propagate");
         assert!(error.to_string().contains("modalities not supported"));

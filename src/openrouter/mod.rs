@@ -106,6 +106,14 @@ impl BoundedResponse {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// [`json`](Self::json) with the one decode-failure message every JSON
+    /// endpoint reports (tests pin its prefix), naming the endpoint by `label`.
+    async fn decode<T: serde::de::DeserializeOwned>(self, label: &str) -> Result<T> {
+        self.json()
+            .await
+            .with_context(|| format!("failed to decode OpenRouter {label} response"))
+    }
+
     async fn bytes(self) -> Result<Vec<u8>> {
         self.read(MAX_MEDIA_BYTES).await
     }
@@ -188,7 +196,7 @@ fn build_http_client() -> Result<reqwest::Client> {
     // that accepts the connection and then stalls hangs the MCP tool call
     // forever, and a stalled background job parks a `Pending` entry that
     // `TaskRegistry::prune_terminal` never evicts - so the registry's cap stops
-    // holding. Note this client is not the only one: `server::image::fetch_url`
+    // holding. Note this client is not the only one: `server::media::fetch_url`
     // builds its own (pinned to a validated IP) and sets its own bounds.
     reqwest::Client::builder()
         .tls_backend_rustls()
@@ -244,6 +252,14 @@ pub struct OpenRouterClient {
     requests: Arc<Semaphore>,
 }
 
+/// Unwrap OpenRouter's `{"data": ...}` envelope when present; a body without
+/// it is returned as is.
+pub(in crate::openrouter) fn unwrap_data(mut body: serde_json::Value) -> serde_json::Value {
+    body.get_mut("data")
+        .map(serde_json::Value::take)
+        .unwrap_or(body)
+}
+
 /// Extract the `X-Generation-Id` response header when present.
 pub(in crate::openrouter) fn generation_id(resp: &BoundedResponse) -> Option<String> {
     resp.headers()
@@ -258,7 +274,12 @@ pub(in crate::openrouter) fn content_type(resp: &BoundedResponse, default: &str)
     resp.headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .map(|s| {
+            s.split_once(';')
+                .map_or(s, |(mime, _)| mime)
+                .trim()
+                .to_string()
+        })
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -350,11 +371,7 @@ impl OpenRouterClient {
         rb: reqwest::RequestBuilder,
         label: &str,
     ) -> Result<T> {
-        self.send_checked(rb, label)
-            .await?
-            .json()
-            .await
-            .with_context(|| format!("failed to decode OpenRouter {label} response"))
+        self.send_checked(rb, label).await?.decode(label).await
     }
 
     /// [`send_json`](Self::send_json) for the endpoints whose 2xx means the
@@ -374,45 +391,11 @@ impl OpenRouterClient {
             generation_id: generation_id.clone(),
         };
         let body = response
-            .json()
+            .decode(label)
             .await
-            .with_context(|| format!("failed to decode OpenRouter {label} response"))
             .map_err(|error| receipt.attach(error))?;
         Ok((body, generation_id))
     }
-}
-
-/// Default number of models returned by list queries unless `all` is requested.
-pub const DEFAULT_MODEL_LIMIT: usize = 20;
-
-/// Result of applying the local `search` filter and the default result cap.
-/// `models` is what the caller should display; `total` is how many matched
-/// before truncation, so callers can render a "showing X of Y" note.
-pub struct FilteredModels {
-    pub models: Vec<Model>,
-    pub total: usize,
-}
-
-impl FilteredModels {
-    /// How many matching models the default cap omitted (0 when `all` was set
-    /// or nothing was truncated).
-    pub fn truncated(&self) -> usize {
-        self.total - self.models.len()
-    }
-}
-
-/// Apply the local case-insensitive `search` filter (across id/name/description)
-/// and, unless `all`, cap the result at [`DEFAULT_MODEL_LIMIT`]. Returns the
-/// models to display plus the pre-truncation match count for `list_models`.
-pub fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) -> FilteredModels {
-    if let Some(needle) = search {
-        models.retain(|m| m.matches_search(needle));
-    }
-    let total = models.len();
-    if !all {
-        models.truncate(DEFAULT_MODEL_LIMIT);
-    }
-    FilteredModels { models, total }
 }
 
 #[cfg(test)]
@@ -571,6 +554,51 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// The one rule every paid JSON endpoint (chat, images, embeddings, rerank,
+    /// decisions, transcription, video submit) inherits: a 2xx whose body
+    /// cannot be decoded keeps a receipt carrying the `X-Generation-Id` header,
+    /// so the charge can still be accounted; an HTTP failure - no charge - has
+    /// no receipt, and its message names the endpoint and the status.
+    #[tokio::test]
+    async fn receipted_decode_keeps_receipt_on_malformed_2xx_but_not_on_http_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for status in [200, 402] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("x-generation-id", "gen-paid")
+                        .set_body_string("{"),
+                )
+                .mount(&server)
+                .await;
+            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+            let error = client
+                .send_json_receipted::<serde_json::Value>(client.http.post(server.uri()), "/paid")
+                .await
+                .expect_err("invalid response");
+            let receipt = crate::billing::Receipt::from_error(&error);
+            if status == 200 {
+                let receipt = receipt.expect("unknown charge survives");
+                assert_eq!(receipt.cost, None);
+                assert_eq!(receipt.generation_id.as_deref(), Some("gen-paid"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("failed to decode OpenRouter /paid response"),
+                    "got: {error}"
+                );
+            } else {
+                assert!(receipt.is_none());
+                assert!(
+                    error.to_string().contains("/paid returned 402"),
+                    "got: {error}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn admission_is_shared_and_held_until_response_body_is_dropped() {
         use wiremock::matchers::method;
@@ -598,67 +626,6 @@ mod tests {
         drop(first);
         assert_eq!(second.await.unwrap()["ok"], true);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
-    /// Build `n` placeholder models with ids `model-0`, `model-1`, ... so list
-    /// filtering/truncation can be exercised without hitting the network.
-    fn models(n: usize) -> Vec<Model> {
-        (0..n)
-            .map(|i| Model {
-                id: format!("model-{i}"),
-                name: None,
-                description: None,
-                context_length: None,
-                architecture: None,
-                pricing: None,
-                ..Default::default()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn apply_filters_caps_at_default_limit_and_reports_total() {
-        let filtered = apply_filters(models(25), None, false);
-        assert_eq!(filtered.models.len(), DEFAULT_MODEL_LIMIT);
-        assert_eq!(filtered.total, 25);
-        assert_eq!(filtered.truncated(), 5);
-    }
-
-    #[test]
-    fn apply_filters_all_returns_everything_with_no_truncation() {
-        let filtered = apply_filters(models(25), None, true);
-        assert_eq!(filtered.models.len(), 25);
-        assert_eq!(filtered.total, 25);
-        assert_eq!(filtered.truncated(), 0);
-    }
-
-    #[test]
-    fn apply_filters_below_limit_is_not_truncated() {
-        let filtered = apply_filters(models(3), None, false);
-        assert_eq!(filtered.models.len(), 3);
-        assert_eq!(filtered.total, 3);
-        assert_eq!(filtered.truncated(), 0);
-    }
-
-    #[test]
-    fn apply_filters_search_runs_before_truncation() {
-        // 30 models; only "model-1", "model-1x", "model-1y"... match "model-1".
-        let mut all = models(30);
-        all[1].name = Some("special".to_string());
-        // Search narrows to ids containing "model-2" => model-2, model-20..29 = 11 matches.
-        let filtered = apply_filters(all, Some("model-2"), false);
-        assert_eq!(filtered.total, 11);
-        assert_eq!(filtered.models.len(), 11); // under the cap, so all kept
-        assert!(filtered.models.iter().all(|m| m.id.contains("model-2")));
-    }
-
-    #[test]
-    fn apply_filters_search_then_cap_reports_pre_truncation_total() {
-        // "model-" matches all 25; search keeps 25, cap trims to 20.
-        let filtered = apply_filters(models(25), Some("MODEL-"), false);
-        assert_eq!(filtered.total, 25);
-        assert_eq!(filtered.models.len(), DEFAULT_MODEL_LIMIT);
-        assert_eq!(filtered.truncated(), 5);
     }
 }
 

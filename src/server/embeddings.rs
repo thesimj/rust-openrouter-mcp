@@ -8,8 +8,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::embed_gen::{self, EmbedRequest, RerankRequest};
-use crate::openrouter::HttpFailure;
+use crate::embed_gen;
+use crate::openrouter::{EmbeddingsBody, EmbeddingsInput, HttpFailure, RerankBody};
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::json_text_result;
 use crate::server::schema::{de_lenient, de_opt_uint, scalarize_nullable};
@@ -108,19 +108,19 @@ impl OpenRouterServer {
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
         let model = args.model.clone();
-        let req = EmbedRequest {
+        embed_gen::check_texts(&args.input, "input")
+            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        let body = EmbeddingsBody {
             model: args.model,
-            input: args.input,
+            input: EmbeddingsInput::from_texts(args.input),
             dimensions: args.dimensions,
             input_type: args.input_type.filter(|s| !s.trim().is_empty()),
             provider: args.provider.into_routing()?,
         };
-        req.validate()
-            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
 
-        match embed_gen::embed(&self.client, &req).await {
+        match embed_gen::embed(&self.client, &body).await {
             Ok(result) => {
-                self.stats.record_text(&model, true, result.cost).await;
+                self.stats.record_text(&model, result.cost).await;
                 json_text_result(&result.to_json())
             }
             Err(e) => {
@@ -154,19 +154,19 @@ impl OpenRouterServer {
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
         let model = args.model.clone();
-        let req = RerankRequest {
+        let body = RerankBody {
             model: args.model,
             query: args.query,
             documents: args.documents,
             top_n: args.top_n,
             provider: args.provider.into_routing()?,
         };
-        req.validate()
+        embed_gen::validate_rerank(&body)
             .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
 
-        match embed_gen::rerank(&self.client, &req).await {
+        match embed_gen::rerank(&self.client, &body).await {
             Ok(result) => {
-                self.stats.record_text(&model, true, result.cost).await;
+                self.stats.record_text(&model, result.cost).await;
                 json_text_result(&result.to_json())
             }
             Err(e) => {

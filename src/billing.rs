@@ -1,9 +1,7 @@
 //! Billing survives local decoding and file-delivery failures.
 
-use serde::Serialize;
-
 /// An upstream generation response was received; its cost may be unknown.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Receipt {
     pub cost: Option<f64>,
     pub generation_id: Option<String>,

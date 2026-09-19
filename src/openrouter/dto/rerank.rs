@@ -52,13 +52,6 @@ pub struct RerankUsage {
     pub total_tokens: Option<u64>,
 }
 
-/// A decoded `/rerank` reply plus the `X-Generation-Id` header.
-#[derive(Debug)]
-pub struct RerankReply {
-    pub body: RerankResponse,
-    pub generation_id: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

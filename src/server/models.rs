@@ -1,4 +1,5 @@
-//! The `list_models` tool and its argument struct.
+//! The `list_models` and `describe_model` tools, their argument structs, the
+//! local search/cap/pagination presentation, and the per-model enrichment.
 
 use rmcp::{
     ErrorData,
@@ -10,11 +11,67 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::openrouter::{ModelsQuery, apply_filters};
+use crate::openrouter::{Model, ModelsQuery, ModelsResponse};
 use crate::pricing::{attach_pricing_human, humanize_pricing, models_to_json};
+use crate::server::result::json_text_result;
 use crate::server::schema::{de_bool, de_opt_bool, de_opt_f64, de_opt_uint, scalarize_nullable};
 
 use super::OpenRouterServer;
+
+/// Default number of models `list_models` shows unless `all` is requested.
+const DEFAULT_MODEL_LIMIT: usize = 20;
+
+/// Result of applying the local `search` filter and the default result cap.
+/// `models` is what the tool displays; `total` is how many matched before
+/// truncation, for the "showing X of Y" footer.
+struct FilteredModels {
+    models: Vec<Model>,
+    total: usize,
+}
+
+impl FilteredModels {
+    /// How many matching models the default cap omitted (0 when `all` was set
+    /// or nothing was truncated).
+    fn truncated(&self) -> usize {
+        self.total - self.models.len()
+    }
+}
+
+/// Apply the local case-insensitive `search` filter (across id/name/description)
+/// and, unless `all`, cap the result at [`DEFAULT_MODEL_LIMIT`].
+fn apply_filters(mut models: Vec<Model>, search: Option<&str>, all: bool) -> FilteredModels {
+    if let Some(needle) = search {
+        models.retain(|m| matches_search(m, needle));
+    }
+    let total = models.len();
+    if !all {
+        models.truncate(DEFAULT_MODEL_LIMIT);
+    }
+    FilteredModels { models, total }
+}
+
+/// Case-insensitive match of `needle` against a model's id, name and
+/// description - the tool's `search` argument.
+fn matches_search(model: &Model, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    let has = |s: Option<&str>| s.is_some_and(|s| s.to_lowercase().contains(&needle));
+    model.id.to_lowercase().contains(&needle)
+        || has(model.name.as_deref())
+        || has(model.description.as_deref())
+}
+
+/// One-line pagination summary for a caller paging with `limit`/`offset`: the
+/// server's `total_count` and, when there is another page, its `links.next`
+/// URL. `None` when the response carries no `total_count`.
+fn pagination_note(page: &ModelsResponse) -> Option<String> {
+    let total = page.total_count?;
+    let mut note =
+        format!("server total_count: {total} models match this query before limit/offset");
+    if let Some(next) = page.links.as_ref().and_then(|l| l.next.as_deref()) {
+        note.push_str(&format!("; next page: {next}"));
+    }
+    Some(note)
+}
 
 /// Arguments for the `list_models` tool. These map to OpenRouter's server-side
 /// `GET /api/v1/models` query parameters, so filtering happens at the API.
@@ -218,8 +275,14 @@ impl OpenRouterServer {
         &self,
         Parameters(mut args): Parameters<ListModelsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Local post-processing knobs; everything else is the wire query.
-        let (search, all) = (args.search.take(), args.all);
+        // Local post-processing knobs; everything else is the wire query. A
+        // blank search means no filter (the repo-wide rule).
+        let search = args
+            .search
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let all = args.all;
         let query = args.into_query();
 
         let page = self
@@ -227,7 +290,7 @@ impl OpenRouterServer {
             .list_models_page(&query)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let pagination = page.pagination_note();
+        let pagination = pagination_note(&page);
 
         let filtered = apply_filters(page.data, search.as_deref(), all);
 
@@ -290,11 +353,7 @@ impl OpenRouterServer {
         let detail = enriched_model_detail(&self.client, model)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let json = serde_json::to_string_pretty(&detail)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        json_text_result(&detail)
     }
 }
 
@@ -395,6 +454,94 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Build `n` placeholder models with ids `model-0`, `model-1`, ... so the
+    /// local filter and cap can be exercised without hitting the network.
+    fn models(n: usize) -> Vec<Model> {
+        (0..n)
+            .map(|i| Model {
+                id: format!("model-{i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// The cap applies only without `all`, and `total` always reports the
+    /// pre-truncation match count.
+    #[test]
+    fn apply_filters_caps_at_default_limit_unless_all() {
+        let filtered = apply_filters(models(25), None, false);
+        assert_eq!(filtered.models.len(), DEFAULT_MODEL_LIMIT);
+        assert_eq!(filtered.total, 25);
+        assert_eq!(filtered.truncated(), 5);
+
+        let filtered = apply_filters(models(25), None, true);
+        assert_eq!(filtered.models.len(), 25);
+        assert_eq!(filtered.truncated(), 0);
+
+        let filtered = apply_filters(models(3), None, false);
+        assert_eq!(filtered.models.len(), 3);
+        assert_eq!(filtered.truncated(), 0);
+    }
+
+    /// Search narrows first, then the cap trims; `total` counts the matches.
+    #[test]
+    fn apply_filters_search_runs_before_truncation() {
+        // "model-2" matches model-2 and model-20..29 = 11 of 30.
+        let filtered = apply_filters(models(30), Some("model-2"), false);
+        assert_eq!(filtered.total, 11);
+        assert_eq!(filtered.models.len(), 11);
+        assert!(filtered.models.iter().all(|m| m.id.contains("model-2")));
+
+        // "MODEL-" matches all 25 (case-insensitive); the cap trims to 20.
+        let filtered = apply_filters(models(25), Some("MODEL-"), false);
+        assert_eq!(filtered.total, 25);
+        assert_eq!(filtered.models.len(), DEFAULT_MODEL_LIMIT);
+    }
+
+    #[test]
+    fn matches_search_checks_id_name_and_description_case_insensitively() {
+        let model = Model {
+            id: "openai/gpt-audio-mini".to_string(),
+            name: Some("OpenAI: GPT Audio Mini".to_string()),
+            description: Some("A cost-efficient audio model.".to_string()),
+            ..Default::default()
+        };
+        assert!(matches_search(&model, "OPENAI"));
+        assert!(matches_search(&model, "audio mini"));
+        assert!(matches_search(&model, "cost-efficient"));
+        assert!(!matches_search(&model, "anthropic"));
+    }
+
+    /// The one-line pagination note in the MCP header: nothing without
+    /// `total_count`, the count alone on the last page, and the next-page link
+    /// when the server says there is more.
+    #[test]
+    fn pagination_note_reports_total_count_and_next_link() {
+        let none: ModelsResponse = serde_json::from_str(r#"{"data": []}"#).unwrap();
+        assert!(pagination_note(&none).is_none());
+
+        let last: ModelsResponse =
+            serde_json::from_str(r#"{"data": [], "total_count": 546, "links": {"next": null}}"#)
+                .unwrap();
+        assert_eq!(
+            pagination_note(&last).as_deref(),
+            Some("server total_count: 546 models match this query before limit/offset")
+        );
+
+        let more: ModelsResponse = serde_json::from_str(
+            r#"{"data": [], "total_count": 546,
+                "links": {"next": "/api/v1/models?offset=20&limit=20"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pagination_note(&more).as_deref(),
+            Some(
+                "server total_count: 546 models match this query before limit/offset; \
+                 next page: /api/v1/models?offset=20&limit=20"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn list_models_tool_returns_model_json() {
         let mock = MockServer::start().await;
@@ -415,6 +562,47 @@ mod tests {
         // The tool returns the model list as pretty JSON text content.
         let body = serde_json::to_string(&result).unwrap();
         assert!(body.contains("openai/gpt"));
+    }
+
+    /// `search` follows the repo-wide blank-means-absent rule: a padded needle
+    /// is trimmed before matching and a blank one applies no filter at all.
+    #[tokio::test]
+    async fn list_models_search_trims_and_treats_blank_as_no_filter() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "openai/gpt"}, {"id": "anthropic/claude"}]
+            })))
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let ids = |result: &rmcp::model::CallToolResult| -> Vec<String> {
+            tool_result_json(result)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let padded = server
+            .list_models(Parameters(ListModelsArgs {
+                search: Some("  claude ".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ids(&padded), vec!["anthropic/claude"]);
+
+        let blank = server
+            .list_models(Parameters(ListModelsArgs {
+                search: Some("   ".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ids(&blank), vec!["openai/gpt", "anthropic/claude"]);
     }
 
     /// F2: `Model` must not silently drop `supported_voices` - it is what

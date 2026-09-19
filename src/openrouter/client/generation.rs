@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::openrouter::OpenRouterClient;
+use crate::openrouter::{OpenRouterClient, unwrap_data};
 
 impl OpenRouterClient {
     /// `GET /api/v1/generation?id=<generation_id>` - the stored record for one
@@ -18,8 +18,7 @@ impl OpenRouterClient {
             .get(format!("{}/generation", self.base_url))
             .bearer_auth(&self.api_key)
             .query(&[("id", generation_id)]);
-        let mut body: Value = self.send_json(rb, "/generation").await?;
-        Ok(body.get_mut("data").map(Value::take).unwrap_or(body))
+        Ok(unwrap_data(self.send_json(rb, "/generation").await?))
     }
 }
 

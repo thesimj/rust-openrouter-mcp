@@ -4,15 +4,15 @@
 //! GPT Image family) are reachable *only* here, and every other image model is
 //! served here too, so all generation goes through this endpoint.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::openrouter::{ImagesRequest, ImagesResponse, OpenRouterClient, generation_id};
+use crate::openrouter::{ImagesRequest, ImagesResponse, OpenRouterClient};
 
 impl OpenRouterClient {
     /// `POST /api/v1/images` - generate image(s) from a prompt (and optional
     /// reference images). Returns the parsed response plus the `X-Generation-Id`
     /// response header when present. On a non-2xx status the upstream error body
-    /// is surfaced verbatim (OpenRouter wraps provider errors there).
+    /// is surfaced (bounded to 500 chars) (OpenRouter wraps provider errors there).
     pub async fn generate_images(
         &self,
         req: &ImagesRequest,
@@ -22,22 +22,7 @@ impl OpenRouterClient {
             .post(format!("{}/images", self.base_url))
             .bearer_auth(&self.api_key)
             .json(req);
-        let resp = self.send_checked(rb, "/images").await?;
-
-        let generation_id = generation_id(&resp);
-
-        let parsed: ImagesResponse = resp
-            .json()
-            .await
-            .context("failed to decode OpenRouter /images response")
-            .map_err(|error| {
-                crate::billing::Receipt {
-                    cost: None,
-                    generation_id: generation_id.clone(),
-                }
-                .attach(error)
-            })?;
-        Ok((parsed, generation_id))
+        self.send_json_receipted(rb, "/images").await
     }
 }
 

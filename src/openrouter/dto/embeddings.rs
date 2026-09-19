@@ -27,7 +27,7 @@ pub struct EmbeddingsBody {
 
 /// The `input` field: a bare string for one text (the shape every provider
 /// accepts), an array for several.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum EmbeddingsInput {
     Text(String),
@@ -36,11 +36,10 @@ pub enum EmbeddingsInput {
 
 impl EmbeddingsInput {
     /// Exactly one text -> [`Self::Text`]; anything else -> [`Self::Texts`].
-    pub fn from_texts(mut texts: Vec<String>) -> Self {
-        if texts.len() == 1 {
-            Self::Text(texts.pop().unwrap_or_default())
-        } else {
-            Self::Texts(texts)
+    pub fn from_texts(texts: Vec<String>) -> Self {
+        match <[String; 1]>::try_from(texts) {
+            Ok([text]) => Self::Text(text),
+            Err(texts) => Self::Texts(texts),
         }
     }
 }
@@ -67,13 +66,6 @@ pub struct EmbeddingsUsage {
     pub total_tokens: Option<u64>,
     /// USD charge for the request, when OpenRouter reports it inline.
     pub cost: Option<f64>,
-}
-
-/// A decoded `/embeddings` reply plus the `X-Generation-Id` header.
-#[derive(Debug)]
-pub struct EmbeddingsReply {
-    pub body: EmbeddingsResponse,
-    pub generation_id: Option<String>,
 }
 
 #[cfg(test)]

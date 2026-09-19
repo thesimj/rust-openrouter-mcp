@@ -18,10 +18,55 @@
   decisions model on `/chat/completions`.
 - `list_models` documents the `decisions` output modality; `get_usage_stats`
   counts `make_decisions` under `text_generations`.
+- `list_models.search` follows the blank-means-absent rule: a padded needle is
+  trimmed and a blank one applies no filter (before, `" gpt "` matched nothing
+  and `""` matched everything).
 - Client: `OpenRouterClient::api_root()` derives the server root above
   `/api/v1` for endpoints served outside it.
 - Skipped on purpose: the `session_id`, `trace` and `user` request fields, and
   the rest of `ProviderPreferences` (quantizations, max_price, preferred_*).
+
+### Internal refactor (no behavior change)
+
+A design pass over the whole crate, one rule per place:
+
+- `send_json_receipted` is the single "a 2xx that fails to decode keeps its
+  billing receipt" step; chat, images, embeddings, rerank, decisions, video
+  submit and transcription all use it. Its five per-endpoint test copies are
+  one test.
+- The `EmbedRequest` / `RerankRequest` / `DecideRequest` mirrors of the wire
+  bodies and the three `*Reply { body, generation_id }` wrappers are gone: the
+  tools build `EmbeddingsBody` / `RerankBody` / `DecisionsBody`, validate once
+  at the boundary, and the client methods return `(response, generation_id)`.
+- `list_models` presentation (`apply_filters`, the search match, the pagination
+  note) moved from the HTTP client and DTOs into `server/models.rs`.
+- `record_text_failure` / `record_audio_failure` own the "failed request +
+  receipt" pairing; `json_text_result` owns the pretty-JSON text block;
+  `clean_list` owns the trim-and-drop-blanks rule for slug and domain lists;
+  `media::check_count` owns the 16-input cap for every input kind (the image
+  message now reads "at most 16 image inputs are supported");
+  `audio_gen::normalize_response_format` / `normalize_voice` own the speech
+  normalization the tool and the job both apply.
+- `chat_completion` and `describe_image` share `finish_chat_call`; the
+  test-only `run_chat_completion` wrapper is gone (tests call the tool).
+- `record_text` / `record_audio` lost their `success` flag: success and
+  failure are separate methods, and the audio failure path has a test.
+- One `BoundedResponse::decode` carries the decode-failure message and one
+  `unwrap_data` the `{"data": ...}` envelope rule.
+- Deleted: the unused `ImageConfig` chat field, the never-set `text` /
+  `provider` fields on generated images and their manifest entries, the
+  `ModelCapsCache` newtype (a map behind a lock on the server struct now),
+  the `list_models` wrapper over `list_models_page`, the `MAX_INPUTS_PER_KIND`
+  alias, a duplicated 30-day timer cap and "any reference present" rule in
+  `video_gen`, two poll-interval floors the only caller already applies plus
+  a dead `.max(1)` on the clip count, and the
+  `prompt_source` / `input_source` parameter every tool passed as `"inline"`
+  (the manifest field stays, always `inline`).
+- Docs brought back in line with the code: PRIVACY.md (17 tools, files fetched
+  by URL, the decisions and generation endpoints), README limits (25 MiB chat
+  audio, 15 MiB cloning sample), routing lists per tool, CI commands, the
+  `.env` search, the output-dir fallback; CONNECT.md provider shapes; manifest
+  and Cargo.toml descriptions and keywords; stale module comments.
 
 ## 0.11.0
 

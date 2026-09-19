@@ -22,15 +22,15 @@ use serde::Deserialize;
 use crate::openrouter::{
     ImageProvider, ProviderOptions, ProviderOptionsMap, ProviderRouting, ProviderSort,
 };
-use crate::server::schema::{de_lenient, de_opt_bool, scalarize_nullable};
+use crate::server::schema::{clean_list, de_lenient, de_opt_bool, scalarize_nullable};
 
 /// Accepted `sort` values (OpenRouter `ProviderPreferences.sort`).
 const SORT_VALUES: [&str; 4] = ["price", "throughput", "latency", "exacto"];
 /// Accepted `sort_partition` values (`sort.partition` in the object form).
 const SORT_PARTITIONS: [&str; 2] = ["model", "none"];
 
-/// Routing-only `provider` block for chat completions, `/embeddings` and
-/// `/rerank` - the endpoints whose schema rejects `options`.
+/// Routing-only `provider` block for chat completions, `/embeddings`, `/rerank`
+/// and `/api/alpha/decisions` - the endpoints whose schema rejects `options`.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct ProviderRoutingArgs {
@@ -68,9 +68,9 @@ impl ProviderRoutingArgs {
     pub(crate) fn into_routing(self) -> Result<Option<ProviderRouting>, ErrorData> {
         let sort = parse_sort(self.sort, self.sort_partition)?;
         Ok(ProviderRouting {
-            order: clean_slugs(self.order),
-            only: clean_slugs(self.only),
-            ignore: clean_slugs(self.ignore),
+            order: clean_list(self.order),
+            only: clean_list(self.only),
+            ignore: clean_list(self.ignore),
             allow_fallbacks: self.allow_fallbacks,
             require_parameters: self.require_parameters,
             zdr: self.zdr,
@@ -117,9 +117,9 @@ impl ImageProviderArgs {
     pub(crate) fn into_image_provider(self) -> Result<Option<ImageProvider>, ErrorData> {
         let sort = parse_sort(self.sort, self.sort_partition)?;
         Ok(ImageProvider {
-            order: clean_slugs(self.order),
-            only: clean_slugs(self.only),
-            ignore: clean_slugs(self.ignore),
+            order: clean_list(self.order),
+            only: clean_list(self.only),
+            ignore: clean_list(self.ignore),
             allow_fallbacks: self.allow_fallbacks,
             sort,
             options: validate_options(self.options)?,
@@ -149,15 +149,6 @@ impl ProviderOptionsArgs {
         }
         .non_empty())
     }
-}
-
-/// Trim slugs and drop blank entries (the repo-wide "blank means absent" rule).
-fn clean_slugs(slugs: Vec<String>) -> Vec<String> {
-    slugs
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 /// `sort` + `sort_partition` -> the wire enum. Blank strings count as unset;

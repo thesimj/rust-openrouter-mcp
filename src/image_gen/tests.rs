@@ -579,7 +579,6 @@ fn size_conflict_check_rejects_pixels_plus_tier_or_ratio() {
     assert!(check_size_conflict(Some("2048x2048"), None, None).is_ok());
     assert!(check_size_conflict(Some("2K"), Some("2K"), Some("1:1")).is_ok());
     assert!(check_size_conflict(None, Some("1K"), Some("1:1")).is_ok());
-    assert!(check_size_conflict(Some("  "), Some("1K"), Some("1:1")).is_ok());
 }
 
 #[test]

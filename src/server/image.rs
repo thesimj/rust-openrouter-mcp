@@ -2,11 +2,8 @@
 //! shared `ImageInput` type, and the image-job result builder.
 
 use rmcp::{
-    ErrorData, RoleServer,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    service::RequestContext,
-    tool, tool_router,
+    ErrorData, RoleServer, handler::server::wrapper::Parameters, model::CallToolResult,
+    service::RequestContext, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -87,12 +84,7 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
 pub(crate) async fn resolve_image_inputs(
     images: Vec<ImageInput>,
 ) -> Result<Vec<image_gen::InputImage>, ErrorData> {
-    if images.len() > crate::resources::MAX_IMAGE_INPUTS {
-        return Err(ErrorData::invalid_params(
-            "at most 16 input images are supported",
-            None,
-        ));
-    }
+    media::check_count(media::InputKind::Image, images.len())?;
     let mut total = 0usize;
     let mut out = Vec::with_capacity(images.len());
     for img in images {
@@ -101,7 +93,10 @@ pub(crate) async fn resolve_image_inputs(
             total += bytes.len();
             if total > crate::resources::MAX_IMAGE_TOTAL_BYTES {
                 return Err(ErrorData::invalid_params(
-                    "input images exceed 64 MiB in total",
+                    format!(
+                        "input images exceed {} MiB in total",
+                        crate::resources::MAX_IMAGE_TOTAL_BYTES / (1024 * 1024)
+                    ),
                     None,
                 ));
             }
@@ -423,7 +418,7 @@ impl OpenRouterServer {
             wait,
             inline_previews,
             move |ctx| async move {
-                match image_gen::run_job(&ctx.client, &req, variants, &base, "inline").await {
+                match image_gen::run_job(&ctx.client, &req, variants, &base).await {
                     Ok(summary) => {
                         ctx.stats
                             .record_job(
@@ -498,20 +493,8 @@ impl OpenRouterServer {
             max_tokens: args.max_tokens,
             provider,
         };
-        match image_gen::describe_image(&self.client, &req).await {
-            Ok(result) => {
-                self.stats.record_text(&model, true, result.cost).await;
-                let mut blocks = vec![ContentBlock::text(result.text.clone())];
-                if let Some(meta) = super::chat::result_meta(&result) {
-                    blocks.push(ContentBlock::text(meta));
-                }
-                Ok(CallToolResult::success(blocks))
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+        let outcome = image_gen::describe_image(&self.client, &req).await;
+        self.finish_chat_call(&model, outcome).await
     }
 }
 

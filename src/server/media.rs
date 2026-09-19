@@ -26,9 +26,6 @@ use crate::server::schema::{AtLeastOneOf, scalarize_nullable};
 /// data URL, so accepting more only increases memory pressure.
 pub(crate) const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
-/// At most this many entries per input list (each may be [`MAX_MEDIA_BYTES`]).
-pub(crate) const MAX_INPUTS_PER_KIND: usize = crate::resources::MAX_IMAGE_INPUTS;
-
 /// Total deadline for one remote fetch, sized against the ceiling above:
 /// 20 MB inside 30s is ~5 Mbit/s, slower than any host worth waiting for.
 const REMOTE_FETCH_TIMEOUT_SECS: u64 = 30;
@@ -385,14 +382,14 @@ async fn fetch_url(kind: InputKind, url: &str, limit: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-/// Refuse more than [`MAX_INPUTS_PER_KIND`] entries of one kind.
-fn check_count(kind: InputKind, len: usize) -> Result<(), ErrorData> {
-    if len > MAX_INPUTS_PER_KIND {
+/// Refuse more than [`MAX_IMAGE_INPUTS`](crate::resources::MAX_IMAGE_INPUTS)
+/// entries of one kind (the same cap for every input list; each entry may be
+/// [`MAX_MEDIA_BYTES`]).
+pub(crate) fn check_count(kind: InputKind, len: usize) -> Result<(), ErrorData> {
+    let max = crate::resources::MAX_IMAGE_INPUTS;
+    if len > max {
         return Err(ErrorData::invalid_params(
-            format!(
-                "at most {MAX_INPUTS_PER_KIND} {} inputs are supported",
-                kind.noun()
-            ),
+            format!("at most {max} {} inputs are supported", kind.noun()),
             None,
         ));
     }
@@ -630,8 +627,8 @@ fn audio_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
 /// URL passes through untouched (the provider fetches it), a `data:` URL is
 /// decoded, capped at [`MAX_MEDIA_BYTES`] and re-issued, and a local path is
 /// read (same cap) and inlined as a data URL typed from its bytes, declared
-/// type, or extension. Used by `video_gen` and the chat inputs above
-/// through [`resolve_source`].
+/// type, or extension. Used by `video_gen`; shares [`resolve_source`] (and
+/// its caps and SSRF guard) with the chat inputs above.
 pub(crate) async fn resolve_media_reference(
     kind: InputKind,
     source: &str,
@@ -1198,7 +1195,7 @@ mod tests {
         );
 
         // Too many entries are refused before any is read.
-        let many = (0..MAX_INPUTS_PER_KIND + 1)
+        let many = (0..crate::resources::MAX_IMAGE_INPUTS + 1)
             .map(|_| VideoInput {
                 base64: Some("!!!".into()),
                 ..Default::default()

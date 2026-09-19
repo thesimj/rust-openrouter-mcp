@@ -1,6 +1,7 @@
-//! The `chat_completion` text tool, its argument struct, and the conversions
-//! from tool arguments to the chat wire controls (`response_format`,
-//! `plugins`, `web_search_options`, `reasoning`).
+//! The `chat_completion` text tool, its argument struct, the conversions from
+//! tool arguments to the chat wire controls (`response_format`, `plugins`,
+//! `web_search_options`, `reasoning`), the per-kind input-modality gate, and
+//! the result/failure tail `describe_image` shares.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +20,7 @@ use crate::image_gen;
 use crate::openrouter::{JsonSchemaSpec, PdfOptions, Plugin, ResponseFormat, WebSearchOptions};
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, require_all,
+    RequireFields, clean_list, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, require_all,
     scalarize_nullable,
 };
 
@@ -190,13 +191,6 @@ fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn clean_list(items: Vec<String>) -> Vec<String> {
-    items
-        .into_iter()
-        .filter_map(|s| non_blank(Some(s)))
-        .collect()
-}
-
 impl WebSearchArgs {
     /// The web plugin entry and `web_search_options` this block asks for;
     /// `(None, None)` when nothing is set.
@@ -297,11 +291,9 @@ pub(crate) fn file_parser_plugin(pdf_engine: Option<String>) -> Result<Option<Pl
 
 /// `reasoning.effort` and `reasoning.max_tokens` are two ways to say the same
 /// thing; OpenRouter documents them as exclusive, so reject both up front.
-pub(crate) fn check_reasoning(
-    effort: Option<&str>,
-    max_tokens: Option<u64>,
-) -> Result<(), ErrorData> {
-    if effort.is_some_and(|e| !e.trim().is_empty()) && max_tokens.is_some() {
+/// `effort` is already normalized (blank means unset).
+fn check_reasoning(effort: Option<&str>, max_tokens: Option<u64>) -> Result<(), ErrorData> {
+    if effort.is_some() && max_tokens.is_some() {
         return Err(ErrorData::invalid_params(
             "reasoning_effort and reasoning_max_tokens are mutually exclusive; pass one",
             None,
@@ -329,12 +321,12 @@ fn typed_annotation(raw: &serde_json::Value) -> serde_json::Value {
 
 /// The second content block a chat-family tool returns, as pretty JSON:
 /// the generation id (what `get_generation` takes), plus - when present -
-/// the reasoning text, the typed annotations (web-search citations), a
-/// finish_reason other than "stop" (truncation, filtering), with the token
-/// counts riding along. `None` only when the response carried none of those,
+/// the reasoning text, the typed annotations (web-search citations), the
+/// finish_reason ("length" = truncated, a filter name, or plain "stop"), with
+/// the token counts riding along. `None` only when the response carried none of those,
 /// so a result from an upstream that sends no id stays the single text block
 /// it always was.
-pub(crate) fn result_meta(result: &chat_gen::ChatResult) -> Option<String> {
+fn result_meta(result: &chat_gen::ChatResult) -> Option<String> {
     let reasoning = result
         .reasoning
         .as_deref()
@@ -386,7 +378,7 @@ impl OpenRouterServer {
         reply (text out). This call waits for the provider response. Useful \
         to route a sub-task to a DIFFERENT model than the host - e.g. ask a cheaper or specialized \
         model on OpenRouter. Provide `model` (a chat model id; discover with list_models) and \
-        `prompt` (the user message); both are required or the call fails naming what is missing. \
+        `prompt` (the user message); a missing prompt fails with a message naming it. \
         `system` (an optional system instruction), `temperature`, `max_tokens`, `seed`, `top_p`, \
         `top_k`, `stop`, `frequency_penalty`, `presence_penalty` and `verbosity` are optional \
         sampling controls passed straight through. Structured output: `json_mode: true` asks for \
@@ -409,7 +401,7 @@ impl OpenRouterServer {
         first content block, then a second JSON block with the generation_id (pass it to \
         get_generation for the recorded cost) plus, when the response carries them, \
         reasoning, annotations (url_citation: url, title, content, start_index, \
-        end_index), a finish_reason other than \"stop\" (e.g. \"length\" = truncated), and \
+        end_index), the finish_reason (e.g. \"length\" = truncated), and \
         the prompt/completion token counts. Not \
         exposed on purpose: tools/tool_choice, logit_bias, logprobs, prediction, fallback \
         models, min_p/top_a/repetition_penalty.",
@@ -423,14 +415,6 @@ impl OpenRouterServer {
     async fn chat_completion(
         &self,
         Parameters(args): Parameters<ChatCompletionArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run_chat_completion(args).await
-    }
-
-    /// Core of `chat_completion` (synchronous), split out so tests drive it directly.
-    pub(crate) async fn run_chat_completion(
-        &self,
-        args: ChatCompletionArgs,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
         let mut missing: Vec<&str> = Vec::new();
@@ -446,7 +430,9 @@ impl OpenRouterServer {
         require_all("chat_completion", "text", &missing)?;
 
         // Argument-level contradictions and vocabulary, all before any network.
-        check_reasoning(args.reasoning_effort.as_deref(), args.reasoning_max_tokens)?;
+        // A blank effort is "unset" everywhere below (the repo-wide rule).
+        let reasoning_effort = non_blank(args.reasoning_effort);
+        check_reasoning(reasoning_effort.as_deref(), args.reasoning_max_tokens)?;
         let response_format = response_format(args.json_mode, args.json_schema)?;
         let (web_plugin, web_search_options) = args.web_search.into_wire()?;
         let pdf_plugin = file_parser_plugin(args.pdf_engine)?;
@@ -498,9 +484,7 @@ impl OpenRouterServer {
         };
 
         let prompt = args.prompt.unwrap_or_default();
-        // Record success only after text is actually extracted (an empty-choices
-        // or empty-content response is an error, not a successful generation).
-        match chat_gen::complete(
+        let outcome = chat_gen::complete(
             &self.client,
             &chat_gen::ChatInputs {
                 model: &args.model,
@@ -513,7 +497,7 @@ impl OpenRouterServer {
                 files: &files,
                 audio: &audio,
                 videos: &videos,
-                reasoning_effort: args.reasoning_effort.as_deref(),
+                reasoning_effort: reasoning_effort.as_deref(),
                 reasoning_max_tokens: args.reasoning_max_tokens,
                 reasoning_exclude: args.reasoning_exclude,
                 seed: args.seed,
@@ -529,27 +513,46 @@ impl OpenRouterServer {
                 provider,
             },
         )
-        .await
-        {
-            Ok(result) => {
-                self.stats.record_text(&args.model, true, result.cost).await;
-                let mut blocks = vec![ContentBlock::text(result.text.clone())];
-                if let Some(meta) = result_meta(&result) {
-                    blocks.push(ContentBlock::text(meta));
-                }
-                Ok(CallToolResult::success(blocks))
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&args.model, &e).await;
-                let mut message = format!("{e:#}");
+        .await;
+        self.finish_chat_call(&args.model, outcome)
+            .await
+            .map_err(|mut err| {
                 // OpenRouter's 400 for a decisions model (TypeSafe Jev) names it
                 // as such; those models live on /api/alpha/decisions, which
                 // `make_decisions` reaches. A substring check is enough: the
                 // phrase does not occur in any other upstream error.
-                if message.to_ascii_lowercase().contains("decisions model") {
-                    message.push_str(" Use the make_decisions tool for this model.");
+                if err.message.to_ascii_lowercase().contains("decisions model") {
+                    err.message = format!(
+                        "{} Use the make_decisions tool for this model.",
+                        err.message
+                    )
+                    .into();
                 }
-                Err(ErrorData::internal_error(message, None))
+                err
+            })
+    }
+
+    /// The shared tail of `chat_completion` and `describe_image`: record the
+    /// outcome in the usage stats, then render the text plus the metadata
+    /// block (generation id, reasoning, citations, truncation) on success or
+    /// the upstream error on failure. Success is recorded only here, after the
+    /// text was actually extracted - an empty reply is a failure.
+    pub(crate) async fn finish_chat_call(
+        &self,
+        model: &str,
+        outcome: anyhow::Result<chat_gen::ChatResult>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match outcome {
+            Ok(result) => {
+                self.stats.record_text(model, result.cost).await;
+                let meta = result_meta(&result);
+                let mut blocks = vec![ContentBlock::text(result.text)];
+                blocks.extend(meta.map(ContentBlock::text));
+                Ok(CallToolResult::success(blocks))
+            }
+            Err(e) => {
+                self.stats.record_text_failure(model, &e).await;
+                Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
     }
@@ -568,7 +571,8 @@ impl OpenRouterServer {
     /// reports input modalities that don't include `kind` — the common, clear
     /// case (e.g. sending an image to a text-only model).
     async fn ensure_input_modality(&self, model: &str, kind: InputKind) -> Result<(), ErrorData> {
-        let modalities = match self.model_caps.get(model).await {
+        let cached = self.model_caps.lock().await.get(model).cloned();
+        let modalities = match cached {
             Some(cached) => cached,
             None => match self.client.model_input_modalities(model).await {
                 Ok(modalities) => {
@@ -576,7 +580,10 @@ impl OpenRouterServer {
                     // (missing/lagging catalog metadata) and must not be pinned for
                     // the process lifetime.
                     if !modalities.is_empty() {
-                        self.model_caps.put(model, modalities.clone()).await;
+                        self.model_caps
+                            .lock()
+                            .await
+                            .insert(model.to_string(), modalities.clone());
                     }
                     modalities
                 }
@@ -645,7 +652,7 @@ mod tests {
     async fn sent_body(args: ChatCompletionArgs) -> serde_json::Value {
         let mock = mock_chat(serde_json::json!({})).await;
         server_for(mock.uri())
-            .run_chat_completion(args)
+            .chat_completion(Parameters(args))
             .await
             .unwrap();
         mock.received_requests().await.unwrap()[0]
@@ -692,12 +699,12 @@ mod tests {
 
         let server = server_for(mock.uri());
         let res = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 system: Some("be terse".to_string()),
                 temperature: Some(0.5),
                 max_tokens: Some(64),
                 ..args("openai/gpt-5.4", "say hi")
-            })
+            }))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -750,11 +757,11 @@ mod tests {
 
         let server = server_for("http://127.0.0.1:9".to_string());
         let err = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 reasoning_effort: Some("high".to_string()),
                 reasoning_max_tokens: Some(2000),
                 ..args("m", "hi")
-            })
+            }))
             .await
             .unwrap_err();
         assert!(
@@ -781,7 +788,7 @@ mod tests {
         }))
         .await;
         server_for(mock.uri())
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 seed: Some(42),
                 top_p: Some(0.9),
                 top_k: Some(40),
@@ -790,7 +797,7 @@ mod tests {
                 presence_penalty: Some(-0.25),
                 verbosity: Some("low".to_string()),
                 ..args("m", "hi")
-            })
+            }))
             .await
             .unwrap();
 
@@ -827,7 +834,7 @@ mod tests {
         }))
         .unwrap();
         server_for(mock.uri())
-            .run_chat_completion(args)
+            .chat_completion(Parameters(args))
             .await
             .unwrap();
 
@@ -837,7 +844,7 @@ mod tests {
         }))
         .unwrap();
         let err = server_for("http://127.0.0.1:9".to_string())
-            .run_chat_completion(bad)
+            .chat_completion(Parameters(bad))
             .await
             .unwrap_err();
         assert!(err.message.contains("sort"), "got: {}", err.message);
@@ -860,7 +867,7 @@ mod tests {
         .await;
         let args_json = serde_json::json!({"model": "m", "prompt": "hi", "json_schema": schema});
         server_for(mock.uri())
-            .run_chat_completion(serde_json::from_value(args_json).unwrap())
+            .chat_completion(Parameters(serde_json::from_value(args_json).unwrap()))
             .await
             .unwrap();
 
@@ -895,13 +902,13 @@ mod tests {
 
         // Both together are a contradiction, refused before any call.
         let err = server_for("http://127.0.0.1:9".to_string())
-            .run_chat_completion(
+            .chat_completion(Parameters(
                 serde_json::from_value(serde_json::json!({
                     "model": "m", "prompt": "hi", "json_mode": true,
                     "json_schema": {"type": "object"}
                 }))
                 .unwrap(),
-            )
+            ))
             .await
             .unwrap_err();
         assert!(
@@ -924,7 +931,7 @@ mod tests {
         }))
         .await;
         server_for(mock.uri())
-            .run_chat_completion(
+            .chat_completion(Parameters(
                 serde_json::from_value(serde_json::json!({
                     "model": "m", "prompt": "hi",
                     "web_search": {
@@ -934,7 +941,7 @@ mod tests {
                     }
                 }))
                 .unwrap(),
-            )
+            ))
             .await
             .unwrap();
 
@@ -952,14 +959,14 @@ mod tests {
 
         // `enabled: false` with knobs set is a contradiction.
         let err = server_for("http://127.0.0.1:9".to_string())
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 web_search: WebSearchArgs {
                     enabled: Some(false),
                     engine: Some("exa".to_string()),
                     ..Default::default()
                 },
                 ..args("m", "hi")
-            })
+            }))
             .await
             .unwrap_err();
         assert!(err.message.contains("enabled"), "got: {}", err.message);
@@ -972,10 +979,10 @@ mod tests {
         }))
         .await;
         server_for(mock.uri())
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 pdf_engine: Some(" Mistral-OCR ".to_string()),
                 ..args("m", "hi")
-            })
+            }))
             .await
             .unwrap();
 
@@ -995,10 +1002,10 @@ mod tests {
         );
 
         let err = server_for("http://127.0.0.1:9".to_string())
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 pdf_engine: Some("tesseract".to_string()),
                 ..args("m", "hi")
-            })
+            }))
             .await
             .unwrap_err();
         assert!(
@@ -1031,13 +1038,13 @@ mod tests {
             .await;
         let server = server_for(mock.uri());
         let err = server
-            .run_chat_completion(args("typesafe/jev-1.13", "hi"))
+            .chat_completion(Parameters(args("typesafe/jev-1.13", "hi")))
             .await
             .unwrap_err();
         assert!(err.message.contains("decisions model"), "{}", err.message);
         assert!(err.message.contains("make_decisions"), "{}", err.message);
         let err = server
-            .run_chat_completion(args("other/model", "hi"))
+            .chat_completion(Parameters(args("other/model", "hi")))
             .await
             .unwrap_err();
         assert!(!err.message.contains("make_decisions"), "{}", err.message);
@@ -1068,7 +1075,7 @@ mod tests {
             .mount(&mock)
             .await;
         let res = server_for(mock.uri())
-            .run_chat_completion(args("m", "hi"))
+            .chat_completion(Parameters(args("m", "hi")))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -1110,7 +1117,7 @@ mod tests {
             .mount(&mock)
             .await;
         let res = server_for(mock.uri())
-            .run_chat_completion(args("m", "hi"))
+            .chat_completion(Parameters(args("m", "hi")))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -1143,7 +1150,7 @@ mod tests {
         let server = server_for("http://127.0.0.1:9".to_string());
         // blank-after-trim counts as missing
         let err = server
-            .run_chat_completion(args("m", "   "))
+            .chat_completion(Parameters(args("m", "   ")))
             .await
             .unwrap_err();
         assert!(err.message.contains("prompt"));
@@ -1176,10 +1183,10 @@ mod tests {
 
         let server = server_for(mock.uri());
         let res = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 images: one_image(),
                 ..args("google/gemini-2.5-flash", "what is this?")
-            })
+            }))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -1195,10 +1202,10 @@ mod tests {
 
         let server = server_for(mock.uri());
         let err = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 images: one_image(),
                 ..args("openai/gpt-5.4", "what is this?")
-            })
+            }))
             .await
             .unwrap_err();
         assert!(err.message.contains("does not accept image input"));
@@ -1229,10 +1236,10 @@ mod tests {
 
         let server = server_for(mock.uri());
         let res = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 images: one_image(),
                 ..args("obscure/vision-model", "what is this?")
-            })
+            }))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -1262,10 +1269,10 @@ mod tests {
 
         let server = server_for(mock.uri());
         let res = server
-            .run_chat_completion(ChatCompletionArgs {
+            .chat_completion(Parameters(ChatCompletionArgs {
                 images: one_image(),
                 ..args("google/gemini-2.5-flash:nitro", "what is this?")
-            })
+            }))
             .await
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
@@ -1313,7 +1320,7 @@ mod tests {
         }))
         .unwrap();
         let res = server_for(mock.uri())
-            .run_chat_completion(args)
+            .chat_completion(Parameters(args))
             .await
             .unwrap();
         assert_eq!(
@@ -1369,7 +1376,7 @@ mod tests {
                 v[k] = val.clone();
             }
             let args: ChatCompletionArgs = serde_json::from_value(v).unwrap();
-            let err = server.run_chat_completion(args).await.unwrap_err();
+            let err = server.chat_completion(Parameters(args)).await.unwrap_err();
             assert!(
                 err.message
                     .contains(&format!("does not accept {kind} input")),
@@ -1396,7 +1403,7 @@ mod tests {
         }))
         .unwrap();
         let err = server_for("http://127.0.0.1:9".to_string())
-            .run_chat_completion(bad)
+            .chat_completion(Parameters(bad))
             .await
             .unwrap_err();
         assert!(

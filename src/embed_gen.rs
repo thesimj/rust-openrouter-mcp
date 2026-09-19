@@ -1,28 +1,14 @@
 //! Retrieval helpers for the MCP tools: text embeddings
 //! (`POST /embeddings`) and document reranking (`POST /rerank`).
 //!
-//! Like [`crate::audio_gen`], this is the single path both front ends use:
-//! input validation, the single-string-vs-array normalization, response
-//! flattening and the result JSON all live here once.
+//! Like [`crate::audio_gen`], this is the single path the tools use after
+//! their argument checks: the request goes out as the wire body the tool
+//! built, and the reply is flattened into the result JSON here once.
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::openrouter::{
-    EmbeddingsBody, EmbeddingsInput, OpenRouterClient, ProviderRouting, RerankBody,
-};
-
-/// Inputs for one `/embeddings` request.
-#[derive(Debug, Clone)]
-pub struct EmbedRequest {
-    pub model: String,
-    /// One or more texts; sent as a bare string when there is exactly one.
-    pub input: Vec<String>,
-    pub dimensions: Option<u32>,
-    pub input_type: Option<String>,
-    /// Routing block, already validated (this endpoint has no `options`).
-    pub provider: Option<ProviderRouting>,
-}
+use crate::openrouter::{EmbeddingsBody, OpenRouterClient, RerankBody};
 
 /// One vector per input text, in input order, plus usage and the receipt id.
 #[derive(Debug)]
@@ -56,17 +42,6 @@ impl EmbedResult {
             "generation_id": self.generation_id,
         })
     }
-}
-
-/// Inputs for one `/rerank` request.
-#[derive(Debug, Clone)]
-pub struct RerankRequest {
-    pub model: String,
-    pub query: String,
-    pub documents: Vec<String>,
-    pub top_n: Option<u32>,
-    /// Routing block, already validated (this endpoint has no `options`).
-    pub provider: Option<ProviderRouting>,
 }
 
 /// One ranked document: its position in the request, the provider's score,
@@ -116,22 +91,13 @@ impl RerankResult {
     }
 }
 
-impl EmbedRequest {
-    /// The local checks run before any HTTP call: at least one non-blank text.
-    pub fn validate(&self) -> Result<()> {
-        check_texts(&self.input, "input")
+/// The local checks a rerank body must pass before any HTTP call: a non-blank
+/// query and at least one non-blank document.
+pub fn validate_rerank(body: &RerankBody) -> Result<()> {
+    if body.query.trim().is_empty() {
+        bail!("query must not be blank");
     }
-}
-
-impl RerankRequest {
-    /// The local checks run before any HTTP call: a non-blank query and at
-    /// least one non-blank document.
-    pub fn validate(&self) -> Result<()> {
-        if self.query.trim().is_empty() {
-            bail!("query must not be blank");
-        }
-        check_texts(&self.documents, "documents")
-    }
+    check_texts(&body.documents, "documents")
 }
 
 /// At least one text, none blank (whitespace-only counts as absent). `field`
@@ -146,58 +112,42 @@ pub fn check_texts(texts: &[String], field: &str) -> Result<()> {
     Ok(())
 }
 
-/// Embed one or more texts. Validates locally, sends the documented body, and
-/// restores input order from the response `index` when the provider sends it.
-pub async fn embed(client: &OpenRouterClient, req: &EmbedRequest) -> Result<EmbedResult> {
-    req.validate()?;
-    let body = EmbeddingsBody {
-        model: req.model.clone(),
-        input: EmbeddingsInput::from_texts(req.input.clone()),
-        dimensions: req.dimensions,
-        input_type: req.input_type.clone(),
-        provider: req.provider.clone(),
-    };
-    let reply = client.embeddings(&body).await?;
-    let usage = reply.body.usage.unwrap_or_default();
+/// Embed one or more texts and restore input order from the response `index`
+/// when the provider sends it. The caller has already checked the texts with
+/// [`check_texts`].
+pub async fn embed(client: &OpenRouterClient, body: &EmbeddingsBody) -> Result<EmbedResult> {
+    let (reply, generation_id) = client.embeddings(body).await?;
+    let usage = reply.usage.unwrap_or_default();
     let receipt = crate::billing::Receipt {
         cost: usage.cost,
-        generation_id: reply.generation_id.clone(),
+        generation_id: generation_id.clone(),
     };
-    if reply.body.data.is_empty() {
+    if reply.data.is_empty() {
         return Err(receipt.attach(anyhow::anyhow!("model returned no embeddings")));
     }
-    let mut data = reply.body.data;
+    let mut data = reply.data;
     // Providers are supposed to answer in input order; `index` is the
     // authority when present, so a reordered reply still lines up.
     if data.iter().all(|d| d.index.is_some()) {
         data.sort_by_key(|d| d.index);
     }
     Ok(EmbedResult {
-        model: reply.body.model.unwrap_or_else(|| req.model.clone()),
+        model: reply.model.unwrap_or_else(|| body.model.clone()),
         embeddings: data.into_iter().map(|d| d.embedding).collect(),
         prompt_tokens: usage.prompt_tokens,
         total_tokens: usage.total_tokens,
         cost: usage.cost,
-        generation_id: reply.generation_id,
+        generation_id,
     })
 }
 
-/// Rerank `documents` against `query`. Validates locally and flattens the
-/// reply, filling each result's `text` from the input when the provider does
-/// not echo the document.
-pub async fn rerank(client: &OpenRouterClient, req: &RerankRequest) -> Result<RerankResult> {
-    req.validate()?;
-    let body = RerankBody {
-        model: req.model.clone(),
-        query: req.query.clone(),
-        documents: req.documents.clone(),
-        top_n: req.top_n,
-        provider: req.provider.clone(),
-    };
-    let reply = client.rerank(&body).await?;
-    let usage = reply.body.usage.unwrap_or_default();
+/// Rerank `body.documents` against `body.query` and flatten the reply,
+/// filling each result's `text` from the input when the provider does not
+/// echo the document. The caller has already run [`validate_rerank`].
+pub async fn rerank(client: &OpenRouterClient, body: &RerankBody) -> Result<RerankResult> {
+    let (reply, generation_id) = client.rerank(body).await?;
+    let usage = reply.usage.unwrap_or_default();
     let results = reply
-        .body
         .results
         .into_iter()
         .map(|r| RankedDocument {
@@ -205,24 +155,24 @@ pub async fn rerank(client: &OpenRouterClient, req: &RerankRequest) -> Result<Re
             text: r
                 .document
                 .and_then(|d| d.text)
-                .or_else(|| req.documents.get(r.index).cloned()),
+                .or_else(|| body.documents.get(r.index).cloned()),
             relevance_score: r.relevance_score,
         })
         .collect();
     Ok(RerankResult {
-        model: reply.body.model.unwrap_or_else(|| req.model.clone()),
+        model: reply.model.unwrap_or_else(|| body.model.clone()),
         results,
         cost: usage.cost,
         search_units: usage.search_units,
         total_tokens: usage.total_tokens,
-        generation_id: reply.generation_id,
+        generation_id,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openrouter::{OpenRouterClient, ProviderRouting};
+    use crate::openrouter::{EmbeddingsInput, OpenRouterClient, ProviderRouting};
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -231,18 +181,18 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    fn embed_request(input: &[&str]) -> EmbedRequest {
-        EmbedRequest {
+    fn embed_body(input: &[&str]) -> EmbeddingsBody {
+        EmbeddingsBody {
             model: "openai/text-embedding-3-small".into(),
-            input: strings(input),
+            input: EmbeddingsInput::from_texts(strings(input)),
             dimensions: None,
             input_type: None,
             provider: None,
         }
     }
 
-    fn rerank_request(documents: &[&str]) -> RerankRequest {
-        RerankRequest {
+    fn rerank_body(documents: &[&str]) -> RerankBody {
+        RerankBody {
             model: "cohere/rerank-v3.5".into(),
             query: "rust".into(),
             documents: strings(documents),
@@ -261,6 +211,17 @@ mod tests {
         assert!(err.to_string().contains("blank"), "got: {err}");
         check_texts(&strings(&["a"]), "input").unwrap();
         check_texts(&strings(&["a", "b"]), "input").unwrap();
+    }
+
+    #[test]
+    fn validate_rerank_requires_a_query_and_documents() {
+        let err = validate_rerank(&rerank_body(&[])).unwrap_err();
+        assert!(err.to_string().contains("documents"), "got: {err}");
+        let mut blank_query = rerank_body(&["a"]);
+        blank_query.query = "  ".into();
+        let err = validate_rerank(&blank_query).unwrap_err();
+        assert!(err.to_string().contains("query"), "got: {err}");
+        validate_rerank(&rerank_body(&["a"])).unwrap();
     }
 
     /// Two texts go as an array, `provider.order` rides along, and the result
@@ -295,14 +256,14 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-        let mut req = embed_request(&["a", "b"]);
-        req.dimensions = Some(2);
-        req.input_type = Some("document".into());
-        req.provider = Some(ProviderRouting {
+        let mut body = embed_body(&["a", "b"]);
+        body.dimensions = Some(2);
+        body.input_type = Some("document".into());
+        body.provider = Some(ProviderRouting {
             order: vec!["openai".into()],
             ..Default::default()
         });
-        let result = embed(&client, &req).await.unwrap();
+        let result = embed(&client, &body).await.unwrap();
         assert_eq!(result.embeddings, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
         assert_eq!(result.dimensions(), 2);
         assert_eq!(result.cost, Some(0.00002));
@@ -320,10 +281,10 @@ mod tests {
         assert_eq!(v["generation_id"], "gen-e");
     }
 
-    /// Validation runs before any HTTP call; a 2xx with no vectors is an error
-    /// that still carries the receipt (the provider may have billed).
+    /// A 2xx with no vectors is an error that still carries the receipt (the
+    /// provider may have billed).
     #[tokio::test]
-    async fn embed_rejects_bad_input_locally_and_empty_data_with_receipt() {
+    async fn embed_reports_empty_data_with_the_receipt() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
@@ -335,12 +296,7 @@ mod tests {
             .mount(&mock)
             .await;
         let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-
-        let err = embed(&client, &embed_request(&[])).await.unwrap_err();
-        assert!(err.to_string().contains("input"), "got: {err}");
-        assert_eq!(mock.received_requests().await.unwrap().len(), 0);
-
-        let err = embed(&client, &embed_request(&["x"])).await.unwrap_err();
+        let err = embed(&client, &embed_body(&["x"])).await.unwrap_err();
         assert!(err.to_string().contains("no embeddings"), "got: {err}");
         let receipt = crate::billing::Receipt::from_error(&err).expect("receipt kept");
         assert_eq!(receipt.generation_id.as_deref(), Some("gen-empty"));
@@ -377,9 +333,9 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-        let mut req = rerank_request(&["go", "rust lang", "zig"]);
-        req.top_n = Some(2);
-        let result = rerank(&client, &req).await.unwrap();
+        let mut body = rerank_body(&["go", "rust lang", "zig"]);
+        body.top_n = Some(2);
+        let result = rerank(&client, &body).await.unwrap();
         assert_eq!(result.results.len(), 2);
         assert_eq!(result.results[0].index, 1);
         assert_eq!(
@@ -404,22 +360,6 @@ mod tests {
         assert_eq!(v["generation_id"], "gen-r");
     }
 
-    #[tokio::test]
-    async fn rerank_rejects_empty_documents_and_blank_query_before_any_call() {
-        let mock = MockServer::start().await;
-        let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-
-        let err = rerank(&client, &rerank_request(&[])).await.unwrap_err();
-        assert!(err.to_string().contains("documents"), "got: {err}");
-
-        let mut blank_query = rerank_request(&["a"]);
-        blank_query.query = "  ".into();
-        let err = rerank(&client, &blank_query).await.unwrap_err();
-        assert!(err.to_string().contains("query"), "got: {err}");
-
-        assert_eq!(mock.received_requests().await.unwrap().len(), 0);
-    }
-
     /// An out-of-range `index` from a buggy provider yields no text, not a panic.
     #[tokio::test]
     async fn rerank_tolerates_an_out_of_range_index() {
@@ -432,7 +372,7 @@ mod tests {
             .mount(&mock)
             .await;
         let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-        let result = rerank(&client, &rerank_request(&["only"])).await.unwrap();
+        let result = rerank(&client, &rerank_body(&["only"])).await.unwrap();
         assert_eq!(result.results[0].index, 7);
         assert_eq!(result.results[0].text, None);
         // The request model is the fallback when the reply names none.

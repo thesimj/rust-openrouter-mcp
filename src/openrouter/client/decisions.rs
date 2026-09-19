@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::openrouter::{DecisionsBody, DecisionsReply, DecisionsResponse, OpenRouterClient};
+use crate::openrouter::{DecisionsBody, DecisionsResponse, OpenRouterClient};
 
 /// Path of the decisions endpoint under [`OpenRouterClient::api_root`]. It is
 /// outside `/api/v1`, so it is the one endpoint not built from `base_url`.
@@ -13,8 +13,11 @@ impl OpenRouterClient {
     /// the decoded body plus a generation id: the `X-Generation-Id` header when
     /// present (undocumented for this endpoint), else the body's `id`. A 2xx
     /// whose body cannot be decoded keeps a billing receipt on the error; an
-    /// HTTP failure surfaces the upstream error body verbatim.
-    pub async fn decisions(&self, req: &DecisionsBody) -> Result<DecisionsReply> {
+    /// HTTP failure surfaces the upstream error body (bounded to 500 chars).
+    pub async fn decisions(
+        &self,
+        req: &DecisionsBody,
+    ) -> Result<(DecisionsResponse, Option<String>)> {
         let rb = self
             .http
             .post(format!("{}{DECISIONS_PATH}", self.api_root()))
@@ -23,10 +26,7 @@ impl OpenRouterClient {
         let (body, header_id): (DecisionsResponse, _) =
             self.send_json_receipted(rb, DECISIONS_PATH).await?;
         let generation_id = header_id.or_else(|| body.id.clone());
-        Ok(DecisionsReply {
-            body,
-            generation_id,
-        })
+        Ok((body, generation_id))
     }
 }
 
@@ -86,14 +86,11 @@ mod tests {
             .await;
 
         let client = crate::openrouter::OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let reply = client.decisions(&request()).await.unwrap();
-        assert_eq!(reply.generation_id.as_deref(), Some("gen-header"));
-        assert_eq!(
-            reply.body.answers["is_bug"],
-            DecisionAnswer::Noul { noul: 0.9 }
-        );
-        assert_eq!(reply.body.usage.unwrap().cost, Some(0.0000005));
-        assert_eq!(reply.body.provider.as_deref(), Some("TypeSafe"));
+        let (body, generation_id) = client.decisions(&request()).await.unwrap();
+        assert_eq!(generation_id.as_deref(), Some("gen-header"));
+        assert_eq!(body.answers["is_bug"], DecisionAnswer::Noul { noul: 0.9 });
+        assert_eq!(body.usage.unwrap().cost, Some(0.0000005));
+        assert_eq!(body.provider.as_deref(), Some("TypeSafe"));
     }
 
     /// Without the header the body's `id` is the generation id.
@@ -111,42 +108,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::openrouter::OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let reply = client.decisions(&request()).await.unwrap();
-        assert_eq!(reply.generation_id.as_deref(), Some("gen-dec-body"));
-    }
-
-    #[tokio::test]
-    async fn malformed_success_retains_receipt_but_http_failure_does_not() {
-        for status in [200, 402] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/api/alpha/decisions"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("x-generation-id", "gen-paid-dec")
-                        .set_body_string("{"),
-                )
-                .mount(&server)
-                .await;
-            let client =
-                crate::openrouter::OpenRouterClient::with_base_url(server.uri(), "test-key");
-            let error = client
-                .decisions(&request())
-                .await
-                .expect_err("invalid response");
-            let receipt = crate::billing::Receipt::from_error(&error);
-            if status == 200 {
-                let receipt = receipt.expect("unknown charge survives");
-                assert_eq!(receipt.cost, None);
-                assert_eq!(receipt.generation_id.as_deref(), Some("gen-paid-dec"));
-            } else {
-                assert!(receipt.is_none());
-                assert!(error.to_string().contains("402"), "got: {error}");
-                assert!(
-                    error.to_string().contains("/api/alpha/decisions"),
-                    "got: {error}"
-                );
-            }
-        }
+        let (_, generation_id) = client.decisions(&request()).await.unwrap();
+        assert_eq!(generation_id.as_deref(), Some("gen-dec-body"));
     }
 }

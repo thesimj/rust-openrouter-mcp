@@ -1,4 +1,5 @@
-//! The sidecar `*.manifest.json` record written alongside generated images.
+//! The sidecar `*.manifest.json` records written alongside generated images,
+//! video clips, speech and music.
 //!
 //! Holds the full request settings, per-input-image normalization metadata, and
 //! per-variant output details (including failures), so the lean tool response
@@ -9,14 +10,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+/// The only `prompt_source` / `input_source` value the MCP tools produce: the
+/// prompt arrived in the tool call. The field stays in every manifest for
+/// compatibility with the files earlier versions wrote.
+pub const PROMPT_SOURCE: &str = "inline";
+
 /// The complete record for one generation job.
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub endpoint: &'static str,
     pub model: String,
     pub prompt: String,
-    /// `inline`, `file`, or `stdin`.
-    pub prompt_source: String,
+    /// Always [`PROMPT_SOURCE`].
+    pub prompt_source: &'static str,
     pub aspect_ratio: Option<String>,
     pub image_size: Option<String>,
     pub base_seed: Option<u64>,
@@ -81,13 +87,9 @@ pub struct VariantMeta {
     pub actual_image_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
     pub duration_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -101,7 +103,8 @@ pub fn path(base: &Path) -> PathBuf {
     )
 }
 
-/// Serialize a manifest ([`Manifest`], [`VideoManifest`], or [`AudioManifest`])
+/// Serialize a manifest ([`Manifest`], [`VideoManifest`], [`AudioManifest`] or
+/// [`MusicManifest`])
 /// as pretty JSON and write it to `path`. Async: this runs on job-completion
 /// paths that share a Tokio worker with concurrent `get_result` polls.
 pub async fn write(path: &Path, manifest: &impl Serialize) -> Result<()> {
@@ -123,8 +126,8 @@ pub struct VideoManifest {
     /// Absent for image-only requests (a frame or reference and no text).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    /// `inline`, `file`, `stdin`, or `none`.
-    pub prompt_source: String,
+    /// Always [`PROMPT_SOURCE`].
+    pub prompt_source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,8 +199,8 @@ pub struct AudioManifest {
     pub endpoint: &'static str,
     pub model: String,
     pub input: String,
-    /// `inline`, `file`, or `stdin`.
-    pub input_source: String,
+    /// Always [`PROMPT_SOURCE`].
+    pub input_source: &'static str,
     /// The voice id sent, when one was (voice-cloning models take none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
@@ -221,8 +224,8 @@ pub struct MusicManifest {
     pub endpoint: &'static str,
     pub model: String,
     pub prompt: String,
-    /// `inline`, `file`, or `stdin`.
-    pub prompt_source: String,
+    /// Always [`PROMPT_SOURCE`].
+    pub prompt_source: &'static str,
     /// The requested `audio.format`, when one was sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,

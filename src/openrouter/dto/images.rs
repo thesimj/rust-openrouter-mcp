@@ -1,8 +1,7 @@
 //! DTOs for the dedicated image-generation endpoint (`POST /api/v1/images`).
 //!
-//! Unlike chat-completions image output (which returns a data URL inside
-//! `choices[].message.images`), this endpoint returns base64 image bytes
-//! directly in `data[].b64_json`. `InputReference` (and its `ImageUrl`) and
+//! The endpoint returns base64 image bytes directly in `data[].b64_json`
+//! (this crate does not model chat-completions image output at all). `InputReference` (and its `ImageUrl`) and
 //! `Usage` are reused from the sibling DTO modules via the flat re-export.
 
 use serde::{Deserialize, Serialize};

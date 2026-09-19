@@ -1,4 +1,5 @@
-//! DTOs for `POST /api/v1/chat/completions` (text/vision/image generation).
+//! DTOs for `POST /api/v1/chat/completions` (text/vision, and audio output
+//! for music). Image generation goes through the dedicated `/images` endpoint.
 //!
 //! [`ImageUrl`] is the canonical chat/image reference; it is also reused by the
 //! video DTOs (`FrameImage`/`InputReference`) via the flat `dto::*` re-export.
@@ -19,8 +20,6 @@ pub struct ChatRequest {
     /// Output modalities; omitted for plain text-output (vision/describe) calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_config: Option<ImageConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Sampling temperature; omitted when `None`.
@@ -204,18 +203,9 @@ pub struct VideoUrl {
     pub processing: Option<String>,
 }
 
-/// `image_config` block controlling aspect ratio and resolution tier.
-#[derive(Debug, Serialize)]
-pub struct ImageConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aspect_ratio: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_size: Option<String>,
-}
-
-/// A `{ "url": ... }` image reference, used both in requests (data URLs) and
-/// in responses (generated-image data URLs).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// A `{ "url": ... }` image reference in request content parts: chat
+/// `image_url`, and the `/images` and `/videos` references.
+#[derive(Debug, Clone, Serialize)]
 pub struct ImageUrl {
     pub url: String,
 }
@@ -242,7 +232,6 @@ pub struct Choice {
 }
 
 /// Assistant message in a text/vision response (`chat_completion`, `describe_image`).
-/// Image generation now uses the dedicated `/images` endpoint, so no image field.
 #[derive(Debug, Deserialize)]
 pub struct ResponseMessage {
     #[serde(default)]
@@ -296,7 +285,7 @@ pub struct ChunkChoice {
 
 /// The incremental assistant message. Music models put lyrics or
 /// `<instrumental>` in `content` and the audio itself in `audio.data`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Delta {
     #[serde(default)]
     pub content: Option<String>,

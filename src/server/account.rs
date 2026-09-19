@@ -40,8 +40,9 @@ impl OpenRouterServer {
         description = "Fetch the status and result of a generation job by task_id (returned \
         by generate_image or generate_video when a job is still running after its fast-return \
         window). Returns \
-        status pending|completed|failed; when completed, the same lean result (image paths, \
-        dimensions, manifest) generate_image would have returned. Tasks are in-memory per \
+        status pending|completed|failed; when completed, the same lean result generate_image \
+        or generate_video would have returned (paths, dimensions or resolution, cost, \
+        manifest). Tasks are in-memory per \
         server process and are lost if the server restarts.",
         annotations(
             title = "Get Job Result",

@@ -31,10 +31,10 @@ Desktop, Claude Code, Cursor and other clients. Bring your own OpenRouter API ke
 - **Ask a decision model.** Send TypeSafe Jev a state and typed questions
   (true/false, pick one, score on a scale). Get calibrated probabilities back
   in about a quarter of a second, with no text generation.
-- **Know what you paid.** Every result carries a generation id, and one tool
-  looks up the real charge for it.
+- **Know what you paid.** Every generation result (or its manifest) carries a
+  generation id, and one tool looks up the real charge for it.
 
-Every tool also accepts a `provider` setting. Use it to choose which provider
+Every generation tool also accepts a `provider` setting. Use it to choose which provider
 serves the request, or to pass a provider's own knobs through. See
 [Provider routing](#provider-routing-and-passthrough).
 
@@ -78,7 +78,8 @@ export OPENROUTER_API_KEY="sk-or-v1-..."      # bash/zsh
 $env:OPENROUTER_API_KEY = "sk-or-v1-..."      # PowerShell
 ```
 
-A `.env` file in the working directory works too. Do not commit it.
+A `.env` file in the working directory (or one of its parents) works too. Do
+not commit it.
 
 Generic MCP client config:
 
@@ -101,10 +102,10 @@ Generic MCP client config:
 | `list_models` | Search the catalog. Filter by input/output modality, supported parameters, category, provider, author, price, region, zero-data-retention, model age, and benchmark scores. Sort, page, and see pricing in dollars per million tokens. |
 | `describe_model` | Everything about one model: architecture, context, benchmarks, and each provider endpoint with its pricing and the `allowed_passthrough_parameters` you may send in `provider.options`. |
 | `generate_image` | Text-to-image or image editing. Inputs by path, URL or base64 (up to 16). Pick `aspect_ratio` + `image_size`, or one `size`. Optional `quality`, `output_format`, `background`, `output_compression`, `seed`, `variants`. Long jobs return a `task_id`. |
-| `generate_video` | Text-, image- or reference-to-video. Required: `model`, `duration`, `with_audio`. `prompt` is optional when a frame or reference is given. Optional `resolution`, `aspect_ratio`, `size`, `seed`, `creativity`, `upscale_factor`. Always returns a `task_id`; poll `get_result`. |
+| `generate_video` | Text-, image- or reference-to-video. Required: `model`, `duration`, `with_audio`. `prompt` is optional when a frame or reference is given. Optional `resolution`, `aspect_ratio`, `size`, `seed`, `creativity`, `upscale_factor`. Almost always returns a `task_id` (after `wait_seconds`, default 20); poll `get_result`. |
 | `generate_audio` | Text-to-speech. `voice` is model-specific. Voice cloning: pass a sample as `voice_reference` plus an optional transcript. |
 | `generate_music` | Text-to-music with Google Lyria. Returns the track, the lyrics text, and the per-track cost. |
-| `transcribe_audio` | Speech-to-text from a file or base64. Optional `language`, `verbose_json` with timestamps, and speaker labels via `provider.options`. |
+| `transcribe_audio` | Speech-to-text from a file or base64. Optional `language`, `response_format: "verbose_json"` with `timestamp_granularities`, and speaker labels via `provider.options`. |
 | `chat_completion` | Send a prompt to any chat model. Attach `images`, `files`, `audio`, `videos`. Ask for `json_mode` or a `json_schema`. Turn on `web_search`. Control sampling and reasoning. |
 | `describe_image` | Describe one or more images with a vision model. |
 | `embed_text` | Float vectors for a list of texts. |
@@ -122,11 +123,13 @@ the right kind of model, for example `output_modalities="transcription"`.
 ## Provider routing and passthrough
 
 OpenRouter can route one model to several providers. The `provider` object on
-each tool lets you steer that.
+each generation tool lets you steer that.
 
-**Routing** (chat, describe_image, generate_music, embed_text, rerank_documents,
-make_decisions, generate_image): `order`, `only`, `ignore`, `allow_fallbacks`,
-`require_parameters`, `zdr`, `sort`.
+**Routing** (chat_completion, describe_image, generate_music, embed_text,
+rerank_documents, make_decisions): `order`, `only`, `ignore`, `allow_fallbacks`,
+`require_parameters`, `zdr`, `sort` (plus `sort_partition`). `generate_image`
+takes the subset `order`, `only`, `ignore`, `allow_fallbacks`, `sort` (plus
+`sort_partition`), next to its `options`.
 
 ```json
 { "provider": { "order": ["anthropic", "google-vertex"], "allow_fallbacks": false } }
@@ -216,18 +219,19 @@ defaults.
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | Your OpenRouter key. | required |
-| `OPENROUTER_MCP_OUTPUT_DIR` | Where generated files land when you give no `output` path. | `$HOME/Downloads/openrouter-mcp` |
+| `OPENROUTER_MCP_OUTPUT_DIR` | Where generated files land when you give no `output` path. | `$HOME/Downloads/openrouter-mcp`, else the system temp dir |
 | `OPENROUTER_MCP_IMAGE_PREVIEWS` | Embed previews of generated media in tool results: `auto`, `always`, `never`. `auto` embeds for every client except Claude Code, which can open the saved file itself. | `auto` |
 | `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest side, in pixels, that input images are scaled down to before upload. Hard ceiling 4096. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Seconds between video status checks. | `5` |
 | `OPENROUTER_VIDEO_POLL_TIMEOUT` | Seconds to wait for a video job. | `600` |
 | `OPENROUTER_VIDEO_DELIVERY_TIMEOUT` | Seconds allowed for downloading finished clips, retries included. | off |
-| `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to let running jobs finish after the client disconnects. | `30` |
+| `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to let running jobs finish after the client disconnects (max 300). | `30` |
 | `OPENROUTER_HTTP_REFERER`, `OPENROUTER_X_TITLE` | App attribution headers shown in OpenRouter rankings. | this repo |
 
 **Limits worth knowing.** Input images: 16 per request, 20 MiB each, 64 MiB per
-batch. Audio for transcription or cloning: 25 MiB. Files, audio and video
-attached to chat: 20 MiB each. At most 32 image or video jobs wait at once, and
+batch. Audio for transcription, and audio attached to chat: 25 MiB. A
+voice-cloning sample: 15 MiB. Files and video attached to chat: 20 MiB each. At
+most 32 image or video jobs wait at once, and
 8 synchronous calls run at once. Job status lives in memory and is gone when
 the server exits.
 
@@ -235,12 +239,12 @@ the server exits.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-CI runs the same three checks plus a build at the minimum supported Rust
-version on every push and pull request. A version tag triggers the release
+CI runs the same three checks plus a `cargo check --all-targets` at the minimum
+supported Rust version on every push and pull request. A version tag triggers the release
 workflow, which builds the `.mcpb` bundles for macOS, Windows and Linux.
 
 Release notes and the list of OpenRouter features left out on purpose live in
@@ -249,7 +253,7 @@ Release notes and the list of OpenRouter features left out on purpose live in
 ## Privacy
 
 `openrouter-mcp` runs on your machine and sends nothing anywhere except to
-OpenRouter, plus a direct fetch of any image URL you pass as input. No
+OpenRouter, plus a direct fetch of any image or file URL you pass as input. No
 telemetry. Details in [PRIVACY.md](PRIVACY.md).
 
 ## License

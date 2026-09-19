@@ -4,8 +4,9 @@
 //! family declares its block `additionalProperties: false`, so the *type* has
 //! to decide what may be sent:
 //!
-//! - [`ProviderRouting`] - chat completions, `/embeddings`, `/rerank`: routing
-//!   fields only. There is no `options` passthrough on these endpoints.
+//! - [`ProviderRouting`] - chat completions, `/embeddings`, `/rerank` and
+//!   `/api/alpha/decisions`: routing fields only. There is no `options`
+//!   passthrough on these endpoints.
 //! - [`ImageProvider`] - `/images`: the routing subset OpenRouter documents
 //!   there (`order`, `only`, `ignore`, `allow_fallbacks`, `sort`) plus `options`.
 //! - [`ProviderOptions`] - `/audio/speech`, `/audio/transcriptions`, `/videos`:
@@ -39,7 +40,8 @@ pub enum ProviderSort {
     Partitioned { by: String, partition: String },
 }
 
-/// Routing-only block for chat completions, `/embeddings` and `/rerank`.
+/// Routing-only block for chat completions, `/embeddings`, `/rerank` and
+/// `/api/alpha/decisions`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProviderRouting {
     /// Provider slugs to try in order; disables load balancing.
@@ -64,13 +66,9 @@ pub struct ProviderRouting {
 }
 
 impl ProviderRouting {
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
     /// `None` when nothing is set, so request DTOs can `skip_serializing_if`.
     pub fn non_empty(self) -> Option<Self> {
-        (!self.is_empty()).then_some(self)
+        (self != Self::default()).then_some(self)
     }
 }
 
@@ -92,12 +90,8 @@ pub struct ImageProvider {
 }
 
 impl ImageProvider {
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
     pub fn non_empty(self) -> Option<Self> {
-        (!self.is_empty()).then_some(self)
+        (self != Self::default()).then_some(self)
     }
 }
 

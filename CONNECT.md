@@ -277,8 +277,9 @@ exceptions:
 
 ## Inline image previews per client
 
-`generate_image` always saves to disk **and**, by default (`auto`), returns the
-image inline for clients that can't read your filesystem. Local CLIs that share
+`generate_image` (and the video, speech and music tools) always saves to disk
+**and**, by default (`auto`), returns the media inline (a `file://` link for
+video) for clients that can't read your filesystem. Local CLIs that share
 your filesystem (detected as `claude-code`) get paths only - they can open the
 file directly. Force it either way with `OPENROUTER_MCP_IMAGE_PREVIEWS=always|never`
 in the server's `env`. See [Configuration](README.md#configuration).
@@ -294,12 +295,14 @@ Most clients list discovered tools after connecting. You should see all 17:
 agent to *"list OpenRouter image models"* to confirm `list_models` runs.
 
 Every generation tool takes an optional `provider` object. Its shape depends on
-the endpoint: routing keys (`order`, `only`, `ignore`, `allow_fallbacks`,
-`sort`, plus `require_parameters`/`zdr` on chat, embeddings, rerank and
-decisions) and,
-on `generate_image`, `generate_audio`, `transcribe_audio` and `generate_video`,
-a `provider.options` map keyed by provider slug for that provider's own
-parameters (e.g. `{"options": {"deepgram": {"diarize": true}}}`). Check
+the endpoint. Routing keys (`order`, `only`, `ignore`, `allow_fallbacks`,
+`require_parameters`, `zdr`, `sort`) on `chat_completion`, `describe_image`,
+`generate_music`, `embed_text`, `rerank_documents` and `make_decisions`;
+`generate_image` takes the subset `order`, `only`, `ignore`, `allow_fallbacks`,
+`sort` (plus `sort_partition`). A `provider.options` map keyed by provider slug, for that provider's own
+parameters, on `generate_image`, `generate_audio`, `transcribe_audio` and
+`generate_video` (the last three take no routing keys), e.g.
+`{"options": {"deepgram": {"diarize": true}}}`. Check
 `describe_model` for each endpoint's `allowed_passthrough_parameters` first.
 
 You can also sanity-check the binary by hand:

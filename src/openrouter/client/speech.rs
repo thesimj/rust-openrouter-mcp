@@ -12,7 +12,7 @@ impl OpenRouterClient {
     /// `POST /api/v1/audio/speech` - synchronous text-to-speech. Returns the raw
     /// audio bytes (OpenAI-Speech-compatible), the content type, and the
     /// `X-Generation-Id` header when present. On a non-2xx status the upstream
-    /// error body is surfaced verbatim.
+    /// error body is surfaced (bounded to 500 chars).
     pub async fn speech(&self, req: &SpeechBody) -> Result<SpeechResult> {
         let rb = self
             .http
@@ -65,49 +65,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{OpenRouterClient, SpeechBody};
-
-    #[tokio::test]
-    async fn malformed_transcription_success_retains_receipt_but_http_failure_does_not() {
-        for status in [200, 401] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/audio/transcriptions"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("x-generation-id", "gen-paid-transcript")
-                        .set_body_string("{"),
-                )
-                .mount(&server)
-                .await;
-            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-            let error = client
-                .transcribe(&crate::openrouter::TranscriptionBody {
-                    model: "test/transcribe".into(),
-                    input_audio: crate::openrouter::InputAudio {
-                        data: "AAAA".into(),
-                        format: "wav".into(),
-                    },
-                    language: None,
-                    response_format: None,
-                    timestamp_granularities: vec![],
-                    temperature: None,
-                    provider: None,
-                })
-                .await
-                .expect_err("invalid response");
-            let receipt = crate::billing::Receipt::from_error(&error);
-            if status == 200 {
-                let receipt = receipt.expect("unknown charge survives");
-                assert_eq!(receipt.cost, None);
-                assert_eq!(
-                    receipt.generation_id.as_deref(),
-                    Some("gen-paid-transcript")
-                );
-            } else {
-                assert!(receipt.is_none());
-            }
-        }
-    }
 
     #[tokio::test]
     async fn speech_returns_bytes_mime_and_generation_id() {

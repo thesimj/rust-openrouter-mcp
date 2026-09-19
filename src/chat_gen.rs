@@ -30,10 +30,11 @@ pub struct ChatResult {
     pub completion_tokens: Option<u64>,
 }
 
-/// Everything needed to issue one chat completion. `images` empty => a plain
-/// text-in / text-out call; non-empty => a multimodal user message where each
-/// image is normalized to a PNG data URL capped at `max_image_dimension` (which
-/// is unused — and may be any value — when `images` is empty). The caller is
+/// Everything needed to issue one chat completion. With no `images`, `files`,
+/// `audio` or `videos` the user message is plain text; otherwise it is a
+/// multimodal message where each image is normalized to a data URL (JPEG,
+/// or PNG when it has alpha) capped at `max_image_dimension` (unused, and
+/// therefore any value, when `images` is empty). The caller is
 /// responsible for having verified the model accepts image input. `prompt` is
 /// assumed already validated as non-empty. Every optional control is passed
 /// through as given (blank strings count as unset); contradictions between
@@ -92,8 +93,9 @@ fn reasoning(inputs: &ChatInputs<'_>) -> Option<Reasoning> {
 }
 
 /// Build a chat request (optional system message, then the user message) and
-/// return the model's reply text and cost. Errors if the model returns no
-/// choices or empty content.
+/// return the reply: text, generation id, cost and token counts, plus the
+/// reasoning, annotations and finish reason when present. Errors if the
+/// model returns no choices or empty content.
 pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Result<ChatResult> {
     let mut messages = Vec::new();
     if let Some(system) = inputs.system.map(str::trim).filter(|s| !s.is_empty()) {
@@ -120,7 +122,7 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         let mut parts = vec![ContentPart::Text {
             text: inputs.prompt.to_string(),
         }];
-        // `into_iter`: each data_url is a base64 PNG (hundreds of KB), so move it
+        // `into_iter`: each data_url is a base64 image (hundreds of KB), so move it
         // into the request rather than cloning every input image.
         for input in prepared {
             parts.push(ContentPart::ImageUrl {
@@ -161,7 +163,6 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         model: inputs.model.to_string(),
         messages,
         modalities: None,
-        image_config: None,
         seed: inputs.seed,
         temperature: inputs.temperature,
         max_tokens: inputs.max_tokens,

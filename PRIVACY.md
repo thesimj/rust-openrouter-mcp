@@ -1,6 +1,6 @@
 # Privacy Policy
 
-_Last updated: 2026-08-21_
+_Last updated: 2026-09-19_
 
 `openrouter-mcp` is a local Model Context Protocol (MCP) server that runs
 entirely on your own machine. It is a thin client for the
@@ -16,22 +16,30 @@ of its own.
 
 `openrouter-mcp` communicates with exactly one third party - **OpenRouter** -
 and only to perform the tool call you (or your AI assistant) explicitly make.
-The 13 tools break down into a few classes:
+The 17 tools break down into a few classes:
 
 - **Model discovery** (`list_models`, `describe_model`): sends your query/
   filter parameters, or a model id, to OpenRouter's model-catalog and
   per-model/per-provider-endpoint routes.
 - **Chat and vision** (`chat_completion`, `describe_image`): sends your
-  prompt, and any images you attach, to the chat/vision model you select.
+  prompt and any images, files, audio or video you attach to the model you
+  select.
+- **Embeddings, rerank and decisions** (`embed_text`, `rerank_documents`,
+  `make_decisions`): sends your texts, your query and documents, or your
+  `state` and questions to the model you select, via `/embeddings`, `/rerank`
+  and the alpha endpoint `/api/alpha/decisions` (outside `/api/v1`).
 - **Image, video, speech, and music generation** (`generate_image`,
   `generate_video`, `generate_audio`, `generate_music`): sends your prompt and
-  any local input images to the model you select, via OpenRouter's dedicated
+  any local inputs - images, reference audio or video clips, a voice-cloning
+  sample - to the model you select, via OpenRouter's dedicated
   `/images`, `/videos`, and `/audio/speech` endpoints; music has no dedicated
   endpoint and goes to `/chat/completions` as a streamed audio-output request.
 - **Transcription** (`transcribe_audio`): sends the audio you provide to the
   speech-to-text model you select.
 - **Account/key info** (`get_account`): reads your key's label, usage, and
   credit balance from OpenRouter's `/key` and `/credits` endpoints.
+- **Billing lookup** (`get_generation`): sends a generation id to
+  OpenRouter's `/generation` endpoint and returns its stored cost record.
 - **Local only, no network call**: `get_result`, `get_usage_stats`, and
   `reset_usage_stats` read or reset the server's own in-memory job/usage
   state and never contact OpenRouter (or anyone else).
@@ -46,8 +54,8 @@ Your **OpenRouter API key** is sent to OpenRouter, and only OpenRouter, to
 authenticate the requests above.
 
 Separately, and not to OpenRouter: when you pass an image by `url` (to
-`generate_image`, `describe_image`, or `chat_completion`), the software
-fetches that URL itself, directly from your machine to whatever host you
+`generate_image`, `describe_image`, or `chat_completion`) or a document by
+`files[].url` (to `chat_completion`), the software fetches that URL itself, directly from your machine to whatever host you
 named. This deliberately uses a plain, unauthenticated HTTP client - a
 different client than the one used for OpenRouter - which is *why* your API
 key is never sent anywhere but OpenRouter: it is never attached to this
@@ -63,7 +71,8 @@ OpenRouter's handling of this data is governed by OpenRouter's own
 - **API key**: when installed as a Claude Desktop extension, your API key is
   stored by Claude Desktop in your operating system's secure keychain.
   When an MCP client launches the binary directly, the binary reads
-  `OPENROUTER_API_KEY` from its environment or a local `.env` file.
+  `OPENROUTER_API_KEY` from its environment or a `.env` file in the working
+  directory or one of its parents.
 - **Generated images, video clips, speech and music files, and their manifests**:
   written to the path you specify, or, when you don't specify one,
   auto-named under `OPENROUTER_MCP_OUTPUT_DIR` if set, else

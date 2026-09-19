@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::openrouter::{Model, ModelsQuery, ModelsResponse, OpenRouterClient};
+use crate::openrouter::{ModelsQuery, ModelsResponse, OpenRouterClient, unwrap_data};
 
 impl OpenRouterClient {
     /// The `input_modalities` declared for a single model id (e.g.
@@ -22,8 +22,9 @@ impl OpenRouterClient {
             ..Default::default()
         };
         let model = self
-            .list_models(&query)
+            .list_models_page(&query)
             .await?
+            .data
             .into_iter()
             .find(|m| m.id == model_id)
             .with_context(|| format!("model '{model_id}' not found on OpenRouter"))?;
@@ -33,18 +34,11 @@ impl OpenRouterClient {
             .unwrap_or_default())
     }
 
-    /// `GET /api/v1/models` - every model with capabilities and pricing.
-    ///
-    /// `query` carries OpenRouter's server-side filters (modalities, sort,
-    /// free-text, price/context bounds, ...) so the API does the filtering.
-    /// Returns the models only; use [`list_models_page`](Self::list_models_page)
-    /// when the pagination envelope (`total_count`, `links.next`) matters.
-    pub async fn list_models(&self, query: &ModelsQuery) -> Result<Vec<Model>> {
-        Ok(self.list_models_page(query).await?.data)
-    }
-
-    /// `GET /api/v1/models` keeping the whole response: the page of models plus
-    /// `total_count` (matches before `limit`/`offset`) and `links.next`.
+    /// `GET /api/v1/models` - every model with capabilities and pricing, as the
+    /// whole response: the page of models plus `total_count` (matches before
+    /// `limit`/`offset`) and `links.next`. `query` carries OpenRouter's
+    /// server-side filters (modalities, sort, free-text, price/context bounds,
+    /// ...) so the API does the filtering.
     pub async fn list_models_page(&self, query: &ModelsQuery) -> Result<ModelsResponse> {
         let rb = self
             .http
@@ -65,11 +59,10 @@ impl OpenRouterClient {
             .http
             .get(format!("{}/models/{}/endpoints", self.base_url, model_id))
             .bearer_auth(&self.api_key);
-        let mut body: Value = self
+        let body = self
             .send_json(rb, &format!("/models/{model_id}/endpoints"))
             .await?;
-        // Unwrap the `data` envelope (model + endpoints) when present.
-        Ok(body.get_mut("data").map(Value::take).unwrap_or(body))
+        Ok(unwrap_data(body))
     }
 
     /// `GET /api/v1/videos/models`, returning the entry whose `id` matches
@@ -108,12 +101,8 @@ impl OpenRouterClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let resp = resp.checked(&label).await?;
-        let mut body: Value = resp
-            .json()
-            .await
-            .with_context(|| format!("failed to decode OpenRouter {label} response"))?;
-        Ok(Some(body.get_mut("data").map(Value::take).unwrap_or(body)))
+        let body = resp.checked(&label).await?.decode(&label).await?;
+        Ok(Some(unwrap_data(body)))
     }
 }
 
@@ -156,7 +145,7 @@ mod tests {
             context: Some(128_000),
             ..Default::default()
         };
-        let models = client.list_models(&query).await.unwrap();
+        let models = client.list_models_page(&query).await.unwrap().data;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "openai/gpt");
         assert_eq!(models[0].context_length, Some(128_000));
@@ -238,7 +227,10 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        client.list_models(&fully_filtered_query()).await.unwrap();
+        client
+            .list_models_page(&fully_filtered_query())
+            .await
+            .unwrap();
     }
 
     /// Unset filters are omitted, not sent empty; and `zdr: Some(false)` is
@@ -261,11 +253,11 @@ mod tests {
             zdr: Some(false),
             ..Default::default()
         };
-        client.list_models(&query).await.unwrap();
+        client.list_models_page(&query).await.unwrap();
     }
 
     /// `list_models_page` keeps the pagination envelope (`total_count`,
-    /// `links.next`) that `list_models` strips.
+    /// `links.next`) from the response.
     #[tokio::test]
     async fn list_models_page_keeps_total_count_and_next_link() {
         let server = MockServer::start().await;
@@ -312,7 +304,10 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        client.list_models(&ModelsQuery::default()).await.unwrap();
+        client
+            .list_models_page(&ModelsQuery::default())
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let encodings = requests[0].headers.get("accept-encoding");
@@ -334,7 +329,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "bad-key");
         let err = client
-            .list_models(&ModelsQuery::default())
+            .list_models_page(&ModelsQuery::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("401"), "got: {err}");

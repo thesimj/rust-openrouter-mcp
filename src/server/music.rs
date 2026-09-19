@@ -1,11 +1,8 @@
 //! The `generate_music` tool and its argument struct.
 
 use rmcp::{
-    ErrorData, RoleServer,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    service::RequestContext,
-    tool, tool_router,
+    ErrorData, RoleServer, handler::server::wrapper::Parameters, model::CallToolResult,
+    service::RequestContext, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -15,7 +12,7 @@ use crate::music_gen::{self, MusicGenRequest};
 use crate::server::naming;
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::{
-    attach_warnings_errors, client_wants_inline_previews, inline_audio_block,
+    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, json_text_result,
 };
 use crate::server::schema::{
     RequireFields, de_lenient, de_opt_uint, require_all, scalarize_nullable,
@@ -24,7 +21,7 @@ use crate::server::schema::{
 use super::OpenRouterServer;
 
 /// Arguments for the `generate_music` tool.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 #[schemars(transform = RequireFields(&["prompt"]))]
 pub(crate) struct GenerateMusicArgs {
@@ -74,9 +71,11 @@ impl OpenRouterServer {
         live); the saved extension follows the bytes returned. Pricing: list_models shows 0 token pricing for these models because they bill a \
         flat fee per track, stated only in the model description ($0.04 per Lyria clip, \
         $0.08 per song); the actual charge comes back as cost_usd. Returns JSON with the saved \
-        path, mime, the model's text (lyrics, or \"<instrumental>\"), cost_usd, and the \
-        manifest path; for sandboxed clients also an inline audio block when the file is \
-        small enough. If the stream ends before its [DONE] sentinel the track is still saved but \
+        path, mime, the model's text (lyrics, or \"<instrumental>\"), cost_usd, \
+        generation_id, and the manifest path; for sandboxed clients also an inline audio \
+        block when the file is small enough. `provider` carries routing only (order, only, \
+        ignore, allow_fallbacks, require_parameters, zdr, sort) - chat completions have no \
+        passthrough options. If the stream ends before its [DONE] sentinel the track is still saved but \
         the result carries a `warnings` entry saying it may be cut short. `output` is optional - \
         omit it for an auto-named file under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).",
@@ -137,9 +136,9 @@ impl OpenRouterServer {
             req.seed,
         );
 
-        match music_gen::run_job(&self.client, &req, &output, "inline").await {
+        match music_gen::run_job(&self.client, &req, &output).await {
             Ok(result) => {
-                self.stats.record_audio(&model, true, result.cost).await;
+                self.stats.record_audio(&model, result.cost).await;
                 let mut env = json!({
                     "ok": true,
                     "kind": "music",
@@ -163,20 +162,15 @@ impl OpenRouterServer {
                     env["generation_id"] = json!(id);
                 }
                 attach_warnings_errors(&mut env, &result.warnings, &[]);
-                let body = serde_json::to_string_pretty(&env)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let mut blocks = vec![ContentBlock::text(body)];
+                let mut res = json_text_result(&env)?;
                 if inline_previews {
-                    blocks.extend(
-                        inline_audio_block(result.music.path.clone(), result.music.mime.clone())
-                            .await?,
-                    );
+                    res.content
+                        .extend(inline_audio_block(result.music.path, result.music.mime).await?);
                 }
-                Ok(CallToolResult::success(blocks))
+                Ok(res)
             }
             Err(e) => {
-                self.stats.record_audio(&model, false, None).await;
-                self.stats.record_failed_receipt(&model, &e).await;
+                self.stats.record_audio_failure(&model, &e).await;
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }

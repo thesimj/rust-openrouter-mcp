@@ -1,5 +1,6 @@
-//! JSON-Schema normalization and tolerant scalar deserialization helpers shared
-//! by every tool-argument struct, plus the shared required-parameter validator.
+//! Argument helpers shared by every tool: JSON-Schema normalization, tolerant
+//! scalar and list deserialization, the blank-means-absent list cleaner, and
+//! the required-parameter validator.
 
 use rmcp::ErrorData;
 
@@ -214,6 +215,16 @@ where
             .map_err(|e| D::Error::custom(format!("invalid JSON in string argument: {e}"))),
         other => serde_json::from_value(other).map_err(D::Error::custom),
     }
+}
+
+/// Trim every entry of a string-list argument and drop the blank ones (the
+/// repo-wide "blank means absent" rule), for provider slugs and domain lists.
+pub(crate) fn clean_list(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Shared "no defaults" validator: if any required-but-absent parameters were

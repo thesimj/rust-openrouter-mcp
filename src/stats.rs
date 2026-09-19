@@ -58,6 +58,15 @@ impl Default for Inner {
 }
 
 impl Inner {
+    /// Account the receipt carried by a failed request, if the provider had
+    /// already answered (and so billed) before the local failure. A receipt
+    /// without usage counts as an unknown cost, not as free.
+    fn record_failed_receipt(&mut self, model: &str, error: &anyhow::Error) {
+        if let Some(receipt) = crate::billing::Receipt::from_error(error) {
+            self.account_cost(model, receipt.cost);
+        }
+    }
+
     /// Add a reported (or unreported) cost to both the global and a per-model
     /// counter: known costs accumulate in `actual_cost_usd`, unknown ones bump
     /// `unknown_cost_count`. Returns the per-model entry for further updates.
@@ -123,17 +132,13 @@ impl UsageStats {
         m.unknown_cost_count += unknown_cost;
     }
 
-    /// Record one text/vision request (e.g. describe_image). `cost` is the
-    /// reported USD `usage.cost`, if any; a failed request only bumps the
-    /// failure counters.
-    pub async fn record_text(&self, model: &str, success: bool, cost: Option<f64>) {
+    /// Record one successful text-family request (chat, describe_image,
+    /// transcribe_audio, embed_text, rerank_documents, make_decisions). `cost`
+    /// is the reported USD `usage.cost`, if any. Failures go through
+    /// [`record_text_failure`](Self::record_text_failure).
+    pub async fn record_text(&self, model: &str, cost: Option<f64>) {
         let mut s = self.inner.lock().await;
         s.requests_total += 1;
-        if !success {
-            s.requests_failed += 1;
-            s.by_model.entry(model.to_string()).or_default().requests += 1;
-            return;
-        }
         s.text_generations += 1;
         s.account_cost(model, cost).requests += 1;
     }
@@ -161,19 +166,15 @@ impl UsageStats {
         m.videos_generated += clips;
     }
 
-    /// Record one finished audio generation: text-to-speech (`generate_audio`)
-    /// or music (`generate_music`). Speech passes `cost: None` (the speech
-    /// endpoint returns no inline usage.cost), which lands in
-    /// `unknown_cost_count`; music passes the stream's `usage.cost`.
-    pub async fn record_audio(&self, model: &str, success: bool, cost: Option<f64>) {
+    /// Record one successful audio generation: text-to-speech
+    /// (`generate_audio`) or music (`generate_music`). Speech passes `cost:
+    /// None` (the speech endpoint returns no inline usage.cost), which lands in
+    /// `unknown_cost_count`; music passes the stream's `usage.cost`. Failures
+    /// go through [`record_audio_failure`](Self::record_audio_failure).
+    pub async fn record_audio(&self, model: &str, cost: Option<f64>) {
         let mut s = self.inner.lock().await;
         s.requests_total += 1;
         s.audio_generations += 1;
-        if !success {
-            s.requests_failed += 1;
-            s.by_model.entry(model.to_string()).or_default().requests += 1;
-            return;
-        }
         s.audio_files += 1;
         let m = s.account_cost(model, cost);
         m.requests += 1;
@@ -196,17 +197,23 @@ impl UsageStats {
     /// failure counters plus whatever receipt `error` carries. The two always
     /// go together - a failed call that the provider answered is still billed.
     pub async fn record_text_failure(&self, model: &str, error: &anyhow::Error) {
-        self.record_text(model, false, None).await;
-        self.record_failed_receipt(model, error).await;
+        let mut s = self.inner.lock().await;
+        s.requests_total += 1;
+        s.requests_failed += 1;
+        s.by_model.entry(model.to_string()).or_default().requests += 1;
+        s.record_failed_receipt(model, error);
     }
 
-    /// Account the receipt carried by a failed request, if the provider had
-    /// already answered (and so billed) before the local failure. A receipt
-    /// without usage counts as an unknown cost, not as free.
-    pub async fn record_failed_receipt(&self, model: &str, error: &anyhow::Error) {
-        if let Some(receipt) = crate::billing::Receipt::from_error(error) {
-            self.inner.lock().await.account_cost(model, receipt.cost);
-        }
+    /// Record one failed audio generation (`generate_audio`, `generate_music`):
+    /// the failure counters plus whatever receipt `error` carries - the same
+    /// pairing as [`record_text_failure`](Self::record_text_failure).
+    pub async fn record_audio_failure(&self, model: &str, error: &anyhow::Error) {
+        let mut s = self.inner.lock().await;
+        s.requests_total += 1;
+        s.requests_failed += 1;
+        s.audio_generations += 1;
+        s.by_model.entry(model.to_string()).or_default().requests += 1;
+        s.record_failed_receipt(model, error);
     }
 
     /// A JSON snapshot of the current counters.
@@ -296,9 +303,11 @@ mod tests {
     #[tokio::test]
     async fn record_text_tracks_describe_calls() {
         let stats = UsageStats::new();
-        stats.record_text("vision-a", true, Some(0.002)).await;
-        stats.record_text("vision-a", true, None).await; // success, cost unknown
-        stats.record_text("vision-b", false, None).await; // failed
+        stats.record_text("vision-a", Some(0.002)).await;
+        stats.record_text("vision-a", None).await; // success, cost unknown
+        stats
+            .record_text_failure("vision-b", &anyhow::anyhow!("boom"))
+            .await;
 
         let s = stats.snapshot().await;
         assert_eq!(s["requests_total"], 3);
@@ -382,5 +391,29 @@ mod audit_regression {
         assert_eq!(output["requests_failed"], 2);
         assert_eq!(output["actual_cost_usd"], 0.02);
         assert_eq!(output["unknown_cost_count"], 0);
+    }
+
+    /// The audio twin: a music stream that answered (and billed) but carried
+    /// no audio counts as one failed audio generation with its cost booked;
+    /// a receipt without a cost is an unknown charge, not a free one.
+    #[tokio::test]
+    async fn failed_audio_generation_keeps_receipt_and_counts_no_file() {
+        let stats = UsageStats::new();
+        let billed = anyhow::anyhow!("no audio").context(Receipt {
+            cost: Some(0.04),
+            generation_id: Some("gen-music".into()),
+        });
+        stats.record_audio_failure("lyria", &billed).await;
+        let unknown = anyhow::anyhow!("no audio").context(Receipt::default());
+        stats.record_audio_failure("lyria", &unknown).await;
+        let output = stats.snapshot().await;
+        assert_eq!(output["requests_total"], 2);
+        assert_eq!(output["requests_failed"], 2);
+        assert_eq!(output["audio_generations"], 2);
+        assert_eq!(output["audio_files"], 0);
+        assert_eq!(output["actual_cost_usd"], 0.04);
+        assert_eq!(output["unknown_cost_count"], 1);
+        assert_eq!(output["by_model"]["lyria"]["requests"], 2);
+        assert_eq!(output["by_model"]["lyria"]["audio_files"], 0);
     }
 }

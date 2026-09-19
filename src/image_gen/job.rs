@@ -40,24 +40,10 @@ pub async fn generate_variants(
     let base_seed = req.seed;
     // saturating_add: a base seed near u64::MAX must not overflow-panic.
     let seed_for = |i: usize| base_seed.map(|s| s.saturating_add(i as u64));
-    // One shared copy of the request and pre-built content; each task builds
-    // its request body only once it holds a permit, so at most
-    // MAX_CONCURRENT_VARIANTS copies of the reference images exist at a time.
-    let req = Arc::new(GenerateRequest {
-        model: req.model.clone(),
-        prompt: String::new(), // GenContent already contains the assembled prompt.
-        aspect_ratio: req.aspect_ratio.clone(),
-        image_size: req.image_size.clone(),
-        seed: req.seed,
-        images: Vec::new(), // Normalized references live in GenContent.
-        max_image_dimension: req.max_image_dimension,
-        quality: req.quality.clone(),
-        output_format: req.output_format.clone(),
-        background: req.background.clone(),
-        output_compression: req.output_compression,
-        size: req.size.clone(),
-        provider: req.provider.clone(),
-    });
+    // One shared copy of the request and the pre-built content (the normalized
+    // reference images already live in `GenContent` behind one Arc, and inline
+    // input bytes are `Arc<[u8]>`, so this clone is cheap).
+    let req = Arc::new(req.clone());
     let content = Arc::new(content);
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_VARIANTS));
     // Dropping this set aborts every outstanding variant, including tasks
@@ -157,7 +143,6 @@ pub async fn run_job(
     req: &GenerateRequest,
     variants: usize,
     base_output: &Path,
-    prompt_source: &str,
 ) -> Result<JobSummary> {
     // Normalize input images once, up front - reused for every variant request
     // and for the manifest (a read/decode failure fails the whole job before any
@@ -194,15 +179,7 @@ pub async fn run_job(
                 .map(move |w| format!("input image {}: {w}", i + 1))
         })
         .collect();
-    save_outcomes(
-        req,
-        base_output,
-        prompt_source,
-        input_images,
-        warnings,
-        outcomes,
-    )
-    .await
+    save_outcomes(req, base_output, input_images, warnings, outcomes).await
 }
 
 /// Delivery and receipt for one image, independent of batch aggregation.
@@ -239,7 +216,6 @@ async fn deliver_variant(
                 generation_id: img.generation_id.clone(),
             });
             meta.generation_id = img.generation_id.clone();
-            meta.provider = img.provider.clone();
             meta.cost = img.cost;
             let ext = image_io::extension_for(&img.mime);
             let path = variant_output_path(base_output, outcome.seed, outcome.index, variants, ext);
@@ -262,10 +238,6 @@ async fn deliver_variant(
                     meta.height = Some(img.height);
                     meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
                     meta.actual_image_size = Some(check.actual_image_size.to_string());
-                    meta.generation_id = img.generation_id.clone();
-                    meta.provider = img.provider.clone();
-                    meta.cost = img.cost;
-                    meta.text = img.text.clone();
                     image = Some(ImageSummary {
                         path,
                         seed: outcome.seed,
@@ -306,7 +278,6 @@ async fn deliver_variant(
 async fn save_outcomes(
     req: &GenerateRequest,
     base_output: &Path,
-    prompt_source: &str,
     input_images: Vec<InputImageMeta>,
     mut warnings: Vec<String>,
     outcomes: Vec<VariantOutcome>,
@@ -332,7 +303,7 @@ async fn save_outcomes(
         endpoint: "/api/v1/images",
         model: req.model.clone(),
         prompt: req.prompt.clone(),
-        prompt_source: prompt_source.to_string(),
+        prompt_source: crate::manifest::PROMPT_SOURCE,
         aspect_ratio: req.aspect_ratio.clone(),
         image_size: req.image_size.clone(),
         base_seed: req.seed,
@@ -444,7 +415,7 @@ mod tests {
             }),
         };
         let base = std::env::temp_dir().join("openrouter-mcp-manifest-knobs-test/hero.png");
-        let summary = run_job(&client, &req, 1, &base, "inline").await.unwrap();
+        let summary = run_job(&client, &req, 1, &base).await.unwrap();
 
         let manifest_json = std::fs::read_to_string(&summary.manifest_path).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
@@ -492,10 +463,8 @@ mod audit_regression {
             mime: "image/png".into(),
             width: 1,
             height: 1,
-            text: None,
             cost,
             generation_id: Some(id.into()),
-            provider: Some("test".into()),
             warnings: vec!["provider note".into()],
         };
         let results = vec![
@@ -519,7 +488,7 @@ mod audit_regression {
                 result,
             })
             .collect();
-        let summary = save_outcomes(&request(), &base, "test", vec![], vec![], outcomes)
+        let summary = save_outcomes(&request(), &base, vec![], vec![], outcomes)
             .await
             .unwrap();
         assert_eq!(summary.images.len(), 1);
@@ -537,7 +506,6 @@ mod audit_regression {
         assert_eq!(manifest["variants"][0]["generation_id"], "write-failed");
         assert!(manifest["variants"][0]["error"].is_string());
         assert!(manifest["variants"][0].get("path").is_none());
-        assert_eq!(manifest["variants"][0]["provider"], "test");
         assert!(manifest["variants"][1]["path"].is_string());
         assert_eq!(manifest["variants"][2]["cost"], 0.5);
         assert_eq!(manifest["variants"][2]["generation_id"], "decode-failed");

@@ -83,7 +83,6 @@ pub async fn run_job(
     client: &OpenRouterClient,
     req: &VideoGenRequest,
     base_output: &Path,
-    prompt_source: &str,
 ) -> Result<VideoJobSummary> {
     // Invariants upstream only rejects after accepting (and billing) the job.
     req.validate()?;
@@ -91,10 +90,7 @@ pub async fn run_job(
 
     // frame_images wins over input_references (image-to-video) - warn if both.
     let use_frames = !req.frames.is_empty();
-    let has_references = !req.references.is_empty()
-        || !req.reference_audio.is_empty()
-        || !req.reference_videos.is_empty();
-    if use_frames && has_references {
+    if use_frames && req.has_references() {
         warnings.push(
             "both frame_images and references (reference_images/reference_audio/\
              reference_videos) were given; sending only frame_images (image-to-video) \
@@ -197,7 +193,7 @@ pub async fn run_job(
         cost: None,
         model: req.model.clone(),
         prompt,
-        prompt_source: prompt_source.to_string(),
+        prompt_source: crate::manifest::PROMPT_SOURCE,
         duration: req.duration,
         resolution: req.resolution.clone(),
         aspect_ratio: req.aspect_ratio.clone(),
@@ -229,7 +225,7 @@ pub async fn run_job(
         || client.poll_video(&job_id),
     )
     .await;
-    let interval = std::time::Duration::from_secs(req.poll_interval_secs.max(1));
+    let interval = std::time::Duration::from_secs(req.poll_interval_secs);
     let job = job_id.as_str();
     let deadline =
         super::resolve_delivery_timeout().map(|budget| tokio::time::Instant::now() + budget);
@@ -253,10 +249,6 @@ pub async fn run_job(
 
 /// GET attempts per clip download before giving up on a transient failure.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
-
-/// Longest poll deadline honored; `OPENROUTER_VIDEO_POLL_TIMEOUT` is
-/// operator-supplied and an unbounded value would overflow `Instant + Duration`.
-const MAX_POLL_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Run `op` again after a retryable failure (see [`poll_retry_delay`]), up to
 /// `attempts` times in total. Permanent failures return immediately.
@@ -405,7 +397,7 @@ where
     manifest.generation_id = billing.generation_id.clone();
 
     if let Some(poll) = terminal {
-        let total = poll.unsigned_urls.len().max(1);
+        let total = poll.unsigned_urls.len();
         for index in 0..poll.unsigned_urls.len() {
             let mut meta = VideoClipMeta {
                 index: index + 1,
@@ -474,9 +466,9 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<crate::openrouter::VideoPollResponse>>,
 {
-    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let interval = std::time::Duration::from_secs(interval_secs);
     let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs.min(MAX_POLL_TIMEOUT_SECS));
+        + std::time::Duration::from_secs(timeout_secs.min(super::MAX_TIMER_SECS));
     loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("video generation timed out after {timeout_secs}s (job {job_id})");
@@ -666,7 +658,7 @@ mod tests {
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let req = text_to_video_request("google/veo-3.1");
         let base = std::env::temp_dir().join("openrouter-mcp-video-test/clip.mp4");
-        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+        let summary = run_job(&client, &req, &base).await.unwrap();
 
         assert_eq!(summary.model, "google/veo-3.1");
         assert_eq!(summary.videos.len(), 1);
@@ -764,7 +756,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("clip.mp4");
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+        let summary = run_job(&client, &req, &base).await.unwrap();
         assert!(summary.errors.is_empty(), "{:?}", summary.errors);
 
         let manifest: serde_json::Value =
@@ -810,7 +802,7 @@ mod tests {
             ..text_to_video_request("bytedance/seedance-2.0")
         };
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let summary = run_job(&client, &req, &dir.path().join("out.mp4"), "test")
+        let summary = run_job(&client, &req, &dir.path().join("out.mp4"))
             .await
             .unwrap();
         assert!(summary.errors.is_empty(), "{:?}", summary.errors);
@@ -847,7 +839,7 @@ mod tests {
             ..text_to_video_request("test/i2v")
         };
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let summary = run_job(&client, &req, &dir.path().join("out.mp4"), "test")
+        let summary = run_job(&client, &req, &dir.path().join("out.mp4"))
             .await
             .unwrap();
         assert!(summary.errors.is_empty(), "{:?}", summary.errors);
@@ -878,7 +870,7 @@ mod tests {
             prompt: None,
             ..text_to_video_request("m")
         };
-        let err = run_job(&client, &no_prompt, &base, "test")
+        let err = run_job(&client, &no_prompt, &base)
             .await
             .err()
             .expect("rejected")
@@ -890,7 +882,7 @@ mod tests {
                 upscale_factor: Some(bad),
                 ..text_to_video_request("m")
             };
-            let err = run_job(&client, &req, &base, "test")
+            let err = run_job(&client, &req, &base)
                 .await
                 .err()
                 .expect("rejected")
@@ -938,7 +930,7 @@ mod tests {
         let mut req = text_to_video_request("xai/grok-imagine-video");
         req.generate_audio = Some(false);
         let base = std::env::temp_dir().join("openrouter-mcp-video-warn-test/clip.mp4");
-        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+        let summary = run_job(&client, &req, &base).await.unwrap();
 
         assert!(summary.videos[0].has_audio, "probe reads the file");
         assert!(
@@ -978,7 +970,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openrouter-mcp-video-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("clip.mp4");
-        let summary = run_job(&client, &req, &base, "test").await.unwrap();
+        let summary = run_job(&client, &req, &base).await.unwrap();
 
         assert!(summary.videos.is_empty());
         assert_eq!(summary.errors.len(), 1, "errors: {:?}", summary.errors);
@@ -998,7 +990,7 @@ mod tests {
         let req = text_to_video_request("nope/model");
         let base = std::env::temp_dir().join("openrouter-mcp-video-submit-err/clip.mp4");
         // A submit failure aborts the whole job before any polling/spend.
-        let err = match run_job(&client, &req, &base, "test").await {
+        let err = match run_job(&client, &req, &base).await {
             Err(e) => e,
             Ok(_) => panic!("submit error should abort the job"),
         };
@@ -1039,7 +1031,7 @@ mod audit_regression {
             cost: None,
             model: "test/video".into(),
             prompt: Some("test".into()),
-            prompt_source: "test".into(),
+            prompt_source: "test",
             duration: Some(5),
             resolution: None,
             aspect_ratio: None,

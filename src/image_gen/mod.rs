@@ -1,6 +1,7 @@
 //! Image-generation orchestration over the OpenRouter Images API.
 //!
-//! Phase 1: a single text-to-image request. The returned image format is
+//! Text-to-image and image editing (reference images, parallel variants in
+//! `job`), plus the `describe_image` vision path. The returned image format is
 //! whatever the provider sends (sniffed, not assumed) and the dimensions are
 //! decoded from the actual bytes (the requested `image_size` is only a hint).
 
@@ -95,7 +96,8 @@ pub struct GenerateRequest {
     pub aspect_ratio: Option<String>,
     pub image_size: Option<String>,
     pub seed: Option<u64>,
-    /// Local images to edit/condition on. Empty for plain text-to-image.
+    /// Images to edit/condition on (local paths or inline bytes from a URL or
+    /// base64). Empty for plain text-to-image.
     pub images: Vec<InputImage>,
     /// Longest-side cap (px) for normalized input images.
     pub max_image_dimension: u32,
@@ -126,22 +128,20 @@ fn is_pixel_size(size: &str) -> bool {
 }
 
 /// Refuse the request shape OpenRouter answers with 400: a pixel-form `size`
-/// sent alongside `image_size` (wire `resolution`) or `aspect_ratio`.
-/// Blank strings count as absent. A tier-form `size` never conflicts.
+/// sent alongside `image_size` (wire `resolution`) or `aspect_ratio`. The
+/// caller has already dropped blank values (the tool's blank-means-absent
+/// pass). A tier-form `size` never conflicts.
 pub fn check_size_conflict(
     size: Option<&str>,
     image_size: Option<&str>,
     aspect_ratio: Option<&str>,
 ) -> Result<()> {
-    fn present(s: Option<&str>) -> Option<&str> {
-        s.map(str::trim).filter(|s| !s.is_empty())
-    }
-    let Some(size) = present(size).filter(|s| is_pixel_size(s)) else {
+    let Some(size) = size.filter(|s| is_pixel_size(s)) else {
         return Ok(());
     };
     let conflicting: Vec<&str> = [
-        present(image_size).map(|_| "image_size"),
-        present(aspect_ratio).map(|_| "aspect_ratio"),
+        image_size.map(|_| "image_size"),
+        aspect_ratio.map(|_| "aspect_ratio"),
     ]
     .into_iter()
     .flatten()
@@ -174,18 +174,15 @@ pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
 #[derive(Debug, Clone)]
 pub struct GeneratedImage {
     pub bytes: Vec<u8>,
-    /// MIME type as reported in the response data URL (e.g. `image/png`).
+    /// MIME type sniffed from the decoded bytes (e.g. `image/png`), cross-checked
+    /// against the declared `media_type`.
     pub mime: String,
     pub width: u32,
     pub height: u32,
-    /// Assistant text, when the model returned any alongside the image.
-    pub text: Option<String>,
     /// Actual USD cost from `usage.cost`, when present.
     pub cost: Option<f64>,
     /// OpenRouter generation id, recorded in the manifest.
     pub generation_id: Option<String>,
-    /// Provider that served the request (e.g. "Google"), recorded in the manifest.
-    pub provider: Option<String>,
     /// Non-fatal notes about this generation (e.g. a declared `media_type` that
     /// disagreed with the actual sniffed bytes).
     pub warnings: Vec<String>,
@@ -314,19 +311,13 @@ pub(crate) async fn prepare_inputs_async(
     images: &[InputImage],
     max_dim: u32,
 ) -> Result<Vec<PreparedInput>> {
-    anyhow::ensure!(
-        images.len() <= crate::resources::MAX_IMAGE_INPUTS,
-        "at most {} input images are allowed",
-        crate::resources::MAX_IMAGE_INPUTS
-    );
     let images = images.to_vec();
     crate::resources::run_blocking(move || prepare_inputs(&images, max_dim)).await
 }
 
 /// Pre-built inputs for one generation, computed once and shared across
 /// variants: the assembled prompt and the reference-image data URLs (sent as
-/// `input_references`). Mirrors the old pre-built `Content`, adapted to the
-/// Images API request shape.
+/// `input_references`), in the Images API request shape.
 #[derive(Debug)]
 pub(crate) struct GenContent {
     prompt: String,
@@ -368,9 +359,9 @@ fn resolution_for(image_size: &str) -> String {
 }
 
 /// Issue one `POST /api/v1/images` request for the given pre-built `content` and
-/// extract the generated image. Shared by single and variant generation so the
-/// content (including normalized input images) is built once and reused; `seed`
-/// is passed separately because it is the only field that varies per variant.
+/// extract the generated image. Every variant calls it with the same `content`
+/// (including normalized input images), built once; `seed` is passed
+/// separately because it is the only field that varies per variant.
 /// Each call asks for a single image (`n` defaults to 1 upstream); variants fan
 /// out across multiple calls, since most models cap `n` at 1.
 pub(crate) async fn generate_core(
@@ -460,12 +451,8 @@ fn decode_generated(
         mime,
         width,
         height,
-        // The Images API returns image bytes only, no assistant commentary.
-        text: None,
         cost,
         generation_id,
-        // The Images API response body carries no provider attribution.
-        provider: None,
         warnings,
     })
 }

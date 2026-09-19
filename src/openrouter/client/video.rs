@@ -9,7 +9,7 @@ use crate::openrouter::{
 impl OpenRouterClient {
     /// `POST /api/v1/videos` - submit an asynchronous video-generation job. This
     /// is **not** the chat endpoint: it returns `202` with a job id to poll. On a
-    /// non-2xx status the upstream error body is surfaced verbatim.
+    /// non-2xx status the upstream error body is surfaced (bounded to 500 chars).
     pub async fn submit_video(&self, req: &VideoSubmitBody) -> Result<VideoSubmitResponse> {
         let rb = self
             .http

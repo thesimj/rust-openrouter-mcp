@@ -1,29 +1,14 @@
 //! Structured decisions for the MCP tool: `POST /api/alpha/decisions`.
 //!
-//! Like [`crate::embed_gen`], this is the single path from validated inputs to
-//! the result JSON: local checks, the request body, the receipt handling and
-//! the result envelope all live here once.
+//! Like [`crate::embed_gen`], this is the single path the tool uses after its
+//! shape checks: the content rules ([`validate`]), the receipt handling and the
+//! result envelope live here once.
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use crate::openrouter::{
-    DecisionAnswer, DecisionQuestion, DecisionsBody, OpenRouterClient, ProviderRouting,
-};
-
-/// Inputs for one `/api/alpha/decisions` request.
-#[derive(Debug, Clone)]
-pub struct DecideRequest {
-    pub model: String,
-    /// The content to evaluate: a non-blank string, a non-empty object or a
-    /// non-empty array.
-    pub state: Value,
-    /// Already-typed questions keyed by the caller's names.
-    pub questions: BTreeMap<String, DecisionQuestion>,
-    /// Routing block, already validated (this endpoint has no `options`).
-    pub provider: Option<ProviderRouting>,
-}
+use crate::openrouter::{DecisionAnswer, DecisionQuestion, DecisionsBody, OpenRouterClient};
 
 /// The typed answers plus usage and the receipt id.
 #[derive(Debug)]
@@ -57,24 +42,22 @@ impl DecideResult {
     }
 }
 
-impl DecideRequest {
-    /// The local checks run before any HTTP call. They enforce what the
-    /// endpoint would reject anyway, plus the provider's own documented
-    /// minimums (a score needs at least two levels), with errors that name
-    /// the question.
-    pub fn validate(&self) -> Result<()> {
-        check_state(&self.state)?;
-        if self.questions.is_empty() {
-            bail!("questions must contain at least one question");
-        }
-        for (name, question) in &self.questions {
-            if name.trim().is_empty() {
-                bail!("every question needs a non-blank name (key)");
-            }
-            check_question(name, question)?;
-        }
-        Ok(())
+/// The local content checks a decisions body must pass before any HTTP call.
+/// They enforce what the endpoint would reject anyway, plus the provider's own
+/// documented minimums (a score needs at least two levels), with errors that
+/// name the question.
+pub fn validate(body: &DecisionsBody) -> Result<()> {
+    check_state(&body.state)?;
+    if body.questions.is_empty() {
+        bail!("questions must contain at least one question");
     }
+    for (name, question) in &body.questions {
+        if name.trim().is_empty() {
+            bail!("every question needs a non-blank name (key)");
+        }
+        check_question(name, question)?;
+    }
+    Ok(())
 }
 
 /// `state` is guidance that must also carry something to evaluate: an empty
@@ -90,7 +73,9 @@ fn check_state(state: &Value) -> Result<()> {
 
 /// Guidance may be a string, an object or an array - but a string must say
 /// something (whitespace-only counts as absent, the repo-wide rule). `what`
-/// names the field in the error.
+/// names the field in the error. The tool types `state` and `instructions` as
+/// guidance already; the `other` arm is reached by criteria values (noul
+/// true/false, choice descriptions, score levels), which arrive untyped.
 fn check_guidance(what: &str, guidance: &Value) -> Result<()> {
     match guidance {
         Value::String(s) if s.trim().is_empty() => bail!("{what} must not be blank"),
@@ -152,35 +137,28 @@ fn check_question(name: &str, question: &DecisionQuestion) -> Result<()> {
     Ok(())
 }
 
-/// Ask a decisions model. Validates locally, sends the documented body, and
-/// flattens the reply. A 2xx with no answers is an error that still carries the
+/// Ask a decisions model and flatten the reply. The caller has already run
+/// [`validate`]. A 2xx with no answers is an error that still carries the
 /// receipt (the provider may have billed).
-pub async fn decide(client: &OpenRouterClient, req: &DecideRequest) -> Result<DecideResult> {
-    req.validate()?;
-    let body = DecisionsBody {
-        model: req.model.clone(),
-        state: req.state.clone(),
-        questions: req.questions.clone(),
-        provider: req.provider.clone(),
-    };
-    let reply = client.decisions(&body).await?;
-    let usage = reply.body.usage.unwrap_or_default();
+pub async fn decide(client: &OpenRouterClient, body: &DecisionsBody) -> Result<DecideResult> {
+    let (reply, generation_id) = client.decisions(body).await?;
+    let usage = reply.usage.unwrap_or_default();
     let receipt = crate::billing::Receipt {
         cost: usage.cost,
-        generation_id: reply.generation_id.clone(),
+        generation_id: generation_id.clone(),
     };
-    if reply.body.answers.is_empty() {
+    if reply.answers.is_empty() {
         return Err(receipt.attach(anyhow::anyhow!("model returned no answers")));
     }
     Ok(DecideResult {
-        model: reply.body.model.unwrap_or_else(|| req.model.clone()),
-        id: reply.body.id,
-        provider: reply.body.provider,
-        answers: reply.body.answers,
+        model: reply.model.unwrap_or_else(|| body.model.clone()),
+        id: reply.id,
+        provider: reply.provider,
+        answers: reply.answers,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cost: usage.cost,
-        generation_id: reply.generation_id,
+        generation_id,
     })
 }
 
@@ -216,8 +194,8 @@ mod tests {
         }
     }
 
-    fn request(questions: &[(&str, DecisionQuestion)]) -> DecideRequest {
-        DecideRequest {
+    fn request(questions: &[(&str, DecisionQuestion)]) -> DecisionsBody {
+        DecisionsBody {
             model: "typesafe/jev-1.13".into(),
             state: json!({"ticket": "checkout is blank"}),
             questions: questions
@@ -228,15 +206,20 @@ mod tests {
         }
     }
 
-    fn error_of(req: &DecideRequest) -> String {
-        req.validate().unwrap_err().to_string()
+    fn error_of(body: &DecisionsBody) -> String {
+        validate(body).unwrap_err().to_string()
     }
 
     /// `state` must be a non-blank string or a non-empty object/array.
     #[test]
     fn validate_rejects_empty_or_scalar_state() {
-        let ok = request(&[("q", noul("Is it a bug?"))]);
-        ok.validate().unwrap();
+        /// The valid request with `state` swapped for the value under test.
+        fn with_state(state: Value) -> DecisionsBody {
+            let mut body = request(&[("q", noul("Is it a bug?"))]);
+            body.state = state;
+            body
+        }
+        validate(&with_state(json!({"ticket": "checkout is blank"}))).unwrap();
         for (state, needle) in [
             (json!("   "), "blank"),
             (json!({}), "empty object"),
@@ -245,18 +228,12 @@ mod tests {
             (json!(true), "string, an object or an array"),
             (Value::Null, "string, an object or an array"),
         ] {
-            let mut req = ok.clone();
-            req.state = state.clone();
-            let err = error_of(&req);
+            let err = error_of(&with_state(state.clone()));
             assert!(err.contains("state"), "{state}: {err}");
             assert!(err.contains(needle), "{state}: {err}");
         }
-        let mut text = ok.clone();
-        text.state = json!("plain text is fine");
-        text.validate().unwrap();
-        let mut list = ok;
-        list.state = json!(["a", {"b": 1}]);
-        list.validate().unwrap();
+        validate(&with_state(json!("plain text is fine"))).unwrap();
+        validate(&with_state(json!(["a", {"b": 1}]))).unwrap();
     }
 
     /// At least one question, every name non-blank, every instruction non-blank.
@@ -267,31 +244,20 @@ mod tests {
         let err = error_of(&request(&[("q", noul("  "))]));
         assert!(err.contains("questions[\"q\"].instructions"), "{err}");
         assert!(err.contains("blank"), "{err}");
-        // Structured instructions are guidance too.
-        let mut structured = request(&[("q", noul("x"))]);
-        structured.questions.insert(
-            "q".into(),
-            DecisionQuestion::Noul {
-                instructions: json!({"what": "Is it spam?"}),
-                criteria: Some(NoulCriteria {
-                    when_true: json!("yes"),
-                    when_false: json!("no"),
-                }),
-            },
-        );
-        structured.validate().unwrap();
-        let mut blank_criteria = structured.clone();
-        blank_criteria.questions.insert(
-            "q".into(),
-            DecisionQuestion::Noul {
-                instructions: json!("x"),
-                criteria: Some(NoulCriteria {
-                    when_true: json!("yes"),
-                    when_false: json!(""),
-                }),
-            },
-        );
-        let err = error_of(&blank_criteria);
+        // Structured instructions and criteria are guidance too.
+        let noul_with = |instructions: Value, when_false: Value| DecisionQuestion::Noul {
+            instructions,
+            criteria: Some(NoulCriteria {
+                when_true: json!("yes"),
+                when_false,
+            }),
+        };
+        validate(&request(&[(
+            "q",
+            noul_with(json!({"what": "Is it spam?"}), json!("no")),
+        )]))
+        .unwrap();
+        let err = error_of(&request(&[("q", noul_with(json!("x"), json!("")))]));
         assert!(err.contains("criteria.false"), "{err}");
     }
 
@@ -302,9 +268,11 @@ mod tests {
         assert!(error_of(&request(&[("q", choice(&[(" ", json!("a"))]))])).contains("blank label"));
         let err = error_of(&request(&[("q", choice(&[("a", json!(""))]))]));
         assert!(err.contains("criteria[\"a\"]"), "{err}");
-        request(&[("q", choice(&[("a", Value::Null), ("b", json!("B"))]))])
-            .validate()
-            .unwrap();
+        validate(&request(&[(
+            "q",
+            choice(&[("a", Value::Null), ("b", json!("B"))]),
+        )]))
+        .unwrap();
     }
 
     /// A score needs two or more levels (the provider's documented minimum),
@@ -315,9 +283,7 @@ mod tests {
         assert!(err.contains("at least two levels"), "{err}");
         let err = error_of(&request(&[("q", score(&["low", " "]))]));
         assert!(err.contains("criteria[1]"), "{err}");
-        request(&[("q", score(&["low", "high"]))])
-            .validate()
-            .unwrap();
+        validate(&request(&[("q", score(&["low", "high"]))])).unwrap();
     }
 
     /// The body reaches the alpha path, answers flatten into the envelope with
@@ -380,10 +346,9 @@ mod tests {
         assert_eq!(v["generation_id"], "gen-d");
     }
 
-    /// Validation runs before any HTTP call; a 2xx with no answers is an error
-    /// that still carries the receipt.
+    /// A 2xx with no answers is an error that still carries the receipt.
     #[tokio::test]
-    async fn decide_rejects_bad_input_locally_and_empty_answers_with_receipt() {
+    async fn decide_reports_empty_answers_with_the_receipt() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/alpha/decisions"))
@@ -395,11 +360,6 @@ mod tests {
             .mount(&mock)
             .await;
         let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
-
-        let err = decide(&client, &request(&[])).await.unwrap_err();
-        assert!(err.to_string().contains("questions"), "got: {err}");
-        assert_eq!(mock.received_requests().await.unwrap().len(), 0);
-
         let err = decide(&client, &request(&[("q", noul("x"))]))
             .await
             .unwrap_err();

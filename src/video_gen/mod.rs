@@ -4,7 +4,8 @@
 //! job API: submit `POST /api/v1/videos`, poll `GET /api/v1/videos/{id}` until
 //! the job completes or fails, then download each clip from the content
 //! endpoint. Frame images (first/last) and reference images are reused from the
-//! image input pipeline (normalized to PNG data URLs).
+//! image input pipeline (normalized to data URLs: JPEG, or PNG when they have
+//! alpha).
 
 use std::path::PathBuf;
 
@@ -59,18 +60,28 @@ pub struct VideoGenRequest {
     /// Per-provider passthrough (`provider.options.<slug>`), already validated.
     pub provider: Option<ProviderOptions>,
     pub max_image_dimension: u32,
+    /// Seconds between status polls; always >= 1 (from
+    /// [`resolve_poll_interval`], the only production source), so the job
+    /// applies no floor of its own.
     pub poll_interval_secs: u64,
+    /// Seconds to wait for the job before giving up; capped at 30 days when
+    /// the deadline is computed.
     pub poll_timeout_secs: u64,
 }
 
 impl VideoGenRequest {
+    /// Whether any reference of any kind (image, audio, video) is present.
+    /// Frames win over references on the wire, so the job warns when both are.
+    pub fn has_references(&self) -> bool {
+        !self.references.is_empty()
+            || !self.reference_audio.is_empty()
+            || !self.reference_videos.is_empty()
+    }
+
     /// Whether any frame or reference of any kind is present - the condition
     /// under which `prompt` may be omitted.
     pub fn has_visual_or_media_input(&self) -> bool {
-        !self.frames.is_empty()
-            || !self.references.is_empty()
-            || !self.reference_audio.is_empty()
-            || !self.reference_videos.is_empty()
+        !self.frames.is_empty() || self.has_references()
     }
 
     /// The trimmed prompt, or `None` when absent or blank.
@@ -99,8 +110,13 @@ impl VideoGenRequest {
     }
 }
 
+/// Longest timer budget honored for the operator-supplied poll and delivery
+/// timeouts: an unbounded value would overflow `Instant + Duration`.
+const MAX_TIMER_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Parse a poll setting (seconds) from a raw env value, falling back to
-/// `default`; floored at 1 so a zero never busy-loops.
+/// `default`; floored at 1 so a zero never busy-loops. This is the only floor:
+/// the job trusts the interval it is given.
 fn parse_secs(raw: Option<&str>, default: u64) -> u64 {
     raw.and_then(|v| v.parse().ok()).unwrap_or(default).max(1)
 }
@@ -123,10 +139,10 @@ pub fn resolve_poll_timeout() -> u64 {
 fn parse_delivery_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     raw.and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map(|seconds| std::time::Duration::from_secs(seconds.min(30 * 24 * 60 * 60)))
+        .map(|seconds| std::time::Duration::from_secs(seconds.min(MAX_TIMER_SECS)))
 }
 
-pub(super) fn resolve_delivery_timeout() -> Option<std::time::Duration> {
+fn resolve_delivery_timeout() -> Option<std::time::Duration> {
     let raw = std::env::var("OPENROUTER_VIDEO_DELIVERY_TIMEOUT").ok();
     parse_delivery_timeout(raw.as_deref())
 }
@@ -169,7 +185,7 @@ mod tests {
         );
         assert_eq!(
             parse_delivery_timeout(Some(&u64::MAX.to_string())),
-            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60))
+            Some(std::time::Duration::from_secs(MAX_TIMER_SECS))
         );
     }
 
