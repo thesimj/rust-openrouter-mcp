@@ -84,8 +84,10 @@ impl Inner {
     }
 }
 
-fn round4(x: f64) -> f64 {
-    (x * 10_000.0).round() / 10_000.0
+/// Six decimals: enough to show a single decisions, embeddings or rerank call
+/// (about $0.00002) while hiding f64 summation noise (`0.2 + 0.04`).
+fn round6(x: f64) -> f64 {
+    (x * 1_000_000.0).round() / 1_000_000.0
 }
 
 /// Process-local usage counters, cheaply cloneable (shared `Arc`).
@@ -231,7 +233,7 @@ impl UsageStats {
                         "images_generated": v.images_generated,
                         "videos_generated": v.videos_generated,
                         "audio_files": v.audio_files,
-                        "actual_cost_usd": round4(v.actual_cost_usd),
+                        "actual_cost_usd": round6(v.actual_cost_usd),
                         "unknown_cost_count": v.unknown_cost_count,
                     }),
                 )
@@ -250,7 +252,7 @@ impl UsageStats {
             "videos_generated": s.videos_generated,
             "audio_generations": s.audio_generations,
             "audio_files": s.audio_files,
-            "actual_cost_usd": round4(s.actual_cost_usd),
+            "actual_cost_usd": round6(s.actual_cost_usd),
             "unknown_cost_count": s.unknown_cost_count,
             "by_model": by_model,
         })
@@ -316,6 +318,23 @@ mod tests {
         assert_eq!(s["unknown_cost_count"], 1);
         assert_eq!(s["actual_cost_usd"], 0.002);
         assert_eq!(s["by_model"]["vision-a"]["requests"], 2);
+    }
+
+    /// Sub-cent charges (decisions, embeddings, rerank bill ~$0.00002 a call)
+    /// must show in the snapshot, not round to 0.0; float-sum noise must not.
+    #[tokio::test]
+    async fn snapshot_shows_sub_cent_costs_without_float_noise() {
+        let stats = UsageStats::new();
+        stats.record_text("jev", Some(0.000022428)).await;
+        let s = stats.snapshot().await;
+        assert_eq!(s["actual_cost_usd"], 0.000022);
+        assert_eq!(s["by_model"]["jev"]["actual_cost_usd"], 0.000022);
+
+        stats.record_text("chat", Some(0.2)).await;
+        stats.record_text("chat", Some(0.04)).await;
+        let s = stats.snapshot().await;
+        // 0.2 + 0.04 is 0.24000000000000002 in f64; the snapshot says 0.24.
+        assert_eq!(s["by_model"]["chat"]["actual_cost_usd"], 0.24);
     }
 
     #[tokio::test]

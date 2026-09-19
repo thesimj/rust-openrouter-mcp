@@ -419,8 +419,9 @@ mod tests {
 
         let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
         assert_eq!(stats["text_generations"], 1);
-        // Jev charges fractions of a cent; the snapshot rounds to 4 decimals,
-        // so the cost shows as 0.0 - but it was known, not unknown.
+        // Jev charges fractions of a cent; the snapshot keeps six decimals so
+        // the charge is visible, and it was known, not unknown.
+        assert_eq!(stats["actual_cost_usd"], 0.00002);
         assert_eq!(stats["unknown_cost_count"], 0);
         assert_eq!(stats["by_model"]["typesafe/jev-1.13"]["requests"], 1);
     }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+- `get_usage_stats` rounds `actual_cost_usd` to six decimals instead of four,
+  so a single decisions, embeddings or rerank call (about $0.00002) no longer
+  displays as `0.0`.
+
 ## 0.12.0
 
 - New tool `make_decisions` for OpenRouter's decisions models (TypeSafe Jev:
