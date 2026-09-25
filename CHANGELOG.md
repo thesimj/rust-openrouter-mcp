@@ -31,6 +31,9 @@ Fixes (each covered by a test):
   that a 512 px image is `~0.5K`, and the `768` tier is recognized.
 - `embed_text`: a reply with fewer vectors than inputs, or indices that skip or
   repeat, is a billed failure instead of a mismatched success.
+- `embed_text` and `rerank_documents` return a `generation_id` again:
+  OpenRouter now sends it as the body `id` (`gen-emb-...`, `gen-rerank-...`)
+  and no `X-Generation-Id` header on these endpoints (found by a live test).
 - Raw base64 inputs decode as leniently as data URLs (line breaks and missing
   padding are accepted).
 - Tool errors keep their cause (`list_models`, `describe_model`, `get_account`,

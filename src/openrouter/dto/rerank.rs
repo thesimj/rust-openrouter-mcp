@@ -24,6 +24,10 @@ pub struct RerankBody {
 /// Response body: ranked results (best first, as the provider orders them).
 #[derive(Debug, Deserialize)]
 pub struct RerankResponse {
+    /// The generation id (`gen-...`). OpenRouter sends it here and no
+    /// `X-Generation-Id` header on this endpoint (live, 2026-09-25).
+    #[serde(default)]
+    pub id: Option<String>,
     pub model: Option<String>,
     pub results: Vec<RerankItem>,
     pub usage: Option<RerankUsage>,

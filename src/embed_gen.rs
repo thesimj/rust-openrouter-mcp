@@ -116,7 +116,8 @@ pub fn check_texts(texts: &[String], field: &str) -> Result<()> {
 /// when the provider sends it. The caller has already checked the texts with
 /// [`check_texts`].
 pub async fn embed(client: &OpenRouterClient, body: &EmbeddingsBody) -> Result<EmbedResult> {
-    let (reply, generation_id) = client.embeddings(body).await?;
+    let (reply, header_id) = client.embeddings(body).await?;
+    let generation_id = header_id.or(reply.id);
     let usage = reply.usage.unwrap_or_default();
     let receipt = crate::billing::Receipt {
         cost: usage.cost,
@@ -156,7 +157,8 @@ pub async fn embed(client: &OpenRouterClient, body: &EmbeddingsBody) -> Result<E
 /// filling each result's `text` from the input when the provider does not
 /// echo the document. The caller has already run [`validate_rerank`].
 pub async fn rerank(client: &OpenRouterClient, body: &RerankBody) -> Result<RerankResult> {
-    let (reply, generation_id) = client.rerank(body).await?;
+    let (reply, header_id) = client.rerank(body).await?;
+    let generation_id = header_id.or(reply.id);
     let usage = reply.usage.unwrap_or_default();
     let results = reply
         .results
@@ -251,6 +253,41 @@ mod tests {
             let receipt = crate::billing::Receipt::from_error(&err).expect("billed");
             assert_eq!(receipt.cost, Some(0.00001));
         }
+    }
+
+    /// Live 2026-09-25: `/embeddings` and `/rerank` send no `X-Generation-Id`
+    /// header; the generation id (`gen-emb-...`, `gen-rerank-...`, which
+    /// `/generation` resolves) is the body `id`. The header still wins when a
+    /// response carries both.
+    #[tokio::test]
+    async fn embed_and_rerank_take_the_generation_id_from_the_body() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-emb-1",
+                "data": [{"index": 0, "embedding": [0.1]}],
+                "usage": {"cost": 0.00000002}
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rerank"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-header")
+                    .set_body_json(json!({
+                        "id": "gen-rerank-1",
+                        "results": [{"index": 0, "relevance_score": 0.9}]
+                    })),
+            )
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
+        let embedded = embed(&client, &embed_body(&["a"])).await.unwrap();
+        assert_eq!(embedded.generation_id.as_deref(), Some("gen-emb-1"));
+        let ranked = rerank(&client, &rerank_body(&["a"])).await.unwrap();
+        assert_eq!(ranked.generation_id.as_deref(), Some("gen-header"));
     }
 
     #[test]

@@ -55,6 +55,10 @@ impl EmbeddingsInput {
 /// Response body: one vector per input, plus token usage and the USD cost.
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingsResponse {
+    /// The generation id (`gen-...`). OpenRouter sends it here and no
+    /// `X-Generation-Id` header on this endpoint (live, 2026-09-25).
+    #[serde(default)]
+    pub id: Option<String>,
     pub model: Option<String>,
     pub data: Vec<EmbeddingItem>,
     pub usage: Option<EmbeddingsUsage>,
