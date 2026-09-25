@@ -8,17 +8,8 @@ use anyhow::{Context, Result};
 use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
 use crate::openrouter::{FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoSubmitBody};
-use crate::server::media::InputKind;
 
 use super::{VideoGenRequest, VideoJobSummary, VideoSummary};
-
-/// One audio/video reference as a URL or data URL, through the shared media
-/// resolver (the same caps and MIME tables as the chat inputs).
-async fn resolve_media_reference(kind: InputKind, source: &str) -> Result<String> {
-    crate::server::media::resolve_media_reference(kind, source)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e.message))
-}
 
 /// File extension for a video/audio MIME type. Falls back to `mp4`.
 fn extension_for(mime: &str) -> &'static str {
@@ -61,19 +52,7 @@ fn has_audio_track(bytes: &[u8]) -> Option<bool> {
 /// Output path for one clip. A single clip uses `base` with the given extension;
 /// multiple clips get a `-clip-NNN` suffix.
 fn clip_output_path(base: &Path, index_zero_based: usize, total: usize, ext: &str) -> PathBuf {
-    if total <= 1 {
-        return base.with_extension(ext);
-    }
-    let width = 3.max(total.to_string().len());
-    crate::output::in_parent_of(
-        base,
-        format!(
-            "{}-clip-{:0width$}.{ext}",
-            crate::output::base_stem(base),
-            index_zero_based + 1,
-            width = width
-        ),
-    )
+    crate::output::numbered_path(base, "clip", |index| index, index_zero_based, total, ext)
 }
 
 /// Run a video generation job: normalize any frame/reference images, submit the
@@ -114,12 +93,12 @@ pub async fn run_job(
     let mut frame_images = Vec::new();
     let mut frame_meta = Vec::new();
     for (i, (f, p)) in req.frames.iter().zip(&frame_prepared).enumerate() {
-        frame_images.push(FrameImage::new(
-            ImageUrl {
+        frame_images.push(FrameImage {
+            image_url: ImageUrl {
                 url: p.data_url.clone(),
             },
-            f.frame_type.clone(),
-        ));
+            frame_type: f.frame_type.clone(),
+        });
         frame_meta.push(FrameImageMeta {
             index: i + 1,
             frame_type: f.frame_type.clone(),
@@ -144,26 +123,18 @@ pub async fn run_job(
         let ref_prepared =
             image_gen::prepare_inputs_async(&ref_inputs, req.max_image_dimension).await?;
         for (p, prep) in req.references.iter().zip(&ref_prepared) {
-            input_references.push(InputReference::new(ImageUrl {
+            input_references.push(InputReference::image(ImageUrl {
                 url: prep.data_url.clone(),
             }));
             reference_meta.push(p.to_string_lossy().into_owned());
         }
-        for source in &req.reference_audio {
-            input_references.push(InputReference::audio(
-                resolve_media_reference(InputKind::Audio, source)
-                    .await
-                    .with_context(|| format!("reference_audio {source}"))?,
-            ));
-            audio_meta.push(source.clone());
+        for reference in &req.reference_audio {
+            input_references.push(InputReference::audio(reference.url.clone()));
+            audio_meta.push(reference.source.clone());
         }
-        for source in &req.reference_videos {
-            input_references.push(InputReference::video(
-                resolve_media_reference(InputKind::Video, source)
-                    .await
-                    .with_context(|| format!("reference_videos {source}"))?,
-            ));
-            video_meta.push(source.clone());
+        for reference in &req.reference_videos {
+            input_references.push(InputReference::video(reference.url.clone()));
+            video_meta.push(reference.source.clone());
         }
     }
 
@@ -229,7 +200,7 @@ pub async fn run_job(
     let job = job_id.as_str();
     let deadline =
         super::resolve_delivery_timeout().map(|budget| tokio::time::Instant::now() + budget);
-    save_outputs(
+    Ok(save_outputs(
         req,
         base_output,
         manifest,
@@ -244,11 +215,16 @@ pub async fn run_job(
             })
         },
     )
-    .await
+    .await)
 }
 
 /// GET attempts per clip download before giving up on a transient failure.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Longest sleep between download retries, however long the poll interval or
+/// the upstream's Retry-After: a clip is already paid for, so it is worth
+/// retrying, but not after hours of silence.
+const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Run `op` again after a retryable failure (see [`poll_retry_delay`]), up to
 /// `attempts` times in total. Permanent failures return immediately.
@@ -268,7 +244,7 @@ where
             Err(error) => match poll_retry_delay(&error, interval) {
                 Some(delay) if attempt < attempts => {
                     attempt += 1;
-                    tokio::time::sleep(delay.min(std::time::Duration::from_secs(300))).await;
+                    tokio::time::sleep(delay.min(MAX_RETRY_DELAY)).await;
                 }
                 _ => return Err(error),
             },
@@ -288,16 +264,14 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     if let Some(deadline) = deadline {
+        let timed_out =
+            || format!("video delivery timed out (job {job_id}); recover using the saved job ID");
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "video delivery timed out (job {job_id}); recover using the saved job ID"
-            );
+            anyhow::bail!(timed_out());
         }
         tokio::time::timeout_at(deadline, download())
             .await
-            .with_context(|| {
-                format!("video delivery timed out (job {job_id}); recover using the saved job ID")
-            })?
+            .with_context(timed_out)?
     } else {
         download().await
     }
@@ -366,7 +340,7 @@ async fn save_outputs<F, Fut>(
     terminal: Result<crate::openrouter::VideoPollResponse>,
     deadline: Option<tokio::time::Instant>,
     mut download: F,
-) -> Result<VideoJobSummary>
+) -> VideoJobSummary
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = Result<(String, Vec<u8>)>>,
@@ -440,11 +414,9 @@ where
 
     manifest.clips = clips;
     let mpath = manifest::path(base_output);
-    if let Err(e) = manifest::write(&mpath, &manifest).await {
-        errors.push(format!("manifest write failed: {e}"));
-    }
+    errors.extend(manifest::write_or_report(&mpath, &manifest).await);
 
-    Ok(VideoJobSummary {
+    VideoJobSummary {
         job_id,
         billing,
         model: req.model.clone(),
@@ -452,7 +424,7 @@ where
         videos,
         warnings,
         errors,
-    })
+    }
 }
 
 /// Poll only GET requests again. Never repeat the billable submission.
@@ -469,15 +441,14 @@ where
     let interval = std::time::Duration::from_secs(interval_secs);
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(timeout_secs.min(super::MAX_TIMER_SECS));
+    let timed_out = || format!("video generation timed out after {timeout_secs}s (job {job_id})");
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("video generation timed out after {timeout_secs}s (job {job_id})");
+            anyhow::bail!(timed_out());
         }
         let result = tokio::time::timeout_at(deadline, poll())
             .await
-            .with_context(|| {
-                format!("video generation timed out after {timeout_secs}s (job {job_id})")
-            })?;
+            .with_context(timed_out)?;
         let delay = match result {
             Ok(response) => match response.status.as_str() {
                 "completed" | "succeeded" => return Ok(response),
@@ -546,19 +517,10 @@ mod tests {
             duration: Some(4),
             resolution: Some("720p".to_string()),
             aspect_ratio: Some("16:9".to_string()),
-            size: None,
             generate_audio: Some(true),
             seed: Some(7),
-            frames: vec![],
-            references: vec![],
-            reference_audio: vec![],
-            reference_videos: vec![],
-            creativity: None,
-            upscale_factor: None,
-            provider: None,
-            max_image_dimension: 800,
-            poll_interval_secs: 1,
             poll_timeout_secs: 30,
+            ..super::super::tests::request()
         }
     }
 
@@ -769,16 +731,16 @@ mod tests {
         assert_eq!(manifest["upscale_factor"], 2.0);
     }
 
-    /// Audio and video references become `audio_url` / `video_url` content parts:
-    /// a URL passes through untouched, a local file becomes a data URL with the
-    /// MIME taken from its extension. Order: images, audio, videos.
+    /// Audio and video references become `audio_url` / `video_url` content parts
+    /// carrying their resolved URL, while the manifest records each source as
+    /// given. Order: images, audio, videos.
     #[tokio::test]
     async fn run_job_sends_audio_and_video_references_as_typed_parts() {
         let dir = tempfile::tempdir().unwrap();
-        let beat = dir.path().join("beat.mp3");
-        std::fs::write(&beat, b"ABC").unwrap();
-        let clip = dir.path().join("ref.mp4");
-        std::fs::write(&clip, b"ABC").unwrap();
+        let reference = |source: &str, url: &str| super::super::MediaReference {
+            source: source.to_string(),
+            url: url.to_string(),
+        };
 
         let server = MockServer::start().await;
         mount_completed_job(
@@ -795,10 +757,10 @@ mod tests {
         .await;
         let req = VideoGenRequest {
             reference_audio: vec![
-                "https://cdn/song.mp3".to_string(),
-                beat.to_string_lossy().into_owned(),
+                reference("https://cdn/song.mp3", "https://cdn/song.mp3"),
+                reference("beat.mp3", "data:audio/mpeg;base64,QUJD"),
             ],
-            reference_videos: vec![clip.to_string_lossy().into_owned()],
+            reference_videos: vec![reference("ref.mp4", "data:video/mp4;base64,QUJD")],
             ..text_to_video_request("bytedance/seedance-2.0")
         };
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
@@ -812,10 +774,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&summary.manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["reference_audio"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            manifest["reference_videos"],
-            json!([clip.to_string_lossy()])
-        );
+        assert_eq!(manifest["reference_videos"], json!(["ref.mp4"]));
     }
 
     /// Image-only models take no prompt: a frame-only request sends no `prompt`
@@ -835,7 +794,10 @@ mod tests {
                 path: frame.clone(),
                 frame_type: "first_frame".to_string(),
             }],
-            reference_audio: vec!["https://cdn/song.mp3".to_string()],
+            reference_audio: vec![super::super::MediaReference {
+                source: "https://cdn/song.mp3".to_string(),
+                url: "https://cdn/song.mp3".to_string(),
+            }],
             ..text_to_video_request("test/i2v")
         };
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
@@ -1006,21 +968,8 @@ mod audit_regression {
             model: "test/video".into(),
             prompt: Some("test".into()),
             duration: Some(5),
-            resolution: None,
-            aspect_ratio: None,
-            size: None,
-            generate_audio: None,
-            seed: None,
-            frames: vec![],
-            references: vec![],
-            reference_audio: vec![],
-            reference_videos: vec![],
-            creativity: None,
-            upscale_factor: None,
-            provider: None,
-            max_image_dimension: 800,
-            poll_interval_secs: 1,
             poll_timeout_secs: 5,
+            ..super::super::tests::request()
         }
     }
     fn manifest() -> VideoManifest {
@@ -1122,8 +1071,7 @@ mod audit_regression {
                 std::future::pending::<Result<(String, Vec<u8>)>>()
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             downloads,
             vec![0],
@@ -1174,8 +1122,7 @@ mod audit_regression {
                     Ok(("video/mp4".into(), bytes.clone()))
                 })
             })
-            .await
-            .unwrap();
+            .await;
             assert_eq!(downloads, [0, 1, 2]);
             assert_eq!(summary.videos.len(), 2 - failed_writes);
             assert_eq!(summary.billing.cost, Some(0.75));
@@ -1260,8 +1207,7 @@ mod audit_regression {
         let summary = save_outputs(&req, &base, manifest(), vec![], Ok(poll), None, |_| {
             std::future::ready(Ok(("video/webm".into(), vec![1, 2, 3])))
         })
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(summary.job_id, "accepted-job");
         assert_eq!(summary.billing.cost, Some(0.75));
@@ -1277,6 +1223,11 @@ mod audit_regression {
         assert!(summary.warnings.is_empty());
         assert_eq!(summary.errors.len(), 1);
         assert!(summary.errors[0].starts_with("manifest write failed:"));
+        assert!(
+            summary.errors[0].contains("os error"),
+            "the cause is kept: {}",
+            summary.errors[0]
+        );
         assert!(manifest_path.is_dir());
     }
     #[tokio::test]
@@ -1292,8 +1243,7 @@ mod audit_regression {
             None,
             |_| std::future::ready(Err(anyhow::anyhow!("must not download"))),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(summary.videos.is_empty());
         assert_eq!(summary.billing.cost, None);
         let saved: serde_json::Value =

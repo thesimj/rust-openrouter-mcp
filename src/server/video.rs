@@ -11,17 +11,19 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::image_gen;
+use crate::server::media::{self, InputKind};
 use crate::server::naming;
 use crate::server::provider::ProviderOptionsArgs;
 use crate::server::result::{
     DEFAULT_VIDEO_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
+    resolve_wait_seconds,
 };
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, require_all,
+    RequireFields, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, non_blank, require_all,
     scalarize_nullable,
 };
 use crate::tasks::TaskKind;
-use crate::video_gen::{self, VideoGenRequest, VideoInput};
+use crate::video_gen::{self, MediaReference, VideoGenRequest, VideoInput};
 
 use super::OpenRouterServer;
 
@@ -49,8 +51,8 @@ pub(crate) struct GenerateVideoArgs {
     /// a given model supports.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub duration: Option<u32>,
-    /// Named resolution tier: "480p", "720p", "768p", "1080p", "1K", "2K", or
-    /// "4K". For text-to-video, pair with aspect_ratio - or use `size` instead
+    /// Named resolution tier: "360p", "480p", "720p", "768p", "1080p", "1K",
+    /// "2K", or "4K". For text-to-video, pair with aspect_ratio - or use `size` instead
     /// of resolution+aspect_ratio.
     #[serde(default)]
     pub resolution: Option<String>,
@@ -149,7 +151,6 @@ fn video_job_result_json(summary: &video_gen::VideoJobSummary) -> serde_json::Va
         "model": summary.model,
         "job_id": summary.job_id,
         "cost": summary.billing.cost,
-        "kind": "video",
         "videos": videos,
         "manifest": summary.manifest_path.to_string_lossy(),
     });
@@ -165,7 +166,7 @@ impl OpenRouterServer {
         asynchronously: it almost always returns status \"pending\" with a task_id after \
         wait_seconds (default 20) - poll get_result until it is \"completed\". \
         For text-to-video, pass a prompt plus (aspect_ratio and/or \
-        resolution) OR size. `resolution` is a named tier (480p/720p/768p/1080p/1K/2K/4K); \
+        resolution) OR size. `resolution` is a named tier (360p/480p/720p/768p/1080p/1K/2K/4K); \
         `size` is explicit pixels as \"WIDTHxHEIGHT\" (e.g. \"1280x720\") - an alternative to \
         resolution+aspect_ratio, not interchangeable with the tier vocabulary. For image-to-video, \
         pass first_frame (and optionally last_frame) as local image paths and provide neither \
@@ -210,9 +211,22 @@ impl OpenRouterServer {
     /// [`Self::run_generate`], so tests can drive it without a `RequestContext`.
     pub(crate) async fn run_generate_video(
         &self,
-        args: GenerateVideoArgs,
+        mut args: GenerateVideoArgs,
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
+        for value in [
+            &mut args.aspect_ratio,
+            &mut args.size,
+            &mut args.resolution,
+            &mut args.first_frame,
+            &mut args.last_frame,
+        ] {
+            *value = non_blank(value.take());
+        }
+        media::check_count(InputKind::Image, args.reference_images.len())?;
+        media::check_count(InputKind::Audio, args.reference_audio.len())?;
+        media::check_count(InputKind::Video, args.reference_videos.len())?;
+
         // No defaults: the agent must choose these explicitly.
         let mut missing: Vec<&str> = Vec::new();
         if args.duration.is_none() {
@@ -259,8 +273,18 @@ impl OpenRouterServer {
             seed: args.seed,
             frames,
             references: args.reference_images.iter().map(PathBuf::from).collect(),
-            reference_audio: args.reference_audio,
-            reference_videos: args.reference_videos,
+            reference_audio: resolve_references(
+                InputKind::Audio,
+                "reference_audio",
+                args.reference_audio,
+            )
+            .await?,
+            reference_videos: resolve_references(
+                InputKind::Video,
+                "reference_videos",
+                args.reference_videos,
+            )
+            .await?,
             creativity: args.creativity,
             upscale_factor: args.upscale_factor,
             provider,
@@ -273,10 +297,7 @@ impl OpenRouterServer {
         req.validate()
             .map_err(|e| ErrorData::invalid_params(format!("generate_video: {e:#}"), None))?;
 
-        let wait = args
-            .wait_seconds
-            .unwrap_or(DEFAULT_VIDEO_WAIT_SECONDS)
-            .clamp(1, 60);
+        let wait = resolve_wait_seconds(args.wait_seconds, DEFAULT_VIDEO_WAIT_SECONDS);
         let mut config: Vec<String> = Vec::new();
         if let Some(a) = &req.aspect_ratio {
             config.push(a.clone());
@@ -336,6 +357,26 @@ impl OpenRouterServer {
     }
 }
 
+/// Resolve reference clips before the job is spawned, so a bad one is an
+/// `invalid_params` error naming it: a URL passes through, a local file or a
+/// `data:` URL is inlined (see [`media::resolve_media_reference`]).
+async fn resolve_references(
+    kind: InputKind,
+    field: &str,
+    sources: Vec<String>,
+) -> Result<Vec<MediaReference>, ErrorData> {
+    let mut references = Vec::with_capacity(sources.len());
+    for source in sources {
+        let url = media::resolve_media_reference(kind, &source)
+            .await
+            .map_err(|e| {
+                ErrorData::invalid_params(format!("{field} {source}: {}", e.message), None)
+            })?;
+        references.push(MediaReference { source, url });
+    }
+    Ok(references)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,22 +393,10 @@ mod tests {
             model: "m".to_string(),
             prompt: Some("p".to_string()),
             duration: None,
-            resolution: None,
             aspect_ratio: None,
-            size: None,
             with_audio: None,
-            seed: None,
-            first_frame: None,
-            last_frame: None,
-            reference_images: vec![],
-            reference_audio: vec![],
-            reference_videos: vec![],
-            creativity: None,
-            upscale_factor: None,
-            provider: Default::default(),
-            max_image_dimension: None,
             wait_seconds: None,
-            output: Some("out.mp4".to_string()),
+            ..valid_args(std::path::Path::new("out.mp4"))
         };
         let err = server.run_generate_video(args, false).await.unwrap_err();
         assert!(err.message.contains("duration"));
@@ -389,20 +418,10 @@ mod tests {
             duration: Some(8),
             resolution: Some("720p".to_string()),
             aspect_ratio: None,
-            size: None,
             with_audio: Some(true),
-            seed: None,
             first_frame,
-            last_frame: None,
-            reference_images: vec![],
-            reference_audio: vec![],
-            reference_videos: vec![],
-            creativity: None,
-            upscale_factor: None,
-            provider: Default::default(),
-            max_image_dimension: None,
             wait_seconds: None,
-            output: Some("out.mp4".to_string()),
+            ..valid_args(std::path::Path::new("out.mp4"))
         };
 
         // No frame: still required, so validation stops the call before any HTTP.
@@ -444,30 +463,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("clip.mp4");
             let result = server
-                .run_generate_video(
-                    GenerateVideoArgs {
-                        model: "test/video".into(),
-                        prompt: Some("a kite".into()),
-                        duration: Some(4),
-                        resolution: None,
-                        aspect_ratio: Some("16:9".into()),
-                        size: None,
-                        with_audio: Some(false),
-                        seed: None,
-                        first_frame: None,
-                        last_frame: None,
-                        reference_images: vec![],
-                        reference_audio: vec![],
-                        reference_videos: vec![],
-                        creativity: None,
-                        upscale_factor: None,
-                        provider: Default::default(),
-                        max_image_dimension: None,
-                        wait_seconds: Some(1),
-                        output: Some(out.to_string_lossy().into_owned()),
-                    },
-                    false,
-                )
+                .run_generate_video(valid_args(&out), false)
                 .await
                 .unwrap();
             let envelope = tool_result_json(&result);
@@ -495,6 +491,62 @@ mod tests {
         }
     }
 
+    /// References are resolved before the job starts: a local file goes out
+    /// inlined as a data URL, and a missing one is an invalid-params error
+    /// naming the argument, with nothing sent upstream.
+    #[tokio::test]
+    async fn generate_video_resolves_references_before_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let beat = dir.path().join("beat.mp3");
+        std::fs::write(&beat, b"ABC").unwrap();
+        let out = dir.path().join("clip.mp4");
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "input_references": [
+                    { "type": "audio_url", "audio_url": { "url": "data:audio/mpeg;base64,QUJD" } }
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "vid-ref" })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/videos/vid-ref"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "vid-ref", "status": "processing", "unsigned_urls": []
+            })))
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        server
+            .run_generate_video(
+                GenerateVideoArgs {
+                    reference_audio: vec![beat.to_string_lossy().into_owned()],
+                    ..valid_args(&out)
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let missing = dir.path().join("missing.mp4");
+        let err = server
+            .run_generate_video(
+                GenerateVideoArgs {
+                    reference_videos: vec![missing.to_string_lossy().into_owned()],
+                    ..valid_args(&out)
+                },
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("reference_videos"), "{}", err.message);
+    }
+
     #[tokio::test]
     async fn generate_video_returns_pending_with_a_task_id() {
         // The submit succeeds but the poll keeps reporting "processing", so the
@@ -519,24 +571,8 @@ mod tests {
         let out = std::env::temp_dir().join("openrouter-mcp-video-pending/clip.mp4");
         let args = GenerateVideoArgs {
             model: "google/veo-3.1".to_string(),
-            prompt: Some("a kite".to_string()),
-            duration: Some(4),
-            resolution: None,
-            aspect_ratio: Some("16:9".to_string()),
-            size: None,
-            with_audio: Some(false),
-            seed: None,
-            first_frame: None,
-            last_frame: None,
-            reference_images: vec![],
-            reference_audio: vec![],
-            reference_videos: vec![],
-            creativity: None,
-            upscale_factor: None,
-            provider: Default::default(),
-            max_image_dimension: None,
             wait_seconds: Some(1), // clamp floor: return quickly as pending
-            output: Some(out.to_string_lossy().into_owned()),
+            ..valid_args(&out)
         };
         let res = server.run_generate_video(args, false).await.unwrap();
         let v = tool_result_json(&res);
@@ -611,6 +647,57 @@ mod tests {
             .expect("a reference call must not be rejected for a missing prompt");
         let text = tool_result_json(&res).to_string();
         assert!(!text.contains("prompt"), "{text}");
+    }
+
+    /// Blank strings count as absent, as in generate_image: a blank ratio does
+    /// not satisfy the ratio requirement, and a blank frame is not a frame.
+    #[tokio::test]
+    async fn generate_video_treats_blank_strings_as_absent() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.mp4");
+        for args in [
+            GenerateVideoArgs {
+                aspect_ratio: Some("  ".to_string()),
+                ..valid_args(&out)
+            },
+            GenerateVideoArgs {
+                aspect_ratio: None,
+                first_frame: Some(String::new()),
+                last_frame: Some(" ".to_string()),
+                ..valid_args(&out)
+            },
+        ] {
+            let err = server.run_generate_video(args, false).await.unwrap_err();
+            assert!(err.message.contains("aspect_ratio"), "{}", err.message);
+        }
+    }
+
+    /// Reference image, audio and video lists have the same count cap as every
+    /// other input list, checked before a job is spawned.
+    #[tokio::test]
+    async fn generate_video_caps_the_reference_lists() {
+        let server = server_for("http://127.0.0.1:9".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.mp4");
+        let too_many = vec!["https://cdn/x".to_string(); crate::resources::MAX_INPUTS_PER_LIST + 1];
+        for args in [
+            GenerateVideoArgs {
+                reference_audio: too_many.clone(),
+                ..valid_args(&out)
+            },
+            GenerateVideoArgs {
+                reference_videos: too_many.clone(),
+                ..valid_args(&out)
+            },
+            GenerateVideoArgs {
+                reference_images: too_many.clone(),
+                ..valid_args(&out)
+            },
+        ] {
+            let err = server.run_generate_video(args, false).await.unwrap_err();
+            assert!(err.message.contains("at most"), "{}", err.message);
+        }
     }
 
     #[tokio::test]

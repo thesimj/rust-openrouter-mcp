@@ -45,7 +45,7 @@ The 17 tools break down into a few classes:
   state and never contact OpenRouter (or anyone else).
 
 Every request above also carries two small app-attribution headers,
-`HTTP-Referer` and `X-Title` - these identify the project to OpenRouter for
+`HTTP-Referer` and `X-OpenRouter-Title` - these identify the project to OpenRouter for
 its public model rankings and have no effect on the response; see the env
 var table in [README.md](README.md#configuration) if you want to override
 them.

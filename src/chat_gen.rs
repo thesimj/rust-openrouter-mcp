@@ -1,7 +1,7 @@
-//! Shared chat-completion (text/vision in -> text out): the single place the
-//! `/chat/completions` request envelope is built and its response extracted.
-//! Used by the `chat_completion` MCP tool and
-//! [`crate::image_gen::describe_image`], which delegates here.
+//! Shared chat-completion (text/vision in -> text out): where the text-reply
+//! `/chat/completions` request is built and its response extracted. Used by
+//! the `chat_completion` MCP tool and [`crate::image_gen::describe_image`],
+//! which delegates here. (Audio output streams through `music_gen` instead.)
 
 use anyhow::{Context, Result};
 
@@ -37,8 +37,8 @@ pub struct ChatResult {
 /// therefore any value, when `images` is empty). The caller is
 /// responsible for having verified the model accepts image input. `prompt` is
 /// assumed already validated as non-empty. Every optional control is passed
-/// through as given (blank strings count as unset); contradictions between
-/// them (`effort` + `max_tokens`) are the caller's to reject.
+/// through as given: the caller has already applied the "blank means absent"
+/// rule and rejected contradictions between them (`effort` + `max_tokens`).
 #[derive(Default)]
 pub struct ChatInputs<'a> {
     pub model: &'a str,
@@ -74,17 +74,10 @@ pub struct ChatInputs<'a> {
     pub provider: Option<ProviderRouting>,
 }
 
-/// Trim and drop a blank optional string.
-fn non_blank(s: Option<&str>) -> Option<String> {
-    s.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 /// The `reasoning` block, or `None` when nothing about reasoning was asked for.
 fn reasoning(inputs: &ChatInputs<'_>) -> Option<Reasoning> {
     let block = Reasoning {
-        effort: non_blank(inputs.reasoning_effort),
+        effort: inputs.reasoning_effort.map(str::to_string),
         max_tokens: inputs.reasoning_max_tokens,
         exclude: inputs.reasoning_exclude,
     };
@@ -98,7 +91,7 @@ fn reasoning(inputs: &ChatInputs<'_>) -> Option<Reasoning> {
 /// model returns no choices or empty content.
 pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Result<ChatResult> {
     let mut messages = Vec::new();
-    if let Some(system) = inputs.system.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(system) = inputs.system {
         messages.push(Message {
             role: "system".to_string(),
             content: Content::Text(system.to_string()),
@@ -168,22 +161,22 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         max_tokens: inputs.max_tokens,
         top_p: inputs.top_p,
         top_k: inputs.top_k,
+        // Not trimmed: whitespace such as "\n" is a stop sequence's content.
         stop: inputs
             .stop
             .iter()
-            .filter(|s| !s.trim().is_empty())
+            .filter(|s| !s.is_empty())
             .cloned()
             .collect(),
         frequency_penalty: inputs.frequency_penalty,
         presence_penalty: inputs.presence_penalty,
-        verbosity: non_blank(inputs.verbosity),
+        verbosity: inputs.verbosity.map(str::to_string),
         response_format: inputs.response_format.clone(),
         plugins: inputs.plugins.clone(),
         web_search_options: inputs.web_search_options.clone(),
         reasoning: reasoning(inputs),
         provider: inputs.provider.clone(),
         audio: None,
-        stream: false,
     };
 
     let completion = client.chat_completion(&req).await?;

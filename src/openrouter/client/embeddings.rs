@@ -1,6 +1,7 @@
 //! `POST /api/v1/embeddings`.
 
 use anyhow::Result;
+use reqwest::Method;
 
 use crate::openrouter::{EmbeddingsBody, EmbeddingsResponse, OpenRouterClient};
 
@@ -8,16 +9,12 @@ impl OpenRouterClient {
     /// `POST /api/v1/embeddings` - synchronous text embeddings. Returns the
     /// decoded body plus the `X-Generation-Id` header. A 2xx whose body cannot
     /// be decoded keeps a billing receipt on the error (the provider may have
-    /// charged); an HTTP failure surfaces the upstream error body (bounded to 500 chars).
+    /// charged); an HTTP failure surfaces the upstream error body (bounded to `MAX_ERROR_BODY_CHARS`).
     pub async fn embeddings(
         &self,
         req: &EmbeddingsBody,
     ) -> Result<(EmbeddingsResponse, Option<String>)> {
-        let rb = self
-            .http
-            .post(format!("{}/embeddings", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let rb = self.request(Method::POST, "/embeddings").json(req);
         self.send_json_receipted(rb, "/embeddings").await
     }
 }

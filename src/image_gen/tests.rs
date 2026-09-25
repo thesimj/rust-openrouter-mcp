@@ -5,6 +5,26 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+/// A generate request for `model` with prompt "p", no images and every
+/// optional control unset; each test overrides only what it exercises.
+pub(super) fn generate_request(model: &str) -> GenerateRequest {
+    GenerateRequest {
+        model: model.to_string(),
+        prompt: "p".to_string(),
+        aspect_ratio: None,
+        image_size: None,
+        seed: None,
+        images: vec![],
+        max_image_dimension: 800,
+        quality: None,
+        output_format: None,
+        background: None,
+        output_compression: None,
+        size: None,
+        provider: None,
+    }
+}
+
 // 1x1 transparent PNG.
 const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
@@ -119,19 +139,11 @@ async fn generate_image_sends_request_and_decodes_response() {
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "google/gemini-3.1-flash-image-preview".to_string(),
         prompt: "an owl".to_string(),
         aspect_ratio: Some("1:1".to_string()),
         image_size: Some("1K".to_string()),
         seed: Some(1200),
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
-        size: None,
-        provider: None,
+        ..generate_request("google/gemini-3.1-flash-image-preview")
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!((img.width, img.height), (1, 1));
@@ -156,19 +168,8 @@ async fn generate_image_maps_half_k_resolution() {
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "m".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
         image_size: Some("0.5K".to_string()),
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
-        size: None,
-        provider: None,
+        ..generate_request("m")
     };
     assert!(generate_image(&client, &req).await.is_ok());
 }
@@ -186,19 +187,8 @@ async fn generate_image_surfaces_provider_error() {
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "openai/gpt-image-2".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
         image_size: Some("1K".to_string()),
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
-        size: None,
-        provider: None,
+        ..generate_request("openai/gpt-image-2")
     };
     let err = generate_image(&client, &req).await.unwrap_err();
     assert!(err.to_string().contains("Internal Server Error"));
@@ -245,7 +235,7 @@ fn sent_image(body: &serde_json::Value) -> (String, (u32, u32)) {
         .iter()
         .find_map(|part| part["image_url"]["url"].as_str())
         .expect("an image part is present");
-    let (mime, bytes) = crate::image_io::parse_data_url(url).unwrap();
+    let (mime, bytes) = crate::base64_codec::parse_data_url(url).unwrap();
     (mime, crate::image_io::decode_dimensions(&bytes).unwrap())
 }
 
@@ -327,10 +317,10 @@ async fn describe_image_sends_jpeg_unless_the_input_has_alpha() {
     }
 }
 
-/// describe_image reaches the reasoning plumbing, and a caller who passes only
-/// whitespace gets no `reasoning` object rather than an empty effort string.
-/// The effort matrix itself lives in `server::chat::tests` - both tools funnel
-/// through the same three lines in `chat_gen::complete`, so it is proved once.
+/// describe_image reaches the reasoning plumbing. Blank efforts are dropped at
+/// the tool boundary (`server::image::tests`), and the effort matrix itself
+/// lives in `server::chat::tests` - both tools funnel through the same lines
+/// in `chat_gen::complete`, so it is proved once.
 #[tokio::test]
 async fn describe_image_forwards_reasoning_effort() {
     const SRC: (u32, u32) = (8, 8);
@@ -338,10 +328,8 @@ async fn describe_image_forwards_reasoning_effort() {
     let body = captured_describe_body(SRC, 800, Some("high")).await;
     assert_eq!(body["reasoning"]["effort"], "high");
 
-    for blank in [Some(""), Some("  ")] {
-        let body = captured_describe_body(SRC, 800, blank).await;
-        assert!(body.get("reasoning").is_none(), "{blank:?} sent: {body}");
-    }
+    let body = captured_describe_body(SRC, 800, None).await;
+    assert!(body.get("reasoning").is_none(), "sent: {body}");
 }
 
 #[tokio::test]
@@ -414,27 +402,16 @@ async fn generate_image_honors_declared_media_type_for_vector() {
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "recraft/recraft-v4.1-vector".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
-        image_size: None,
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
-        size: None,
-        provider: None,
+        ..generate_request("recraft/recraft-v4.1-vector")
     };
     let img = generate_image(&client, &req).await.unwrap();
-    // media_type is trusted over sniffing, and SVG dimensions come from the viewBox.
+    // No raster sniffer recognizes SVG text, so the declared type decides, and
+    // the SVG dimensions come from the viewBox.
     assert_eq!(img.mime, "image/svg+xml");
     assert_eq!((img.width, img.height), (120, 60));
 }
 
-/// N3: `image/jpg` is a real-world alias for `image/jpeg`, which is what
+/// `image/jpg` is a real-world alias for `image/jpeg`, which is what
 /// `sniff_mime` always reports for JPEG bytes - a declared `image/jpg` must not
 /// false-positive as a mismatch against the sniffed type.
 #[tokio::test]
@@ -455,19 +432,7 @@ async fn generate_image_treats_image_jpg_as_an_alias_of_image_jpeg_no_warning() 
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "m".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
-        image_size: None,
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
-        size: None,
-        provider: None,
+        ..generate_request("m")
     };
     let img = generate_image(&client, &req).await.unwrap();
     assert_eq!(img.mime, "image/jpeg");
@@ -493,19 +458,11 @@ async fn generate_image_passes_through_quality_format_background_compression() {
 
     let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
     let req = GenerateRequest {
-        model: "openai/gpt-image-2".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
-        image_size: None,
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
         quality: Some("high".to_string()),
         output_format: Some("webp".to_string()),
         background: Some("transparent".to_string()),
         output_compression: Some(80),
-        size: None,
-        provider: None,
+        ..generate_request("openai/gpt-image-2")
     };
     assert!(generate_image(&client, &req).await.is_ok());
 }
@@ -537,23 +494,13 @@ async fn generate_image_sends_provider_and_size() {
         json!({"steps": 28, "guidance": 3.5}),
     );
     let req = GenerateRequest {
-        model: "black-forest-labs/flux.2-pro".to_string(),
-        prompt: "p".to_string(),
-        aspect_ratio: None,
-        image_size: None,
-        seed: None,
-        images: vec![],
-        max_image_dimension: 800,
-        quality: None,
-        output_format: None,
-        background: None,
-        output_compression: None,
         size: Some("2048x2048".to_string()),
         provider: Some(crate::openrouter::ImageProvider {
             order: vec!["black-forest-labs".to_string()],
             options,
             ..Default::default()
         }),
+        ..generate_request("black-forest-labs/flux.2-pro")
     };
     assert!(generate_image(&client, &req).await.is_ok());
     let body: serde_json::Value =
@@ -592,9 +539,9 @@ fn canonical_mime_normalizes_case_and_aliases() {
 
 #[test]
 fn input_limits_reject_the_batch_before_decoding() {
-    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_INPUTS, MAX_IMAGE_TOTAL_BYTES};
+    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_TOTAL_BYTES, MAX_INPUTS_PER_LIST};
     let invalid = InputImage::inline(vec![0], "invalid", None);
-    let too_many = vec![invalid.clone(); MAX_IMAGE_INPUTS + 1];
+    let too_many = vec![invalid.clone(); MAX_INPUTS_PER_LIST + 1];
     assert!(
         prepare_inputs(&too_many, 1)
             .err()
@@ -634,4 +581,50 @@ fn file_input_limit_rejects_before_normalization() {
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("limit") || format!("{error:#}").contains("exceed"));
+}
+
+/// Raster magic bytes are ground truth even against a declared SVG type: a
+/// PNG labelled `image/svg+xml` is saved as a PNG, with the mismatch reported.
+#[test]
+fn decode_generated_trusts_raster_bytes_over_a_declared_svg() {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let resp: crate::openrouter::ImagesResponse = serde_json::from_value(json!({
+        "data": [{
+            "b64_json": base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            "media_type": "image/svg+xml"
+        }]
+    }))
+    .unwrap();
+    let img = decode_generated(resp, None, None).unwrap();
+    assert_eq!(img.mime, "image/png");
+    assert_eq!((img.width, img.height), (2, 2));
+    assert!(
+        img.warnings.iter().any(|w| w.contains("image/svg+xml")),
+        "{:?}",
+        img.warnings
+    );
+}
+
+/// An SVG whose size cannot be read is still saved, but the 0x0 it reports
+/// comes with a warning saying why, instead of passing for a real size.
+#[test]
+fn decode_generated_warns_when_an_svg_size_cannot_be_read() {
+    let resp: crate::openrouter::ImagesResponse = serde_json::from_value(json!({
+        "data": [{
+            "b64_json": base64::engine::general_purpose::STANDARD.encode("<svg"),
+            "media_type": "image/svg+xml"
+        }]
+    }))
+    .unwrap();
+    let img = decode_generated(resp, None, None).unwrap();
+    assert_eq!(img.mime, "image/svg+xml");
+    assert_eq!((img.width, img.height), (0, 0));
+    assert!(
+        img.warnings.iter().any(|w| w.contains("SVG")),
+        "{:?}",
+        img.warnings
+    );
 }

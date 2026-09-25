@@ -36,6 +36,11 @@ mod video;
 #[cfg(test)]
 mod test_support;
 
+/// Synchronous tool calls (chat, embeddings, speech, ...) served at once; a
+/// call past it is refused rather than queued. Generation jobs have their own
+/// cap in [`TaskRegistry`].
+const MAX_SYNC_CALLS: usize = 8;
+
 /// MCP server wrapping an [`OpenRouterClient`].
 #[derive(Clone)]
 pub struct OpenRouterServer {
@@ -43,10 +48,10 @@ pub struct OpenRouterServer {
     pub(crate) tasks: TaskRegistry,
     work: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) stats: UsageStats,
-    /// Per-model input modalities (e.g. `["text", "image"]`) looked up once per
-    /// process, so `chat_completion` can reject an image, file, audio or video
-    /// sent to a model that does not take it before any network call. See
-    /// `chat::ensure_input_modality` for the lookup rules.
+    /// Per-model input modalities (e.g. `["text", "image"]`), cached once known,
+    /// so `chat_completion` can reject an image, file, audio or video sent to a
+    /// model that does not take it before the chat call. See
+    /// `chat::input_modalities` for the lookup rules.
     pub(crate) model_caps: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
@@ -65,7 +70,7 @@ impl OpenRouterServer {
         Self {
             client,
             tasks: TaskRegistry::new(),
-            work: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            work: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SYNC_CALLS)),
             stats: UsageStats::new(),
             model_caps: Default::default(),
             tool_router: Self::models_router()
@@ -190,7 +195,9 @@ mod lifecycle_tests {
     async fn synchronous_capacity_is_shared_and_reopens() {
         let server = test_support::server_for("http://127.0.0.1:9".into());
         let clone = server.clone();
-        let mut permits: Vec<_> = (0..8).map(|_| server.admit_work().unwrap()).collect();
+        let mut permits: Vec<_> = (0..MAX_SYNC_CALLS)
+            .map(|_| server.admit_work().unwrap())
+            .collect();
         assert!(clone.admit_work().is_err());
         permits.pop();
         assert!(clone.admit_work().is_ok());
@@ -234,7 +241,10 @@ mod lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(tasks.snapshot(&id).await.unwrap().status, "completed");
+        assert!(matches!(
+            tasks.snapshot(&id).await.unwrap().status,
+            crate::tasks::Status::Completed(_)
+        ));
         done.await.unwrap();
         assert!(tasks.reserve(crate::tasks::TaskKind::Image).is_none());
     }

@@ -11,7 +11,6 @@ use tokio::sync::Semaphore;
 use crate::image_io;
 use crate::manifest::{self, InputImageMeta, Manifest, VariantMeta};
 use crate::openrouter::OpenRouterClient;
-use crate::output::{base_stem, in_parent_of};
 
 use super::{GenContent, GenerateRequest, GeneratedImage, build_gen_content, generate_core};
 
@@ -100,18 +99,12 @@ pub fn variant_output_path(
     total: usize,
     ext: &str,
 ) -> PathBuf {
-    if total <= 1 {
-        return base.with_extension(ext);
-    }
-    let marker = match seed {
+    let marker = |index: String| match seed {
         // The index stays unique even if seed stepping saturates at u64::MAX.
-        Some(s) => format!("{s:04}-{:03}", index_zero_based + 1),
-        None => {
-            let width = 3.max(total.to_string().len());
-            format!("{:0width$}", index_zero_based + 1, width = width)
-        }
+        Some(s) => format!("{s:04}-{index}"),
+        None => index,
     };
-    in_parent_of(base, format!("{}-var-{marker}.{ext}", base_stem(base)))
+    crate::output::numbered_path(base, "var", marker, index_zero_based, total, ext)
 }
 
 /// One saved image in a job's lean summary.
@@ -179,7 +172,7 @@ pub async fn run_job(
                 .map(move |w| format!("input image {}: {w}", i + 1))
         })
         .collect();
-    save_outcomes(req, base_output, input_images, warnings, outcomes).await
+    Ok(save_outcomes(req, base_output, input_images, warnings, outcomes).await)
 }
 
 /// Delivery and receipt for one image, independent of batch aggregation.
@@ -281,7 +274,7 @@ async fn save_outcomes(
     input_images: Vec<InputImageMeta>,
     mut warnings: Vec<String>,
     outcomes: Vec<VariantOutcome>,
-) -> Result<JobSummary> {
+) -> JobSummary {
     let variants = outcomes.len();
     let mut billing = crate::billing::Totals::default();
     let mut images = Vec::new();
@@ -320,19 +313,16 @@ async fn save_outcomes(
         variants: variant_metas,
     };
     let mpath = manifest::path(base_output);
-    // A manifest-write failure must not discard already-saved images / spend.
-    if let Err(e) = manifest::write(&mpath, &manifest).await {
-        errors.push(format!("manifest write failed: {e}"));
-    }
+    errors.extend(manifest::write_or_report(&mpath, &manifest).await);
 
-    Ok(JobSummary {
+    JobSummary {
         model: req.model.clone(),
         manifest_path: mpath,
         images,
         warnings,
         errors,
         billing,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -375,7 +365,7 @@ mod tests {
         );
     }
 
-    /// F5: the manifest doc says it holds "the full request settings" - the
+    /// The manifest doc says it holds "the full request settings" - the
     /// four new image knobs (quality/output_format/background/
     /// output_compression) must actually round-trip onto disk, not just live in
     /// the request struct.
@@ -397,13 +387,9 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let req = GenerateRequest {
-            model: "openai/gpt-image-2".to_string(),
             prompt: "an owl".to_string(),
             aspect_ratio: Some("1:1".to_string()),
             image_size: Some("1K".to_string()),
-            seed: None,
-            images: vec![],
-            max_image_dimension: 800,
             quality: Some("high".to_string()),
             output_format: Some("webp".to_string()),
             background: Some("transparent".to_string()),
@@ -413,6 +399,7 @@ mod tests {
                 order: vec!["openai".to_string()],
                 ..Default::default()
             }),
+            ..crate::image_gen::tests::generate_request("openai/gpt-image-2")
         };
         let base = std::env::temp_dir().join("openrouter-mcp-manifest-knobs-test/hero.png");
         let summary = run_job(&client, &req, 1, &base).await.unwrap();
@@ -436,19 +423,8 @@ mod audit_regression {
     use super::*;
     fn request() -> GenerateRequest {
         GenerateRequest {
-            model: "test/image".into(),
             prompt: "test".into(),
-            aspect_ratio: None,
-            image_size: None,
-            seed: None,
-            images: vec![],
-            max_image_dimension: 800,
-            quality: None,
-            output_format: None,
-            background: None,
-            output_compression: None,
-            size: None,
-            provider: None,
+            ..crate::image_gen::tests::generate_request("test/image")
         }
     }
 
@@ -488,9 +464,7 @@ mod audit_regression {
                 result,
             })
             .collect();
-        let summary = save_outcomes(&request(), &base, vec![], vec![], outcomes)
-            .await
-            .unwrap();
+        let summary = save_outcomes(&request(), &base, vec![], vec![], outcomes).await;
         assert_eq!(summary.images.len(), 1);
         assert_eq!(
             std::fs::read(&summary.images[0].path).unwrap(),

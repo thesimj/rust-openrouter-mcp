@@ -42,6 +42,14 @@ impl EmbeddingsInput {
             Err(texts) => Self::Texts(texts),
         }
     }
+
+    /// How many texts go out: one vector must come back for each.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(_) => 1,
+            Self::Texts(texts) => texts.len(),
+        }
+    }
 }
 
 /// Response body: one vector per input, plus token usage and the USD cost.

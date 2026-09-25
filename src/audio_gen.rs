@@ -18,14 +18,20 @@ use crate::openrouter::{
     SpeechReferenceAudio, TranscriptionBody,
 };
 
-/// Audio container formats the transcription endpoint accepts, as the
-/// `input_audio.format` values it expects. Keyed by file extension - which is
-/// the same string for every format we support.
-const TRANSCRIBE_FORMATS: [&str; 7] = ["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"];
+/// `input_audio.format` values accepted locally for every audio input: the
+/// transcription source, chat `input_audio` parts, and the speech voice
+/// reference. OpenRouter's examples for transcription (wav, mp3, flac, m4a,
+/// ogg, webm, aac) plus what its chat audio guide adds (aiff, pcm16, pcm24);
+/// which ones a model takes still varies by provider. The format string
+/// doubles as the file extension, except for the raw PCM formats.
+pub(crate) const INPUT_AUDIO_FORMATS: [&str; 10] = [
+    "wav", "mp3", "flac", "m4a", "ogg", "webm", "aac", "aiff", "pcm16", "pcm24",
+];
 
-/// Local decoded audio limit (25 MiB), applied to files and inline inputs.
-/// This bounds memory use; OpenRouter JSON requests may support larger inputs.
-const MAX_TRANSCRIBE_BYTES: u64 = 25 * 1024 * 1024;
+/// Local decoded audio limit (25 MiB) for every audio input except the voice
+/// reference, applied to files and inline data. This bounds memory use;
+/// OpenRouter JSON requests may support larger inputs.
+const MAX_INPUT_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Decoded cap for a voice-cloning reference sample sent as
 /// `input_references[].input_audio` on `/audio/speech` (OpenRouter documents
@@ -36,29 +42,28 @@ pub const MAX_VOICE_REFERENCE_BYTES: u64 = 15 * 1024 * 1024;
 /// the sample).
 pub const MAX_VOICE_REFERENCE_TEXT_CHARS: usize = 10_000;
 
-/// The `input_audio.format` value for a file extension, if it is one the
-/// endpoint accepts. Case-insensitive.
-fn transcribe_format(ext: &str) -> Option<&'static str> {
+/// The `input_audio.format` value for a file extension or MIME subtype, if it
+/// is one of [`INPUT_AUDIO_FORMATS`]. Case-insensitive.
+fn input_audio_format(ext: &str) -> Option<&'static str> {
     let ext = ext.trim().to_ascii_lowercase();
     let ext = match ext.as_str() {
         "mpeg" => "mp3",
         "mp4" | "x-m4a" => "m4a",
         "x-wav" | "wave" => "wav",
         "x-flac" => "flac",
+        "aif" | "x-aiff" => "aiff",
         other => other,
     };
-    TRANSCRIBE_FORMATS.into_iter().find(|f| *f == ext)
+    INPUT_AUDIO_FORMATS.into_iter().find(|f| *f == ext)
 }
 
 /// Inputs for one transcription request.
 #[derive(Debug, Clone)]
 pub struct TranscribeRequest {
     pub model: String,
-    /// Raw base64 audio bytes (no `data:` prefix - upstream rejects those).
-    pub data: String,
-    /// Container format: one of [`TRANSCRIBE_FORMATS`], or a data-URL subtype
-    /// alias (`mpeg`, `x-wav`, ...) that [`validate_inline_audio`] normalizes.
-    pub format: String,
+    /// The audio, already checked by [`validate_inline_audio`]: raw base64 (no
+    /// `data:` prefix - upstream rejects those) and a normalized format.
+    pub audio: InputAudio,
     /// Optional ISO-639-1 language hint (e.g. "en").
     pub language: Option<String>,
     /// "json" (default, when `None`) or "verbose_json".
@@ -76,6 +81,8 @@ pub struct TranscribeRequest {
 pub struct TranscribeResult {
     pub text: String,
     pub cost: Option<f64>,
+    /// OpenRouter's `X-Generation-Id` header, when the response carried one.
+    pub generation_id: Option<String>,
     pub verbose: Option<serde_json::Value>,
 }
 
@@ -88,15 +95,15 @@ pub async fn read_audio_file(
 ) -> Result<(String, String)> {
     let format = match format_override {
         Some(f) => {
-            transcribe_format(f).with_context(|| format!("unsupported audio format {f:?}"))?
+            input_audio_format(f).with_context(|| format!("unsupported audio format {f:?}"))?
         }
         None => {
             let ext = path.extension().unwrap_or_default().to_string_lossy();
-            transcribe_format(&ext).with_context(|| {
+            input_audio_format(&ext).with_context(|| {
                 format!(
                     "could not infer the audio format from {}; pass format explicitly (one of: {})",
                     path.display(),
-                    TRANSCRIBE_FORMATS.join(", ")
+                    INPUT_AUDIO_FORMATS.join(", ")
                 )
             })?
         }
@@ -105,7 +112,7 @@ pub async fn read_audio_file(
     let path = path.to_path_buf();
     let format = format.to_string();
     crate::resources::run_blocking(move || {
-        let bytes = crate::resources::read_file_limited(&path, MAX_TRANSCRIBE_BYTES as usize)?;
+        let bytes = crate::resources::read_file_limited(&path, MAX_INPUT_AUDIO_BYTES as usize)?;
         Ok((
             base64::engine::general_purpose::STANDARD.encode(bytes),
             format,
@@ -120,7 +127,7 @@ pub async fn read_audio_file(
 /// with the chat `input_audio` parts (`server::media`).
 pub(crate) fn validate_inline_audio(data: &str, format: &str) -> Result<(String, String)> {
     let (data, format) =
-        validate_inline_audio_within(data, Some(format), MAX_TRANSCRIBE_BYTES, "transcription")?;
+        validate_inline_audio_within(data, Some(format), MAX_INPUT_AUDIO_BYTES, "input audio")?;
     Ok((data, format.unwrap_or_default()))
 }
 
@@ -136,15 +143,14 @@ fn validate_inline_audio_within(
     limit: u64,
     what: &str,
 ) -> Result<(String, Option<String>)> {
-    let data = crate::image_io::compact_base64(data);
+    let data = crate::base64_codec::compact_base64(data);
     let format = format
-        .map(|f| transcribe_format(f).with_context(|| format!("unsupported audio format {f:?}")))
+        .map(|f| input_audio_format(f).with_context(|| format!("unsupported audio format {f:?}")))
         .transpose()?;
-    let encoded_limit = limit.div_ceil(3) * 4;
-    if data.len() as u64 > encoded_limit {
+    if data.len() > crate::base64_codec::max_base64_len(limit as usize) {
         bail!("audio exceeds the local {what} limit of {limit} decoded bytes");
     }
-    let bytes = crate::image_io::decode_base64(&data).context("invalid base64 audio")?;
+    let bytes = crate::base64_codec::decode_base64(&data).context("invalid base64 audio")?;
     if bytes.is_empty() {
         bail!("audio is empty");
     }
@@ -212,8 +218,8 @@ impl VoiceReference {
     }
 }
 
-/// Transcribe audio to text. Requires already-encoded base64 `data` (see
-/// [`read_audio_file`]) so the caller decides where the bytes came from.
+/// Transcribe audio to text. `req.audio` is already resolved and checked by
+/// the caller (see [`validate_inline_audio`]), wherever the bytes came from.
 pub async fn transcribe(
     client: &OpenRouterClient,
     req: &TranscribeRequest,
@@ -235,24 +241,23 @@ pub async fn transcribe(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let (data, format) = validate_inline_audio(&req.data, &req.format)?;
     let body = TranscriptionBody {
         model: req.model.clone(),
-        input_audio: InputAudio { data, format },
+        input_audio: req.audio.clone(),
         language: req.language.clone(),
         response_format: response_format.clone(),
         timestamp_granularities,
         temperature: req.temperature,
         provider: req.provider.clone(),
     };
-    let raw = client.transcribe(&body).await?;
+    let (raw, generation_id) = client.transcribe(&body).await?;
     let cost = raw
         .get("usage")
         .and_then(|u| u.get("cost"))
         .and_then(serde_json::Value::as_f64);
     let receipt = crate::billing::Receipt {
         cost,
-        generation_id: None,
+        generation_id: generation_id.clone(),
     };
     let text = raw
         .get("text")
@@ -292,6 +297,7 @@ pub async fn transcribe(
     Ok(TranscribeResult {
         text,
         cost,
+        generation_id,
         verbose,
     })
 }
@@ -332,24 +338,6 @@ pub struct AudioJobResult {
     pub warnings: Vec<String>,
 }
 
-/// File extension for an audio MIME type, falling back to the requested
-/// `response_format` (mp3/pcm) and finally `mp3`.
-fn extension_for(mime: &str, response_format: &str) -> &'static str {
-    match mime {
-        "audio/mpeg" | "audio/mp3" => "mp3",
-        "audio/wav" | "audio/x-wav" => "wav",
-        "audio/pcm" | "audio/l16" => "pcm",
-        "audio/flac" => "flac",
-        "audio/ogg" => "ogg",
-        // application/octet-stream and unknown types: trust the requested format.
-        _ => match response_format {
-            "pcm" => "pcm",
-            "wav" => "wav",
-            _ => "mp3",
-        },
-    }
-}
-
 /// The `response_format` that goes on the wire: trimmed and lowercased,
 /// defaulting to `mp3` so the file extension is deterministic. Blank counts as
 /// absent, so a literal `"  "` is never sent. Shared with the MCP tool so its
@@ -367,8 +355,8 @@ pub(crate) fn normalize_voice(raw: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Run a TTS job: synthesize the speech, save the bytes (extension from the
-/// content-type / requested format), and write the sidecar manifest.
+/// Run a TTS job: synthesize the speech, save the bytes (typed by
+/// [`crate::audio_container::container_for`]), and write the sidecar manifest.
 pub async fn run_job(
     client: &OpenRouterClient,
     req: &SpeechGenRequest,
@@ -393,7 +381,11 @@ pub async fn run_job(
     };
 
     let result = client.speech(&body).await?;
-    let ext = extension_for(&result.mime, &response_format);
+    let (mime, ext) = crate::audio_container::container_for(
+        &result.bytes,
+        Some(&result.mime),
+        Some(&response_format),
+    );
     let path = output.with_extension(ext);
     crate::output::write_bytes(&path, &result.bytes)
         .await
@@ -419,23 +411,20 @@ pub async fn run_job(
         provider: req.provider.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         output: AudioOutputMeta {
-            path: Some(path.to_string_lossy().into_owned()),
-            mime_type: Some(result.mime.clone()),
+            path: path.to_string_lossy().into_owned(),
+            mime_type: mime.to_string(),
             generation_id: result.generation_id,
-            error: None,
         },
     };
     let mpath = manifest::path(output);
-    if let Err(e) = manifest::write(&mpath, &manifest).await {
-        warnings.push(format!("manifest write failed: {e}"));
-    }
+    warnings.extend(manifest::write_or_report(&mpath, &manifest).await);
 
     Ok(AudioJobResult {
         model: req.model.clone(),
         manifest_path: mpath,
         audio: AudioSummary {
             path,
-            mime: result.mime,
+            mime: mime.to_string(),
             voice,
             response_format,
         },
@@ -451,13 +440,64 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn extension_for_prefers_mime_then_requested_format() {
-        assert_eq!(extension_for("audio/mpeg", "mp3"), "mp3");
-        assert_eq!(extension_for("audio/wav", "mp3"), "wav");
-        // Unknown/opaque content type falls back to the requested format.
-        assert_eq!(extension_for("application/octet-stream", "pcm"), "pcm");
-        assert_eq!(extension_for("application/octet-stream", "mp3"), "mp3");
+    /// The saved file and the recorded mime agree: the bytes decide first,
+    /// then a content type we know, then the requested format.
+    #[tokio::test]
+    async fn run_job_types_the_audio_from_its_bytes_then_its_content_type() {
+        for (content_type, bytes, requested, mime, ext) in [
+            (
+                "application/octet-stream",
+                &b"ID3\x03\x00"[..],
+                None,
+                "audio/mpeg",
+                "mp3",
+            ),
+            ("audio/wav", &b"ID3\x03\x00"[..], None, "audio/mpeg", "mp3"),
+            ("audio/aac", &b"\x00\x01"[..], None, "audio/aac", "aac"),
+            ("audio/x-wav", &b"\x00\x01"[..], None, "audio/wav", "wav"),
+            (
+                "application/octet-stream",
+                &b"\xFF\xFB\x90\x00"[..],
+                Some("pcm"),
+                "audio/pcm",
+                "pcm",
+            ),
+            (
+                "application/octet-stream",
+                &b"\x00\x01"[..],
+                None,
+                "audio/mpeg",
+                "mp3",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/audio/speech"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", content_type)
+                        .set_body_bytes(bytes.to_vec()),
+                )
+                .mount(&server)
+                .await;
+            let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+            let req = SpeechGenRequest {
+                model: "m".to_string(),
+                input: "hi".to_string(),
+                voice: None,
+                response_format: requested.map(str::to_string),
+                speed: None,
+                voice_reference: None,
+                provider: None,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let result = run_job(&client, &req, &dir.path().join("speech"))
+                .await
+                .unwrap();
+            let case = format!("{content_type} {bytes:?} {requested:?}");
+            assert_eq!(result.audio.mime, mime, "{case}");
+            assert_eq!(result.audio.path.extension().unwrap(), ext, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -504,7 +544,7 @@ mod tests {
         assert_eq!(std::fs::read(&result.audio.path).unwrap(), b"ID3-FAKE-MP3");
     }
 
-    /// N5 (B10 sibling of F9): a blank/whitespace-only response_format must
+    /// A blank/whitespace-only response_format must
     /// behave exactly like `None` - the mp3 default - not reach the wire as a
     /// literal "  ".
     #[tokio::test]
@@ -723,8 +763,10 @@ mod tests {
     fn transcribe_req(response_format: Option<&str>, granularities: &[&str]) -> TranscribeRequest {
         TranscribeRequest {
             model: "openai/whisper-1".to_string(),
-            data: "QUJD".to_string(),
-            format: "mp3".to_string(),
+            audio: InputAudio {
+                data: "QUJD".to_string(),
+                format: "mp3".to_string(),
+            },
             language: None,
             response_format: response_format.map(str::to_string),
             timestamp_granularities: granularities.iter().map(|s| s.to_string()).collect(),
@@ -733,7 +775,7 @@ mod tests {
         }
     }
 
-    /// F10: response_format gating and the wire value are case/whitespace
+    /// Response_format gating and the wire value are case/whitespace
     /// insensitive - "Verbose_json" (and " verbose_json ") behave exactly like
     /// "verbose_json".
     #[tokio::test]
@@ -766,7 +808,7 @@ mod tests {
         }
     }
 
-    /// F9: a blank/whitespace-only response_format is treated as absent (the
+    /// A blank/whitespace-only response_format is treated as absent (the
     /// default "json" path), not sent to the wire as an empty string.
     #[tokio::test]
     async fn transcribe_drops_blank_response_format() {
@@ -789,13 +831,13 @@ mod tests {
         assert!(sent.get("response_format").is_none(), "sent: {sent}");
     }
 
-    /// F9: blank entries in timestamp_granularities are dropped before the wire.
+    /// Blank entries in timestamp_granularities are dropped before the wire.
     #[tokio::test]
     async fn transcribe_drops_blank_timestamp_granularities_entries() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/audio/transcriptions"))
-            // N4: "Word" is lowercased to "word", like response_format, and the
+            // "Word" is lowercased to "word", like response_format, and the
             // blank/whitespace-only entries are dropped entirely.
             .and(body_partial_json(
                 json!({ "timestamp_granularities": ["word", "segment"] }),
@@ -856,12 +898,21 @@ mod audit_regression {
         assert_eq!(validate_inline_audio("QUJDRA", "wav").unwrap().0, "QUJDRA");
         assert!(validate_inline_audio("QUJD", "exe").is_err());
         assert!(validate_inline_audio("", "wav").is_err());
-        let too_large = "A".repeat((MAX_TRANSCRIBE_BYTES.div_ceil(3) * 4 + 4) as usize);
+        // Formats the chat audio guide lists beyond the transcription examples.
+        for (format, expected) in [
+            ("aiff", "aiff"),
+            ("x-aiff", "aiff"),
+            ("pcm16", "pcm16"),
+            ("pcm24", "pcm24"),
+        ] {
+            assert_eq!(validate_inline_audio("QUJD", format).unwrap().1, expected);
+        }
+        let too_large = "A".repeat((MAX_INPUT_AUDIO_BYTES.div_ceil(3) * 4 + 4) as usize);
         assert!(
             validate_inline_audio(&too_large, "wav")
                 .unwrap_err()
                 .to_string()
-                .contains("local transcription limit")
+                .contains("local input audio limit")
         );
     }
 }

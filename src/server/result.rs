@@ -1,5 +1,6 @@
-//! Job-envelope construction, inline preview/media encoding, and the shared
-//! background-job spawn/wait flow used by the image and video tools.
+//! Tool-result construction: error mapping, the synchronous text-call tail,
+//! job envelopes, inline preview/media encoding, and the shared background-job
+//! spawn/wait flow used by the image and video tools.
 
 use base64::Engine;
 use rmcp::{
@@ -10,7 +11,7 @@ use rmcp::{
 use serde_json::json;
 
 use crate::stats::UsageStats;
-use crate::tasks::{JobReservation, TaskKind, TaskSnapshot};
+use crate::tasks::{JobReservation, Status, TaskKind, TaskSnapshot};
 
 use super::OpenRouterServer;
 
@@ -19,8 +20,18 @@ pub(crate) const DEFAULT_WAIT_SECONDS: u64 = 10;
 
 /// Default inline wait for video: video takes 30s-several minutes, so the
 /// fast-return window almost always yields `pending` and the caller polls
-/// get_result. Kept within the 1-60 clamp.
+/// get_result.
 pub(crate) const DEFAULT_VIDEO_WAIT_SECONDS: u64 = 20;
+
+/// Longest inline wait a caller may ask for. The `wait_seconds` schemas state
+/// the same 1-60 range.
+const MAX_WAIT_SECONDS: u64 = 60;
+
+/// The inline wait for a job: the caller's `wait_seconds`, else `default`,
+/// clamped to 1..=[`MAX_WAIT_SECONDS`].
+pub(crate) fn resolve_wait_seconds(requested: Option<u64>, default: u64) -> u64 {
+    requested.unwrap_or(default).clamp(1, MAX_WAIT_SECONDS)
+}
 
 /// Longest-side cap (px) for the inline preview embedded in a tool result. The
 /// full-resolution image always stays on disk; this only bounds the base64 copy
@@ -32,6 +43,13 @@ const PREVIEW_MAX_SIDE: u32 = 1568;
 /// produce up to 16 images; base64-embedding every one would bloat the client's
 /// context, so any beyond this cap are reported by path in the JSON block only.
 const MAX_INLINE_PREVIEWS: usize = 4;
+
+/// Largest generated image file read back to build its inline preview.
+const MAX_PREVIEW_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Tool results building inline previews at once. Past it, a result carries
+/// the saved paths only, with a note saying so.
+const MAX_CONCURRENT_PREVIEWS: usize = 4;
 
 /// Most inline media blocks (audio / video ResourceLinks) attached to a result.
 const MAX_INLINE_MEDIA: usize = 4;
@@ -48,6 +66,43 @@ pub(crate) fn json_text_result(value: &serde_json::Value) -> Result<CallToolResu
     let body = serde_json::to_string_pretty(value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+}
+
+/// A failed call as a tool error, with its whole cause chain. `{e}` and
+/// `to_string()` on an `anyhow::Error` print only the outermost context
+/// ("failed to decode ..."), which hides the reason.
+pub(crate) fn internal_error_from(e: &anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(format!("{e:#}"), None)
+}
+
+/// [`internal_error_from`] for input rejected before any upstream call.
+pub(crate) fn invalid_params_from(e: &anyhow::Error) -> ErrorData {
+    ErrorData::invalid_params(format!("{e:#}"), None)
+}
+
+impl OpenRouterServer {
+    /// The shared tail of the synchronous text-out tools (chat, describe,
+    /// transcribe, embed, rerank, decide): record the outcome in the usage
+    /// stats, then render the success or return the failure. Success is
+    /// recorded only here, after the result was fully extracted.
+    pub(crate) async fn finish_text_call<T>(
+        &self,
+        model: &str,
+        outcome: anyhow::Result<T>,
+        cost: impl FnOnce(&T) -> Option<f64>,
+        render: impl FnOnce(T) -> Result<CallToolResult, ErrorData>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match outcome {
+            Ok(result) => {
+                self.stats.record_text(model, cost(&result)).await;
+                render(result)
+            }
+            Err(e) => {
+                self.stats.record_text_failure(model, &e).await;
+                Err(internal_error_from(&e))
+            }
+        }
+    }
 }
 
 /// Append non-empty `warnings`/`errors` arrays to a job result object. Shared by
@@ -147,9 +202,11 @@ fn encode_preview_blocks(paths: &[String]) -> Vec<ContentBlock> {
         .iter()
         .take(MAX_INLINE_PREVIEWS)
         .filter_map(|path| {
-            let bytes =
-                crate::resources::read_file_limited(std::path::Path::new(path), 64 * 1024 * 1024)
-                    .ok()?;
+            let bytes = crate::resources::read_file_limited(
+                std::path::Path::new(path),
+                MAX_PREVIEW_SOURCE_BYTES,
+            )
+            .ok()?;
             let png = if is_png_within_bound(&bytes, PREVIEW_MAX_SIDE) {
                 bytes
             } else {
@@ -161,13 +218,14 @@ fn encode_preview_blocks(paths: &[String]) -> Vec<ContentBlock> {
         .collect()
 }
 
-/// Decide whether to embed inline image previews for the connected client.
+/// Decide whether to embed generated media inline for the connected client:
+/// image previews, video resource links, and audio blocks.
 ///
 /// Why this is client-dependent: a local CLI (Claude Code) shares the
-/// filesystem, so a returned path *is* the image - inline base64 only bloats
+/// filesystem, so a returned path *is* the file - inline base64 only bloats
 /// context. Claude Desktop, by contrast, runs the MCP server in a sandbox whose
 /// filesystem the app can't read, so a path is useless and the bytes must be
-/// returned inline or the image is stranded.
+/// returned inline or the output is stranded.
 ///
 /// `OPENROUTER_MCP_IMAGE_PREVIEWS` overrides detection: `always` / `never`
 /// (anything else, or unset, means `auto`). The `.mcpb` connector sets `always`.
@@ -205,7 +263,7 @@ pub(crate) async fn job_call_result(
         static PREVIEW_CAPACITY: std::sync::OnceLock<tokio::sync::Semaphore> =
             std::sync::OnceLock::new();
         let Ok(_preview_permit) = PREVIEW_CAPACITY
-            .get_or_init(|| tokio::sync::Semaphore::new(4))
+            .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PREVIEWS))
             .try_acquire()
         else {
             blocks.push(ContentBlock::text(
@@ -252,17 +310,17 @@ pub(crate) async fn job_call_result(
 /// (fast path) and `get_result`: the completed result, an error, or a pending
 /// note - always carrying `task_id`, `status`, and `kind`.
 pub(crate) fn snapshot_to_envelope(task_id: &str, snap: &TaskSnapshot) -> serde_json::Value {
-    let mut env = match snap.status {
-        "completed" => snap.result.clone().unwrap_or_else(|| json!({ "ok": true })),
-        "failed" => json!({ "ok": false, "error": snap.error }),
-        _ => json!({
+    let mut env = match &snap.status {
+        Status::Completed(result) => result.clone(),
+        Status::Failed(error) => json!({ "ok": false, "error": error }),
+        Status::Pending => json!({
             "ok": true,
             "message": format!("still generating - call get_result with task_id \"{task_id}\""),
         }),
     };
     env["task_id"] = json!(task_id);
-    env["status"] = json!(snap.status);
-    env["kind"] = json!(snap.kind);
+    env["status"] = json!(snap.status.name());
+    env["kind"] = json!(snap.kind.as_str());
     env
 }
 
@@ -342,7 +400,7 @@ impl OpenRouterServer {
         let env = snapshot_to_envelope(&task_id, &snap);
         let mut result = job_call_result(&env, inline_previews).await?;
         // A lookup may succeed for a failed job, but the original generation failed.
-        if snap.status == "failed" {
+        if matches!(snap.status, Status::Failed(_)) {
             result.is_error = Some(true);
         }
         Ok(result)
@@ -382,6 +440,20 @@ pub(crate) async fn inline_audio_block(
 mod tests {
     use super::*;
     use crate::server::test_support::valid_png_b64;
+
+    #[test]
+    fn resolve_wait_seconds_defaults_and_clamps_to_one_through_sixty() {
+        assert_eq!(resolve_wait_seconds(None, DEFAULT_WAIT_SECONDS), 10);
+        assert_eq!(resolve_wait_seconds(Some(0), DEFAULT_WAIT_SECONDS), 1);
+        assert_eq!(
+            resolve_wait_seconds(Some(600), DEFAULT_VIDEO_WAIT_SECONDS),
+            60
+        );
+        assert_eq!(
+            resolve_wait_seconds(Some(30), DEFAULT_VIDEO_WAIT_SECONDS),
+            30
+        );
+    }
 
     #[test]
     fn encode_preview_blocks_reads_existing_and_skips_missing() {

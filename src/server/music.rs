@@ -12,7 +12,8 @@ use crate::music_gen::{self, MusicGenRequest};
 use crate::server::naming;
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::result::{
-    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, json_text_result,
+    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, internal_error_from,
+    json_text_result,
 };
 use crate::server::schema::{
     RequireFields, de_lenient, de_opt_uint, require_all, scalarize_nullable,
@@ -171,7 +172,7 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_audio_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
+                Err(internal_error_from(&e))
             }
         }
     }

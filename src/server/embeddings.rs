@@ -11,8 +11,8 @@ use serde::Deserialize;
 use crate::embed_gen;
 use crate::openrouter::{EmbeddingsBody, EmbeddingsInput, HttpFailure, RerankBody};
 use crate::server::provider::ProviderRoutingArgs;
-use crate::server::result::json_text_result;
-use crate::server::schema::{de_lenient, de_opt_uint, scalarize_nullable};
+use crate::server::result::{internal_error_from, invalid_params_from, json_text_result};
+use crate::server::schema::{de_lenient, de_opt_uint, non_blank, scalarize_nullable};
 
 use super::OpenRouterServer;
 
@@ -107,27 +107,23 @@ impl OpenRouterServer {
         Parameters(args): Parameters<EmbedTextArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let model = args.model.clone();
-        embed_gen::check_texts(&args.input, "input")
-            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        embed_gen::check_texts(&args.input, "input").map_err(|e| invalid_params_from(&e))?;
         let body = EmbeddingsBody {
             model: args.model,
             input: EmbeddingsInput::from_texts(args.input),
             dimensions: args.dimensions,
-            input_type: args.input_type.filter(|s| !s.trim().is_empty()),
+            input_type: non_blank(args.input_type),
             provider: args.provider.into_routing()?,
         };
 
-        match embed_gen::embed(&self.client, &body).await {
-            Ok(result) => {
-                self.stats.record_text(&model, result.cost).await;
-                json_text_result(&result.to_json())
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+        let outcome = embed_gen::embed(&self.client, &body).await;
+        self.finish_text_call(
+            &body.model,
+            outcome,
+            |r| r.cost,
+            |r| json_text_result(&r.to_json()),
+        )
+        .await
     }
 
     #[tool(
@@ -153,7 +149,6 @@ impl OpenRouterServer {
         Parameters(args): Parameters<RerankDocumentsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let model = args.model.clone();
         let body = RerankBody {
             model: args.model,
             query: args.query,
@@ -161,19 +156,16 @@ impl OpenRouterServer {
             top_n: args.top_n,
             provider: args.provider.into_routing()?,
         };
-        embed_gen::validate_rerank(&body)
-            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        embed_gen::validate_rerank(&body).map_err(|e| invalid_params_from(&e))?;
 
-        match embed_gen::rerank(&self.client, &body).await {
-            Ok(result) => {
-                self.stats.record_text(&model, result.cost).await;
-                json_text_result(&result.to_json())
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+        let outcome = embed_gen::rerank(&self.client, &body).await;
+        self.finish_text_call(
+            &body.model,
+            outcome,
+            |r| r.cost,
+            |r| json_text_result(&r.to_json()),
+        )
+        .await
     }
 
     #[tool(
@@ -229,7 +221,7 @@ impl OpenRouterServer {
                         None,
                     ));
                 }
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
+                Err(internal_error_from(&e))
             }
         }
     }

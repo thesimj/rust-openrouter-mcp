@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::openrouter::{
     ImageProvider, ProviderOptions, ProviderOptionsMap, ProviderRouting, ProviderSort,
 };
-use crate::server::schema::{clean_list, de_lenient, de_opt_bool, scalarize_nullable};
+use crate::server::schema::{clean_list, de_lenient, de_opt_bool, non_blank, scalarize_nullable};
 
 /// Accepted `sort` values (OpenRouter `ProviderPreferences.sort`).
 const SORT_VALUES: [&str; 4] = ["price", "throughput", "latency", "exacto"];
@@ -158,10 +158,7 @@ fn parse_sort(
     sort: Option<String>,
     partition: Option<String>,
 ) -> Result<Option<ProviderSort>, ErrorData> {
-    let normalize = |s: Option<String>| {
-        s.map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-    };
+    let normalize = |s: Option<String>| non_blank(s).map(|s| s.to_ascii_lowercase());
     let sort = normalize(sort);
     let partition = normalize(partition);
     if let Some(s) = &sort

@@ -1,9 +1,10 @@
 //! `GET /api/v1/models` and `GET /api/v1/models/{id}/endpoints`.
 
 use anyhow::{Context, Result};
+use reqwest::Method;
 use serde_json::Value;
 
-use crate::openrouter::{ModelsQuery, ModelsResponse, OpenRouterClient, unwrap_data};
+use crate::openrouter::{ModelsQuery, ModelsResponse, OpenRouterClient, model_path, unwrap_data};
 
 impl OpenRouterClient {
     /// The `input_modalities` declared for a single model id (e.g.
@@ -40,11 +41,7 @@ impl OpenRouterClient {
     /// server-side filters (modalities, sort, free-text, price/context bounds,
     /// ...) so the API does the filtering.
     pub async fn list_models_page(&self, query: &ModelsQuery) -> Result<ModelsResponse> {
-        let rb = self
-            .http
-            .get(format!("{}/models", self.base_url))
-            .bearer_auth(&self.api_key)
-            .query(query);
+        let rb = self.request(Method::GET, "/models").query(query);
         self.send_json(rb, "/models").await
     }
 
@@ -55,13 +52,9 @@ impl OpenRouterClient {
     /// OpenRouter reports without a hand-maintained schema. `model_id` is the
     /// `author/slug` id (e.g. "anthropic/claude-opus-4.7").
     pub async fn describe_model(&self, model_id: &str) -> Result<Value> {
-        let rb = self
-            .http
-            .get(format!("{}/models/{}/endpoints", self.base_url, model_id))
-            .bearer_auth(&self.api_key);
-        let body = self
-            .send_json(rb, &format!("/models/{model_id}/endpoints"))
-            .await?;
+        let path = format!("/models/{}/endpoints", model_path(model_id)?);
+        let rb = self.request(Method::GET, &path);
+        let body = self.send_json(rb, &path).await?;
         Ok(unwrap_data(body))
     }
 
@@ -71,10 +64,7 @@ impl OpenRouterClient {
     /// supported resolutions/durations/sizes - none of which appears in the
     /// token-based `/models` pricing object (which is `0` for video).
     pub async fn video_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
-        let rb = self
-            .http
-            .get(format!("{}/videos/models", self.base_url))
-            .bearer_auth(&self.api_key);
+        let rb = self.request(Method::GET, "/videos/models");
         let body: Value = self.send_json(rb, "/videos/models").await?;
         let found = body.get("data").and_then(Value::as_array).and_then(|arr| {
             arr.iter()
@@ -92,16 +82,13 @@ impl OpenRouterClient {
     /// [`video_model_detail`](Self::video_model_detail)'s posture of never
     /// failing the whole `describe_model` call over this enrichment.
     pub async fn image_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
-        let label = format!("/images/models/{model_id}/endpoints");
-        let rb = self
-            .http
-            .get(format!("{}{label}", self.base_url))
-            .bearer_auth(&self.api_key);
-        let resp = self.send_response(rb, &label).await?;
+        let path = format!("/images/models/{}/endpoints", model_path(model_id)?);
+        let rb = self.request(Method::GET, &path);
+        let resp = self.send_response(rb, &path).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body = resp.checked(&label).await?.decode(&label).await?;
+        let body = resp.checked(&path).await?.decode(&path).await?;
         Ok(Some(unwrap_data(body)))
     }
 }
@@ -113,6 +100,39 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{ModelsQuery, OpenRouterClient};
+
+    /// A model id goes into the path one segment at a time: `/` still
+    /// separates author and slug, `:` (routing variants) stays, and characters
+    /// that would end the path (`?`, `#`) or break it are percent-encoded.
+    #[tokio::test]
+    async fn model_detail_paths_encode_the_id_segments() {
+        let server = MockServer::start().await;
+        for expected in [
+            "/models/author/slug:free/endpoints",
+            "/models/author/odd%3Fid%23x%20y/endpoints",
+            "/images/models/author/odd%3Fid%23x%20y/endpoints",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(expected))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        client.describe_model("author/slug:free").await.unwrap();
+        client.describe_model("author/odd?id#x y").await.unwrap();
+        let detail = client
+            .image_model_detail("author/odd?id#x y")
+            .await
+            .unwrap();
+        assert!(detail.is_some());
+        // Dot and empty segments would climb to another endpoint: refused,
+        // never sent (the mocks above expect exactly one call each).
+        for id in ["a/../../key", "./x", "a//b"] {
+            assert!(client.describe_model(id).await.is_err(), "{id}");
+        }
+    }
 
     #[tokio::test]
     async fn list_models_sends_query_params_and_parses_data() {
@@ -466,7 +486,7 @@ mod tests {
         assert!(err.to_string().contains("500"), "got: {err}");
     }
 
-    /// F3: an oversized error body must be capped the same way
+    /// An oversized error body must be capped the same way
     /// `send_checked` caps it, not echoed verbatim into the caller's context.
     #[tokio::test]
     async fn image_model_detail_truncates_an_oversized_error_body() {

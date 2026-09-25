@@ -13,7 +13,7 @@ impl OpenRouterClient {
     /// the decoded body plus a generation id: the `X-Generation-Id` header when
     /// present (undocumented for this endpoint), else the body's `id`. A 2xx
     /// whose body cannot be decoded keeps a billing receipt on the error; an
-    /// HTTP failure surfaces the upstream error body (bounded to 500 chars).
+    /// HTTP failure surfaces the upstream error body (bounded to `MAX_ERROR_BODY_CHARS`).
     pub async fn decisions(
         &self,
         req: &DecisionsBody,

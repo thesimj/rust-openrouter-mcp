@@ -16,10 +16,11 @@ use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
 use crate::server::provider::ProviderOptionsArgs;
 use crate::server::result::{
-    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, json_text_result,
+    attach_warnings_errors, client_wants_inline_previews, inline_audio_block, internal_error_from,
+    invalid_params_from, json_text_result,
 };
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_f64, require_all, scalarize_nullable,
+    RequireFields, de_lenient, de_opt_f64, non_blank, require_all, scalarize_nullable,
 };
 
 use super::OpenRouterServer;
@@ -40,8 +41,9 @@ pub(crate) struct TranscribeAudioArgs {
     /// path/base64. Requires `format` unless the data URL names one.
     #[serde(default)]
     pub base64: Option<String>,
-    /// Container format: wav, mp3, flac, m4a, ogg, webm, or aac. Inferred from
-    /// the file extension when `path` is used.
+    /// Container format: wav, mp3, flac, m4a, ogg, webm, aac, aiff, pcm16 or
+    /// pcm24 (support varies by provider). Inferred from the file extension
+    /// when `path` is used.
     #[serde(default)]
     pub format: Option<String>,
     /// Optional ISO-639-1 language hint (e.g. "en", "ja"); improves accuracy.
@@ -96,7 +98,7 @@ pub(crate) struct GenerateAudioArgs {
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub speed: Option<f64>,
     /// Stateless voice cloning: the audio sample whose voice to imitate, as
-    /// {"path": "<local file>"} (wav, mp3, flac, m4a, ogg, webm, aac; format
+    /// {"path": "<local file>"} (wav, mp3, flac, m4a, ogg, webm, aac, aiff; format
     /// inferred from the extension) or {"base64": "<base64 or data: URL>",
     /// "format"?: "wav"} (15 MiB decoded max; the format is optional and
     /// omitted from the request when unknown). Omit for no cloning. Sent as
@@ -239,7 +241,7 @@ impl OpenRouterServer {
             }
             Err(e) => {
                 self.stats.record_audio_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
+                Err(internal_error_from(&e))
             }
         }
     }
@@ -249,11 +251,14 @@ impl OpenRouterServer {
         openai/gpt-4o-mini-transcribe, openai/whisper-1, or a Voxtral/Chirp model). This is a \
         synchronous call that waits for the provider response. Pass the audio as `path` (a local file, \
         format inferred from its extension) or `base64` (inline data, with `format`); accepted \
-        formats are wav, mp3, flac, m4a, ogg, webm, aac, with a local 25 MiB limit for both paths and inline data. An optional `language` \
+        formats are wav, mp3, flac, m4a, ogg, webm, aac, aiff, pcm16 and pcm24 (support varies \
+        by provider), with a local 25 MiB limit for both paths and inline data. An optional `language` \
         hint (ISO-639-1, e.g. \"en\") improves accuracy. Returns the transcript text by default \
         (response_format=\"json\"). Set response_format=\"verbose_json\" to get the full \
         response object (language, duration, segments, words, ...) instead - this needs an \
-        OpenAI-compatible provider; other providers reject it with a 400. \
+        OpenAI-compatible provider; other providers reject it with a 400. When OpenRouter \
+        reports a generation id, a second block carries {\"generation_id\"} for \
+        get_generation. \
         timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
         an OpenAI-compatible provider. Provider-specific settings go in `provider.options` keyed \
         by provider slug - e.g. speaker diarization with {\"deepgram\": {\"diarize\": true}} or \
@@ -273,32 +278,35 @@ impl OpenRouterServer {
         Parameters(args): Parameters<TranscribeAudioArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let model = args.model.clone();
         let req = resolve_transcribe_request(args).await?;
 
-        match audio_gen::transcribe(&self.client, &req).await {
-            Ok(result) => {
-                self.stats.record_text(&model, result.cost).await;
-                match result.verbose {
+        let outcome = audio_gen::transcribe(&self.client, &req).await;
+        self.finish_text_call(
+            &req.model,
+            outcome,
+            |r| r.cost,
+            |r| {
+                let mut result = match r.verbose {
                     // verbose_json: return the full response object, not just text.
-                    Some(v) => json_text_result(&v),
-                    None => Ok(CallToolResult::success(vec![ContentBlock::text(
-                        result.text,
-                    )])),
+                    Some(v) => json_text_result(&v)?,
+                    None => CallToolResult::success(vec![ContentBlock::text(r.text)]),
+                };
+                if let Some(id) = r.generation_id {
+                    let meta = serde_json::json!({ "generation_id": id });
+                    result.content.push(ContentBlock::text(meta.to_string()));
                 }
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+                Ok(result)
+            },
+        )
+        .await
     }
 }
 
 /// Resolve `transcribe_audio` arguments to a [`audio_gen::TranscribeRequest`]:
 /// exactly one source, base64 decoded from a `data:` URL when given as one, and
 /// the format taken from the argument, the data URL, or the file extension -
-/// through the same [`media::load_audio_input`] the chat `audio` parts use.
+/// through the same [`media::resolve_audio_input`] the chat `audio` parts use,
+/// so bad input is rejected here, before any call.
 async fn resolve_transcribe_request(
     args: TranscribeAudioArgs,
 ) -> Result<audio_gen::TranscribeRequest, ErrorData> {
@@ -307,19 +315,12 @@ async fn resolve_transcribe_request(
         base64: args.base64,
         format: args.format,
     };
-    let (data, format) = media::load_audio_input(source).await?;
-    let format = format.ok_or_else(|| {
-        ErrorData::invalid_params(
-            "base64 audio needs an explicit format (wav, mp3, flac, m4a, ogg, webm, aac)",
-            None,
-        )
-    })?;
+    let audio = media::resolve_audio_input(source, "base64 audio needs an explicit format").await?;
 
     Ok(audio_gen::TranscribeRequest {
         model: args.model,
-        data,
-        format,
-        language: args.language.filter(|s| !s.trim().is_empty()),
+        audio,
+        language: non_blank(args.language),
         response_format: args.response_format,
         timestamp_granularities: args.timestamp_granularities,
         temperature: args.temperature,
@@ -337,7 +338,7 @@ pub(crate) async fn resolve_voice_reference(
     reference: media::AudioInput,
     text: Option<String>,
 ) -> Result<Option<audio_gen::VoiceReference>, ErrorData> {
-    let text = text.filter(|t| !t.trim().is_empty());
+    let text = non_blank(text);
     if reference.is_empty() {
         if text.is_some() {
             return Err(ErrorData::invalid_params(
@@ -351,7 +352,7 @@ pub(crate) async fn resolve_voice_reference(
     let (data, format) = media::load_audio_input(reference).await?;
     audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref())
         .map(Some)
-        .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))
+        .map_err(|e| invalid_params_from(&e))
 }
 
 #[cfg(test)]
@@ -443,10 +444,14 @@ mod tests {
                 "input_audio": { "data": "QUJD", "format": "mp3" },
                 "language": "en"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "text": "hello there",
-                "usage": { "seconds": 1.5, "tokens": 4, "cost": 0.0004 }
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-stt")
+                    .set_body_json(serde_json::json!({
+                        "text": "hello there",
+                        "usage": { "seconds": 1.5, "tokens": 4, "cost": 0.0004 }
+                    })),
+            )
             .mount(&mock)
             .await;
 
@@ -468,6 +473,10 @@ mod tests {
             .unwrap();
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["content"][0]["text"], "hello there");
+        // The generation id follows in its own block, as for chat_completion.
+        let meta: serde_json::Value =
+            serde_json::from_str(v["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["generation_id"], "gen-stt");
 
         // The transcription and its cost were recorded as a text generation.
         let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
@@ -529,6 +538,22 @@ mod tests {
             "got: {}",
             err.message
         );
+
+        // Bad inline data or an unknown format is the caller's error, caught
+        // before any call, exactly as the same file-based input would be.
+        for (b64, format, expected) in [
+            ("not base64!", "mp3", "invalid base64"),
+            ("QUJD", "exe", "unsupported audio format"),
+        ] {
+            let err = server
+                .transcribe_audio(args(None, Some(b64), Some(format)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{b64:?}");
+            assert!(err.message.contains(expected), "got: {}", err.message);
+        }
+        let stats = server.stats.snapshot().await;
+        assert_eq!(stats["requests_failed"], 0, "{stats}");
     }
 
     #[tokio::test]

@@ -13,18 +13,18 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::openrouter::{FilePart, InputAudio, VideoUrl};
+use crate::server::result::invalid_params_from;
 use crate::server::schema::{AtLeastOneOf, scalarize_nullable};
 
-/// Hard ceiling for one inline or fetched media body (20 MiB), the same cap
-/// images have in [`crate::resources::MAX_IMAGE_BYTES`]. Bytes are sent as a
-/// data URL, so accepting more only increases memory pressure.
-pub(crate) const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
+/// Hard ceiling for one inline or fetched media body: the same 20 MiB cap
+/// images have. Bytes are sent as a data URL, so accepting more only
+/// increases memory pressure.
+pub(crate) const MAX_MEDIA_BYTES: usize = crate::resources::MAX_IMAGE_BYTES;
 
 /// Total deadline for one remote fetch, sized against the ceiling above:
 /// 20 MB inside 30s is ~5 Mbit/s, slower than any host worth waiting for.
@@ -68,9 +68,6 @@ pub(crate) enum Resolved {
     Path(PathBuf),
     /// Already-decoded bytes from a base64/data-URL argument or a URL fetch.
     Bytes(MediaBytes),
-    /// A URL passed through untouched for the provider to fetch
-    /// (`fetch_urls: false`).
-    Url(String),
 }
 
 /// Decoded bytes plus what is known about them.
@@ -113,15 +110,15 @@ pub(crate) fn check_exactly_one(
 }
 
 /// Resolve one source: a path stays a path, inline data is decoded (capped at
-/// `limit` bytes), a URL is fetched (SSRF-guarded, capped at `limit`) when
-/// `fetch_urls` is set and passed through otherwise. Requires exactly one source.
+/// `limit` bytes), and a URL is fetched (SSRF-guarded, capped at `limit`).
+/// Requires exactly one source. Inputs whose URL the provider fetches itself
+/// take [`passthrough_url`] first.
 pub(crate) async fn resolve_source(
     kind: InputKind,
     path: Option<String>,
     url: Option<String>,
     base64: Option<String>,
     limit: usize,
-    fetch_urls: bool,
 ) -> Result<Resolved, ErrorData> {
     check_exactly_one(kind, path.as_deref(), url.as_deref(), base64.as_deref())?;
     if let Some(p) = path.filter(|s| !s.trim().is_empty()) {
@@ -140,9 +137,6 @@ pub(crate) async fn resolve_source(
         }));
     }
     let url = url.map(|u| u.trim().to_string()).unwrap_or_default();
-    if !fetch_urls {
-        return Ok(Resolved::Url(url));
-    }
     let bytes = fetch_url(kind, &url, limit).await?;
     Ok(Resolved::Bytes(MediaBytes {
         bytes,
@@ -152,8 +146,7 @@ pub(crate) async fn resolve_source(
 }
 
 /// Materialize a [`Resolved`] as bytes: a path is read (off the runtime,
-/// capped at `limit`), bytes pass through. A pass-through URL has no bytes,
-/// so asking for them is a caller bug.
+/// capped at `limit`), bytes pass through.
 pub(crate) async fn into_bytes(
     kind: InputKind,
     resolved: Resolved,
@@ -179,11 +172,19 @@ pub(crate) async fn into_bytes(
                 declared_mime: None,
             })
         }
-        Resolved::Url(_) => Err(ErrorData::internal_error(
-            format!("{} url was not fetched", kind.noun()),
-            None,
-        )),
     }
+}
+
+/// For an input whose URL the provider fetches itself: check that exactly one
+/// source is given, and return the trimmed URL when it is that source.
+pub(crate) fn passthrough_url(
+    kind: InputKind,
+    path: Option<&str>,
+    url: Option<&str>,
+    base64: Option<&str>,
+) -> Result<Option<String>, ErrorData> {
+    check_exactly_one(kind, path, url, base64)?;
+    Ok(present(url).map(str::to_string))
 }
 
 /// The last path segment (or the whole string when there is none).
@@ -216,19 +217,24 @@ fn decode_inline(
     } else {
         data
     };
-    if payload.len() > limit.div_ceil(3) * 4 {
+    // Compact (a copy) only when the raw text is over the cap: whitespace
+    // may be all that puts it there.
+    let max_len = crate::base64_codec::max_base64_len(limit);
+    if payload.len() > max_len && crate::base64_codec::compact_base64(payload).len() > max_len {
         return Err(too_large());
     }
     let (mime, bytes) = if data.starts_with("data:") {
-        crate::image_io::parse_data_url(data)
+        crate::base64_codec::parse_data_url(data)
             .map(|(mime, bytes)| ((!mime.is_empty()).then_some(mime), bytes))
             .map_err(|e| ErrorData::invalid_params(format!("invalid data URL: {e}"), None))
     } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
+        crate::base64_codec::decode_base64(data)
             .map(|bytes| (None, bytes))
             .map_err(|e| {
-                ErrorData::invalid_params(format!("invalid base64 {} data: {e}", kind.noun()), None)
+                ErrorData::invalid_params(
+                    format!("invalid base64 {} data: {e:#}", kind.noun()),
+                    None,
+                )
             })
     }?;
     if bytes.len() > limit {
@@ -382,11 +388,11 @@ async fn fetch_url(kind: InputKind, url: &str, limit: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-/// Refuse more than [`MAX_IMAGE_INPUTS`](crate::resources::MAX_IMAGE_INPUTS)
+/// Refuse more than [`MAX_INPUTS_PER_LIST`](crate::resources::MAX_INPUTS_PER_LIST)
 /// entries of one kind (the same cap for every input list; each entry may be
 /// [`MAX_MEDIA_BYTES`]).
 pub(crate) fn check_count(kind: InputKind, len: usize) -> Result<(), ErrorData> {
-    let max = crate::resources::MAX_IMAGE_INPUTS;
+    let max = crate::resources::MAX_INPUTS_PER_LIST;
     if len > max {
         return Err(ErrorData::invalid_params(
             format!("at most {max} {} inputs are supported", kind.noun()),
@@ -436,8 +442,9 @@ pub(crate) struct AudioInput {
     /// path/base64. Raw base64 needs `format`.
     #[serde(default)]
     pub base64: Option<String>,
-    /// Container format: wav, mp3, flac, m4a, ogg, webm, or aac. Inferred
-    /// from the file extension or the data URL's MIME type when omitted.
+    /// Container format: wav, mp3, flac, m4a, ogg, webm, aac, aiff, pcm16 or
+    /// pcm24 (support varies by provider). Inferred from the file extension or
+    /// the data URL's MIME type when omitted.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -469,8 +476,9 @@ pub(crate) struct VideoInput {
     /// One of url/path/base64.
     #[serde(default)]
     pub base64: Option<String>,
-    /// Provider processing hint (e.g. Gemini media resolution "low"/"high"),
-    /// passed through untouched.
+    /// Video processing mode, "agentic" (the model navigates the timeline) or
+    /// "static" (sampled at a fixed frame rate). A Gemini feature that other
+    /// providers ignore; passed through untouched.
     #[serde(default)]
     pub processing: Option<String>,
 }
@@ -584,18 +592,11 @@ fn video_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
 /// MPEG frame sync, fLaC, OggS, an `ftyp` box, EBML) first, then a declared
 /// data-URL type, then the extension, else `audio/mpeg`.
 fn audio_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
-        return "audio/wav".to_string();
+    if let Some((mime, _)) = crate::audio_container::sniff(bytes) {
+        return mime.to_string();
     }
-    let mpeg_sync = bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0;
-    if bytes.starts_with(b"ID3") || mpeg_sync {
+    if crate::audio_container::looks_like_mpeg_frame(bytes) {
         return "audio/mpeg".to_string();
-    }
-    if bytes.starts_with(b"fLaC") {
-        return "audio/flac".to_string();
-    }
-    if bytes.starts_with(b"OggS") {
-        return "audio/ogg".to_string();
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         return "audio/mp4".to_string();
@@ -627,8 +628,9 @@ fn audio_mime(bytes: &[u8], name: &str, declared: Option<&str>) -> String {
 /// URL passes through untouched (the provider fetches it), a `data:` URL is
 /// decoded, capped at [`MAX_MEDIA_BYTES`] and re-issued, and a local path is
 /// read (same cap) and inlined as a data URL typed from its bytes, declared
-/// type, or extension. Used by `video_gen`; shares [`resolve_source`] (and
-/// its caps and SSRF guard) with the chat inputs above.
+/// type, or extension. Used by `generate_video` before its job starts;
+/// shares [`resolve_source`] (and its caps and SSRF guard) with the chat
+/// inputs above.
 pub(crate) async fn resolve_media_reference(
     kind: InputKind,
     source: &str,
@@ -640,19 +642,22 @@ pub(crate) async fn resolve_media_reference(
             None,
         ));
     }
-    let lower = source.to_ascii_lowercase();
-    let (path, url, base64) = if lower.starts_with("http://") || lower.starts_with("https://") {
-        (None, Some(source.to_string()), None)
-    } else if lower.starts_with("data:") {
-        (None, None, Some(source.to_string()))
+    // Checked on the prefix only: a `data:` reference can be tens of MiB.
+    let starts_with = |prefix: &str| {
+        source
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    if starts_with("http://") || starts_with("https://") {
+        return Ok(source.to_string());
+    }
+    let (path, base64) = if starts_with("data:") {
+        (None, Some(source.to_string()))
     } else {
-        (Some(source.to_string()), None, None)
+        (Some(source.to_string()), None)
     };
-    let resolved = resolve_source(kind, path, url, base64, MAX_MEDIA_BYTES, false).await?;
-    let media = match resolved {
-        Resolved::Url(url) => return Ok(url),
-        other => into_bytes(kind, other, MAX_MEDIA_BYTES).await?,
-    };
+    let resolved = resolve_source(kind, path, None, base64, MAX_MEDIA_BYTES).await?;
+    let media = into_bytes(kind, resolved, MAX_MEDIA_BYTES).await?;
     if media.bytes.is_empty() {
         return Err(ErrorData::invalid_params(
             format!("{} reference {} is empty", kind.noun(), media.name),
@@ -664,7 +669,7 @@ pub(crate) async fn resolve_media_reference(
         InputKind::Audio => audio_mime(&media.bytes, &media.name, declared),
         _ => video_mime(&media.bytes, &media.name, declared),
     };
-    Ok(crate::image_io::data_url(&media.bytes, &mime))
+    Ok(crate::base64_codec::data_url(&media.bytes, &mime))
 }
 
 /// The file name a URL or path implies: its last segment without a query.
@@ -676,15 +681,8 @@ fn implied_filename(name: &str) -> Option<String> {
 
 async fn resolve_file_input(f: FileInput) -> Result<FilePart, ErrorData> {
     let filename = present(f.filename.as_deref()).map(str::to_string);
-    let resolved = resolve_source(
-        InputKind::File,
-        f.path,
-        f.url,
-        f.base64,
-        MAX_MEDIA_BYTES,
-        true,
-    )
-    .await?;
+    let resolved =
+        resolve_source(InputKind::File, f.path, f.url, f.base64, MAX_MEDIA_BYTES).await?;
     let media = into_bytes(InputKind::File, resolved, MAX_MEDIA_BYTES).await?;
     let filename = filename
         .or_else(|| implied_filename(&media.name))
@@ -697,7 +695,7 @@ async fn resolve_file_input(f: FileInput) -> Result<FilePart, ErrorData> {
     let mime = file_mime(&media.bytes, &filename, media.declared_mime.as_deref());
     Ok(FilePart {
         filename,
-        file_data: crate::image_io::data_url(&media.bytes, &mime),
+        file_data: crate::base64_codec::data_url(&media.bytes, &mime),
     })
 }
 
@@ -720,7 +718,7 @@ pub(crate) async fn resolve_file_inputs(files: Vec<FileInput>) -> Result<Vec<Fil
 /// reference applies its own (`VoiceReference::new`).
 pub(crate) async fn load_audio_input(a: AudioInput) -> Result<(String, Option<String>), ErrorData> {
     check_audio_input(&a)?;
-    let invalid = |e: anyhow::Error| ErrorData::invalid_params(format!("{e:#}"), None);
+    let invalid = |e: anyhow::Error| invalid_params_from(&e);
     let format = present(a.format.as_deref()).map(str::to_string);
     if let Some(p) = present(a.path.as_deref()) {
         let (data, format) = crate::audio_gen::read_audio_file(Path::new(p), format.as_deref())
@@ -733,16 +731,24 @@ pub(crate) async fn load_audio_input(a: AudioInput) -> Result<(String, Option<St
     if !b64.starts_with("data:") {
         return Ok((b64.to_string(), format));
     }
-    let (mime, data) = crate::image_io::split_data_url(b64).map_err(invalid)?;
+    let (mime, data) = crate::base64_codec::split_data_url(b64).map_err(invalid)?;
     let from_url = mime.rsplit('/').next().map(str::to_string);
     Ok((data.trim().to_string(), format.or(from_url)))
 }
 
-async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
+/// Resolve one audio source to a validated `input_audio` part. `format_needed`
+/// is the caller's error for inline data with no format to decode it as.
+pub(crate) async fn resolve_audio_input(
+    a: AudioInput,
+    format_needed: &str,
+) -> Result<InputAudio, ErrorData> {
     let (data, format) = load_audio_input(a).await?;
     let format = format.ok_or_else(|| {
         ErrorData::invalid_params(
-            "audio[].format is required with raw base64 (wav, mp3, flac, m4a, ogg, webm, aac)",
+            format!(
+                "{format_needed} ({})",
+                crate::audio_gen::INPUT_AUDIO_FORMATS.join(", ")
+            ),
             None,
         )
     })?;
@@ -750,7 +756,7 @@ async fn resolve_audio_input(a: AudioInput) -> Result<InputAudio, ErrorData> {
         crate::audio_gen::validate_inline_audio(&data, &format)
     })
     .await
-    .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+    .map_err(|e| invalid_params_from(&e))?;
     Ok(InputAudio { data, format })
 }
 
@@ -761,30 +767,26 @@ pub(crate) async fn resolve_audio_inputs(
     check_count(InputKind::Audio, audio.len())?;
     let mut out = Vec::with_capacity(audio.len());
     for a in audio {
-        out.push(resolve_audio_input(a).await?);
+        out.push(resolve_audio_input(a, "audio[].format is required with raw base64").await?);
     }
     Ok(out)
 }
 
 async fn resolve_video_input(v: VideoInput) -> Result<VideoUrl, ErrorData> {
     let processing = present(v.processing.as_deref()).map(str::to_string);
-    let resolved = resolve_source(
-        InputKind::Video,
-        v.path,
-        v.url,
-        v.base64,
-        MAX_MEDIA_BYTES,
-        false,
-    )
-    .await?;
-    let url = match resolved {
-        Resolved::Url(url) => url,
-        other => {
-            let media = into_bytes(InputKind::Video, other, MAX_MEDIA_BYTES).await?;
-            let mime = video_mime(&media.bytes, &media.name, media.declared_mime.as_deref());
-            crate::image_io::data_url(&media.bytes, &mime)
-        }
-    };
+    let kind = InputKind::Video;
+    if let Some(url) = passthrough_url(
+        kind,
+        v.path.as_deref(),
+        v.url.as_deref(),
+        v.base64.as_deref(),
+    )? {
+        return Ok(VideoUrl { url, processing });
+    }
+    let resolved = resolve_source(kind, v.path, None, v.base64, MAX_MEDIA_BYTES).await?;
+    let media = into_bytes(kind, resolved, MAX_MEDIA_BYTES).await?;
+    let mime = video_mime(&media.bytes, &media.name, media.declared_mime.as_deref());
+    let url = crate::base64_codec::data_url(&media.bytes, &mime);
     Ok(VideoUrl { url, processing })
 }
 
@@ -805,6 +807,7 @@ pub(crate) async fn resolve_video_inputs(
 mod tests {
     use super::*;
     use crate::server::test_support::valid_png_b64;
+    use base64::Engine;
     use rmcp::handler::server::common::schema_for_type;
     use serde_json::json;
 
@@ -823,7 +826,6 @@ mod tests {
             url.map(str::to_string),
             base64.map(str::to_string),
             crate::resources::MAX_IMAGE_BYTES,
-            true,
         )
         .await
     }
@@ -847,6 +849,18 @@ mod tests {
         match image_source(None, None, Some(&data_url)).await.unwrap() {
             Resolved::Bytes(m) => assert_eq!(m.declared_mime.as_deref(), Some("image/png")),
             other => panic!("expected inline bytes from data URL, got {other:?}"),
+        }
+    }
+
+    /// Raw base64 is decoded as leniently as a data URL's payload: line
+    /// wrapping and missing padding do not change the bytes.
+    #[tokio::test]
+    async fn resolve_source_accepts_wrapped_and_unpadded_raw_base64() {
+        for raw in ["QUJDRA", "QUJD\nRA==", " QUJDRA== "] {
+            match image_source(None, None, Some(raw)).await {
+                Ok(Resolved::Bytes(m)) => assert_eq!(m.bytes, b"ABCD", "{raw:?}"),
+                other => panic!("{raw:?}: expected inline bytes, got {other:?}"),
+            }
         }
     }
 
@@ -1142,13 +1156,13 @@ mod tests {
         // A URL is not fetched, not validated, not rewritten.
         let parts = resolve_video_inputs(vec![VideoInput {
             url: Some(" https://www.youtube.com/watch?v=abc ".into()),
-            processing: Some("low".into()),
+            processing: Some("agentic".into()),
             ..Default::default()
         }])
         .await
         .unwrap();
         assert_eq!(parts[0].url, "https://www.youtube.com/watch?v=abc");
-        assert_eq!(parts[0].processing.as_deref(), Some("low"));
+        assert_eq!(parts[0].processing.as_deref(), Some("agentic"));
 
         // Inline MP4 (ftyp box) -> video/mp4 data URL; WebM EBML -> video/webm.
         let mp4 = [&[0, 0, 0, 0x18][..], b"ftypisom", &[0; 8]].concat();
@@ -1195,7 +1209,7 @@ mod tests {
         );
 
         // Too many entries are refused before any is read.
-        let many = (0..crate::resources::MAX_IMAGE_INPUTS + 1)
+        let many = (0..crate::resources::MAX_INPUTS_PER_LIST + 1)
             .map(|_| VideoInput {
                 base64: Some("!!!".into()),
                 ..Default::default()

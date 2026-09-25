@@ -5,7 +5,9 @@
 //!
 //! Requires the `OPENROUTER_API_KEY` environment variable (or a local `.env`).
 
+mod audio_container;
 mod audio_gen;
+mod base64_codec;
 mod billing;
 mod chat_gen;
 mod decision_gen;
@@ -44,7 +46,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Load a local `.env` file if present (does not override real env vars).
     // Key resolution is therefore: real env var > .env entry > error in from_env().
-    let _ = dotenvy::dotenv();
+    // A missing file is normal; one that fails to parse stops loading at the
+    // bad line, so say so rather than let a later "key is not set" mislead.
+    if let Err(e) = dotenvy::dotenv()
+        && !e.not_found()
+    {
+        eprintln!("warning: could not load .env: {e}");
+    }
 
     server::run().await
 }

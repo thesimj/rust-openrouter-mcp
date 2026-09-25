@@ -21,10 +21,6 @@ pub struct ImagesRequest {
     pub aspect_ratio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
-    /// Images per call. Left `None` (defaults to 1 upstream): variants are a
-    /// parallel fan-out of single-image calls, since most models cap `n` at 1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_references: Vec<InputReference>,
     /// "auto" | "low" | "medium" | "high" | "xhigh" | "max". Provider support
@@ -59,9 +55,9 @@ pub struct ImagesResponse {
     pub usage: Option<Usage>,
 }
 
-/// One generated image: base64 bytes plus an optional MIME. `media_type` is only
-/// present for vector outputs (e.g. SVG); when absent the format is a raster one
-/// to sniff from the bytes.
+/// One generated image: base64 bytes plus an optional MIME. OpenRouter sends
+/// `media_type` whenever the format is identifiable (raster ones included); it
+/// may be absent, and the bytes are sniffed either way.
 #[derive(Debug, Deserialize)]
 pub struct ImageData {
     pub b64_json: String,
@@ -85,8 +81,7 @@ mod tests {
             resolution: Some("1K".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             seed: None,
-            n: None,
-            input_references: vec![InputReference::new(ImageUrl {
+            input_references: vec![InputReference::image(ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
             })],
             quality: None,
@@ -120,7 +115,6 @@ mod tests {
             resolution: None,
             aspect_ratio: None,
             seed: None,
-            n: None,
             input_references: vec![],
             quality: Some("high".to_string()),
             output_format: Some("webp".to_string()),
@@ -158,7 +152,6 @@ mod tests {
             resolution: None,
             aspect_ratio: None,
             seed: None,
-            n: None,
             input_references: vec![],
             quality: None,
             output_format: None,
@@ -185,7 +178,7 @@ mod tests {
         );
     }
 
-    /// A raster response has no `media_type`; a vector one does.
+    /// `media_type` is optional: a response may omit it, or carry one.
     #[test]
     fn images_response_parses_raster_and_vector() {
         let raster: ImagesResponse = serde_json::from_value(json!({

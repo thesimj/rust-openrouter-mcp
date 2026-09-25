@@ -88,6 +88,22 @@ fn mcp_requires_credentials_and_keeps_errors_off_stdout() {
     }
 }
 
+/// A `.env` that exists but cannot be parsed is named on stderr: otherwise
+/// the only symptom is a misleading "OPENROUTER_API_KEY is not set".
+#[test]
+fn a_malformed_env_file_is_reported_on_stderr() {
+    let (dir, mut command) = isolated_command();
+    std::fs::write(
+        dir.path().join(".env"),
+        "BROKEN=\"unterminated\nOPENROUTER_API_KEY=local-test-key\n",
+    )
+    .unwrap();
+    let output = command.output().unwrap();
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(".env"), "{stderr}");
+}
+
 // Reap the process even when a protocol assertion fails or times out.
 struct ServerProcess(Child);
 

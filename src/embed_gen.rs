@@ -128,8 +128,19 @@ pub async fn embed(client: &OpenRouterClient, body: &EmbeddingsBody) -> Result<E
     let mut data = reply.data;
     // Providers are supposed to answer in input order; `index` is the
     // authority when present, so a reordered reply still lines up.
-    if data.iter().all(|d| d.index.is_some()) {
+    let indexed = data.iter().all(|d| d.index.is_some());
+    if indexed {
         data.sort_by_key(|d| d.index);
+    }
+    let inputs = body.input.len();
+    let one_per_input = data.len() == inputs
+        && (!indexed || data.iter().enumerate().all(|(i, d)| d.index == Some(i)));
+    if !one_per_input {
+        return Err(receipt.attach(anyhow::anyhow!(
+            "model returned {} embeddings for {inputs} inputs (or their indices do not \
+             cover 0..{inputs} once each)",
+            data.len()
+        )));
     }
     Ok(EmbedResult {
         model: reply.model.unwrap_or_else(|| body.model.clone()),
@@ -211,6 +222,35 @@ mod tests {
         assert!(err.to_string().contains("blank"), "got: {err}");
         check_texts(&strings(&["a"]), "input").unwrap();
         check_texts(&strings(&["a", "b"]), "input").unwrap();
+    }
+
+    /// The result promises one vector per input, in input order: a reply
+    /// that is short, or whose indices skip or repeat, is a billed failure,
+    /// not a success that pairs vectors with the wrong texts.
+    #[tokio::test]
+    async fn embed_rejects_a_reply_that_does_not_match_the_inputs() {
+        for data in [
+            json!([{"index": 0, "embedding": [0.1]}]),
+            json!([{"index": 0, "embedding": [0.1]}, {"index": 0, "embedding": [0.2]}]),
+            json!([{"index": 0, "embedding": [0.1]}, {"index": 2, "embedding": [0.2]}]),
+            json!([{"embedding": [0.1]}]),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": data, "usage": {"cost": 0.00001}
+                })))
+                .mount(&mock)
+                .await;
+            let client = OpenRouterClient::with_base_url(mock.uri(), "test-key");
+            let err = embed(&client, &embed_body(&["a", "b"]))
+                .await
+                .expect_err(&format!("must fail: {data}"));
+            assert!(err.to_string().contains("2 inputs"), "{data}: {err}");
+            let receipt = crate::billing::Receipt::from_error(&err).expect("billed");
+            assert_eq!(receipt.cost, Some(0.00001));
+        }
     }
 
     #[test]

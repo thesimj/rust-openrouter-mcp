@@ -14,9 +14,10 @@ use crate::server::naming;
 use crate::server::provider::{ImageProviderArgs, ProviderRoutingArgs};
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
+    resolve_wait_seconds,
 };
 use crate::server::schema::{
-    AtLeastOneOf, de_lenient, de_opt_f64, de_opt_uint, require_all, scalarize_nullable,
+    AtLeastOneOf, de_lenient, de_opt_f64, de_opt_uint, non_blank, require_all, scalarize_nullable,
 };
 use crate::tasks::TaskKind;
 
@@ -68,15 +69,11 @@ async fn resolve_image_input(img: ImageInput) -> Result<image_gen::InputImage, E
         img.url,
         img.base64,
         crate::resources::MAX_IMAGE_BYTES,
-        true,
     )
     .await?;
     Ok(match resolved {
         media::Resolved::Path(p) => image_gen::InputImage::from_path(p, label),
         media::Resolved::Bytes(b) => image_gen::InputImage::inline(b.bytes, b.name, label),
-        media::Resolved::Url(_) => {
-            return Err(ErrorData::internal_error("image url was not fetched", None));
-        }
     })
 }
 
@@ -126,7 +123,7 @@ pub(crate) struct GenerateImageArgs {
     #[serde(default)]
     pub aspect_ratio: Option<String>,
     /// REQUIRED unless `size` is given (no default): resolution TIER (not
-    /// pixel dimensions), e.g. "512" (or "0.5K"), "1K", "2K", "4K" (maps to
+    /// pixel dimensions), e.g. "512" (or "0.5K"), "768", "1K", "2K", "4K" (maps to
     /// the Images API `resolution`). Cannot be combined with a pixel-form
     /// `size`.
     #[serde(default)]
@@ -331,9 +328,6 @@ impl OpenRouterServer {
         args: GenerateImageArgs,
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
-        // Blank/whitespace-only strings count as absent: better a clear
-        // "missing parameter" error here than a confusing provider 400.
-        let non_blank = |o: Option<String>| o.filter(|s| !s.trim().is_empty());
         let args = GenerateImageArgs {
             aspect_ratio: non_blank(args.aspect_ratio),
             image_size: non_blank(args.image_size),
@@ -389,10 +383,7 @@ impl OpenRouterServer {
         };
 
         let variants = args.variants.unwrap_or(1).clamp(1, 16);
-        let wait = args
-            .wait_seconds
-            .unwrap_or(DEFAULT_WAIT_SECONDS)
-            .clamp(1, 60);
+        let wait = resolve_wait_seconds(args.wait_seconds, DEFAULT_WAIT_SECONDS);
         let mut config: Vec<&str> = Vec::new();
         if let Some(a) = &aspect_ratio {
             config.push(a);
@@ -421,12 +412,11 @@ impl OpenRouterServer {
                 match image_gen::run_job(&ctx.client, &req, variants, &base).await {
                     Ok(summary) => {
                         ctx.stats
-                            .record_job(
+                            .record_image_job(
                                 &model,
                                 variants_u64,
                                 summary.images.len() as u64,
-                                summary.billing.cost,
-                                summary.billing.unknown,
+                                &summary.billing,
                             )
                             .await;
                         if summary.images.is_empty() {
@@ -438,7 +428,9 @@ impl OpenRouterServer {
                         Ok(image_job_result_json(&summary, &aspect_ratio, &image_size))
                     }
                     Err(e) => {
-                        ctx.stats.record_job(&model, variants_u64, 0, 0.0, 0).await;
+                        ctx.stats
+                            .record_image_job(&model, variants_u64, 0, &Default::default())
+                            .await;
                         Err(format!("{e:#}"))
                     }
                 }
@@ -482,13 +474,12 @@ impl OpenRouterServer {
         let provider = args.provider.into_routing()?;
         let req = image_gen::DescribeRequest {
             model: args.model,
-            prompt: args
-                .prompt
+            prompt: non_blank(args.prompt)
                 .unwrap_or_else(|| "Describe this image in detail.".to_string()),
             images: resolve_image_inputs(args.images).await?,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
-            reasoning_effort: args.reasoning_effort,
-            system: args.system,
+            reasoning_effort: non_blank(args.reasoning_effort),
+            system: non_blank(args.system),
             temperature: args.temperature,
             max_tokens: args.max_tokens,
             provider,
@@ -826,6 +817,42 @@ mod tests {
         let err = server.run_generate(args, true).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("acme"), "got: {}", err.message);
+    }
+
+    /// Blank optional strings count as unset at the tool boundary: no
+    /// `reasoning` object, no system message, and the default prompt.
+    #[tokio::test]
+    async fn describe_image_treats_blank_strings_as_unset() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "a square"}}]
+            })))
+            .mount(&mock)
+            .await;
+        let args: DescribeImageArgs = serde_json::from_value(json!({
+            "model": "m",
+            "images": [{"base64": valid_png_b64()}],
+            "prompt": " ",
+            "system": "",
+            "reasoning_effort": "  "
+        }))
+        .unwrap();
+        server_for(mock.uri())
+            .describe_image(rmcp::handler::server::wrapper::Parameters(args))
+            .await
+            .unwrap();
+        let body: serde_json::Value = mock.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(body.get("reasoning").is_none(), "sent: {body}");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "no system message: {body}");
+        assert!(
+            body.to_string().contains("Describe this image in detail."),
+            "default prompt: {body}"
+        );
     }
 
     /// `describe_image` no longer hardcodes system/temperature/max_tokens to

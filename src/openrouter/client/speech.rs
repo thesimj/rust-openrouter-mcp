@@ -2,6 +2,7 @@
 //! and `POST /api/v1/audio/transcriptions` (speech-to-text).
 
 use anyhow::{Context, Result};
+use reqwest::Method;
 use serde_json::Value;
 
 use crate::openrouter::{
@@ -12,13 +13,9 @@ impl OpenRouterClient {
     /// `POST /api/v1/audio/speech` - synchronous text-to-speech. Returns the raw
     /// audio bytes (OpenAI-Speech-compatible), the content type, and the
     /// `X-Generation-Id` header when present. On a non-2xx status the upstream
-    /// error body is surfaced (bounded to 500 chars).
+    /// error body is surfaced (bounded to `MAX_ERROR_BODY_CHARS`).
     pub async fn speech(&self, req: &SpeechBody) -> Result<SpeechResult> {
-        let rb = self
-            .http
-            .post(format!("{}/audio/speech", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let rb = self.request(Method::POST, "/audio/speech").json(req);
         let resp = self.send_checked(rb, "/audio/speech").await?;
 
         let generation_id = generation_id(&resp);
@@ -45,16 +42,12 @@ impl OpenRouterClient {
     /// Returns the raw response JSON: shape varies with `response_format`
     /// (`json` is just `{text, usage}`; `verbose_json` adds `language`,
     /// `duration`, `segments`, `words`, etc.), so the caller reads it untyped.
-    pub async fn transcribe(&self, req: &TranscriptionBody) -> Result<Value> {
+    /// Also returns the `X-Generation-Id` header when present.
+    pub async fn transcribe(&self, req: &TranscriptionBody) -> Result<(Value, Option<String>)> {
         let rb = self
-            .http
-            .post(format!("{}/audio/transcriptions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .request(Method::POST, "/audio/transcriptions")
             .json(req);
-        let (body, _generation_id) = self
-            .send_json_receipted(rb, "/audio/transcriptions")
-            .await?;
-        Ok(body)
+        self.send_json_receipted(rb, "/audio/transcriptions").await
     }
 }
 
@@ -111,7 +104,7 @@ mod tests {
         // exercise a truncated body without a generation header.
         for (length, generation_id) in [
             (
-                crate::openrouter::MAX_MEDIA_BYTES + 1,
+                crate::openrouter::MAX_MEDIA_RESPONSE_BYTES + 1,
                 Some("gen-paid-audio"),
             ),
             (10, None),
@@ -155,7 +148,7 @@ mod tests {
                     .to_string()
                     .starts_with("failed to read speech audio bytes")
             );
-            if length > crate::openrouter::MAX_MEDIA_BYTES {
+            if length > crate::openrouter::MAX_MEDIA_RESPONSE_BYTES {
                 assert!(error.to_string().contains("byte limit"));
             }
             let mut totals = crate::billing::Totals::default();

@@ -13,8 +13,10 @@ use serde_json::Value;
 
 use crate::openrouter::{Model, ModelsQuery, ModelsResponse};
 use crate::pricing::{attach_pricing_human, humanize_pricing, models_to_json};
-use crate::server::result::json_text_result;
-use crate::server::schema::{de_bool, de_opt_bool, de_opt_f64, de_opt_uint, scalarize_nullable};
+use crate::server::result::{internal_error_from, json_text_result};
+use crate::server::schema::{
+    de_bool, de_opt_bool, de_opt_f64, de_opt_uint, non_blank, scalarize_nullable,
+};
 
 use super::OpenRouterServer;
 
@@ -277,11 +279,7 @@ impl OpenRouterServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Local post-processing knobs; everything else is the wire query. A
         // blank search means no filter (the repo-wide rule).
-        let search = args
-            .search
-            .take()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let search = non_blank(args.search.take());
         let all = args.all;
         let query = args.into_query();
 
@@ -289,13 +287,15 @@ impl OpenRouterServer {
             .client
             .list_models_page(&query)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .map_err(|e| internal_error_from(&e))?;
         let pagination = pagination_note(&page);
 
         let filtered = apply_filters(page.data, search.as_deref(), all);
 
         // Attach human-readable pricing_human to each model.
-        let mut json = serde_json::to_string_pretty(&models_to_json(&filtered.models))
+        let models = models_to_json(&filtered.models)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mut json = serde_json::to_string_pretty(&models)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         if filtered.truncated() > 0 {
             json = format!(
@@ -352,7 +352,7 @@ impl OpenRouterServer {
 
         let detail = enriched_model_detail(&self.client, model)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .map_err(|e| internal_error_from(&e))?;
         json_text_result(&detail)
     }
 }
@@ -411,9 +411,6 @@ async fn enriched_model_detail(
                 if let Some(endpoints) = image.get_mut("endpoints").and_then(Value::as_array_mut) {
                     for ep in endpoints {
                         crate::pricing::attach_image_pricing_human(ep);
-                        // Fallback: if the shape ever turns string-priced
-                        // (like flat pricing objects), humanize that too.
-                        attach_pricing_human(ep);
                     }
                 }
                 detail["image"] = image;
@@ -605,7 +602,7 @@ mod tests {
         assert_eq!(ids(&blank), vec!["openai/gpt", "anthropic/claude"]);
     }
 
-    /// F2: `Model` must not silently drop `supported_voices` - it is what
+    /// `Model` must not silently drop `supported_voices` - it is what
     /// generate_audio points callers at, and OpenRouter's speech models carry
     /// it on `GET /models?output_modalities=speech` (live-confirmed).
     #[tokio::test]
@@ -1071,6 +1068,31 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("500"), "got: {}", err.message);
     }
+    /// A body that is not JSON fails with its cause (the parser's message),
+    /// not only the outer "failed to decode" line.
+    #[tokio::test]
+    async fn model_tools_report_the_cause_of_a_decode_failure() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock)
+            .await;
+        let server = server_for(mock.uri());
+        let listed = server
+            .list_models(Parameters(ListModelsArgs::default()))
+            .await
+            .unwrap_err();
+        let described = server
+            .describe_model(Parameters(DescribeModelArgs {
+                model: "test/model".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        for err in [listed, described] {
+            assert!(err.message.contains("expected"), "got: {}", err.message);
+        }
+    }
+
     #[tokio::test]
     async fn describe_model_preserves_both_modalities_and_video_errors() {
         for video_status in [200, 500] {

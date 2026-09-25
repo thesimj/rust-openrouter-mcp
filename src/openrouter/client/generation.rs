@@ -1,6 +1,7 @@
 //! `GET /api/v1/generation?id=` - the billing/latency record of one request.
 
 use anyhow::Result;
+use reqwest::Method;
 use serde_json::Value;
 
 use crate::openrouter::{OpenRouterClient, unwrap_data};
@@ -14,9 +15,7 @@ impl OpenRouterClient {
     /// id is a 404 [`crate::openrouter::HttpFailure`].
     pub async fn get_generation(&self, generation_id: &str) -> Result<Value> {
         let rb = self
-            .http
-            .get(format!("{}/generation", self.base_url))
-            .bearer_auth(&self.api_key)
+            .request(Method::GET, "/generation")
             .query(&[("id", generation_id)]);
         Ok(unwrap_data(self.send_json(rb, "/generation").await?))
     }

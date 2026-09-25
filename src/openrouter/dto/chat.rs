@@ -10,9 +10,10 @@ use super::provider::ProviderRouting;
 use super::speech::InputAudio;
 
 /// A chat-completions request. Every optional control is omitted when unset
-/// (`None` / empty), so the bare request is exactly `model`, `messages`,
-/// `stream`. `stream` is `false` for text/vision calls (one complete result)
-/// and `true` for audio output, which OpenRouter only delivers as a stream.
+/// (`None` / empty), so the bare request is exactly `model` and `messages`
+/// plus the `stream` flag [`ChatWire`] adds: `false` for text/vision calls (one
+/// complete result), `true` for audio output, which OpenRouter only delivers
+/// as a stream.
 #[derive(Debug, Default, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -39,7 +40,7 @@ pub struct ChatRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
-    /// "low" | "medium" | "high" on models that support it.
+    /// "low" | "medium" | "high" | "xhigh" | "max" on models that support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<String>,
     /// Structured-output request (`json_object` or a strict `json_schema`).
@@ -63,6 +64,15 @@ pub struct ChatRequest {
     /// has no such knob (Lyria returns MP3 regardless) never sees it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioConfig>,
+}
+
+/// A [`ChatRequest`] on the wire, with the `stream` flag the client method
+/// sets: each endpoint method owns it, so a caller cannot ask for a JSON
+/// result in stream mode or the reverse.
+#[derive(Serialize)]
+pub(crate) struct ChatWire<'a> {
+    #[serde(flatten)]
+    pub request: &'a ChatRequest,
     pub stream: bool,
 }
 
@@ -194,8 +204,8 @@ pub struct FilePart {
     pub file_data: String,
 }
 
-/// `video_url` part body. `processing` is a provider hint (e.g. Gemini's
-/// media resolution), passed through untouched and omitted when unset.
+/// `video_url` part body. `processing` is Gemini's video processing mode
+/// ("agentic" or "static"), passed through untouched and omitted when unset.
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoUrl {
     pub url: String,
@@ -234,7 +244,9 @@ pub struct Choice {
 /// Assistant message in a text/vision response (`chat_completion`, `describe_image`).
 #[derive(Debug, Deserialize)]
 pub struct ResponseMessage {
-    #[serde(default)]
+    /// The reply text. OpenRouter documents `content` as a string, an array
+    /// of content parts, or `null`; an array's text parts are joined in order.
+    #[serde(default, deserialize_with = "content_text")]
     pub content: Option<String>,
     /// The reasoning text, when the model exposes it (and `exclude` is not set).
     #[serde(default)]
@@ -245,6 +257,33 @@ pub struct ResponseMessage {
     /// send an explicit `null` for "none", so null decodes as empty.
     #[serde(default, deserialize_with = "super::null_as_default")]
     pub annotations: Vec<serde_json::Value>,
+}
+
+/// `deserialize_with` for [`ResponseMessage::content`]: the text of a string
+/// or of the `text` parts of an array; `None` for `null` or an array with no
+/// text.
+fn content_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Parts(Vec<serde_json::Value>),
+    }
+    Ok(match Option::<Content>::deserialize(deserializer)? {
+        None => None,
+        Some(Content::Text(text)) => Some(text),
+        Some(Content::Parts(parts)) => {
+            let text: String = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,7 +344,7 @@ pub struct DeltaAudio {
 
 /// A streamed audio-output completion, aggregated over all chunks. `audio` is
 /// every `delta.audio.data` fragment decoded as it arrived (see
-/// [`crate::image_io::Base64Assembler`] for why fragments are not concatenated
+/// [`crate::base64_codec::Base64Assembler`] for why fragments are not concatenated
 /// first). `text` gathers `delta.content`, `transcript` gathers
 /// `delta.audio.transcript`.
 #[derive(Debug, Default)]
@@ -343,7 +382,12 @@ mod tests {
     /// empty arrays that a strict provider might reject).
     #[test]
     fn chat_request_omits_every_unset_control() {
-        let v = serde_json::to_value(bare_request()).unwrap();
+        let request = bare_request();
+        let v = serde_json::to_value(ChatWire {
+            request: &request,
+            stream: false,
+        })
+        .unwrap();
         assert_eq!(
             v,
             json!({
@@ -521,12 +565,12 @@ mod tests {
         let processed = ContentPart::VideoUrl {
             video_url: VideoUrl {
                 url: "data:video/mp4;base64,AAAA".into(),
-                processing: Some("low".into()),
+                processing: Some("agentic".into()),
             },
         };
         assert_eq!(
             serde_json::to_value(processed).unwrap()["video_url"]["processing"],
-            "low"
+            "agentic"
         );
     }
 
@@ -573,5 +617,33 @@ mod tests {
         .unwrap();
         assert!(nulled.choices[0].message.reasoning.is_none());
         assert!(nulled.choices[0].message.annotations.is_empty());
+    }
+
+    /// OpenRouter's `ChatAssistantMessage.content` is a string, an array of
+    /// content parts, or `null`: an array reply keeps its text parts, in order,
+    /// instead of failing to decode a response that was already billed.
+    #[test]
+    fn response_content_accepts_a_string_parts_or_null() {
+        let content = |content: serde_json::Value| {
+            let reply: ChatCompletion =
+                serde_json::from_value(json!({"choices": [{"message": {"content": content}}]}))
+                    .unwrap();
+            reply.choices.into_iter().next().unwrap().message.content
+        };
+        assert_eq!(content(json!("plain")).as_deref(), Some("plain"));
+        assert_eq!(
+            content(json!([
+                {"type": "text", "text": "Hello, "},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "world"}
+            ]))
+            .as_deref(),
+            Some("Hello, world")
+        );
+        assert_eq!(
+            content(json!([{"type": "image_url", "image_url": {"url": "u"}}])),
+            None
+        );
+        assert_eq!(content(json!(null)), None);
     }
 }

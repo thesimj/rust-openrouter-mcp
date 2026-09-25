@@ -49,7 +49,12 @@ pub(crate) struct Totals {
 
 impl Totals {
     pub fn add(&mut self, receipt: &Receipt) {
-        match receipt.cost {
+        self.add_cost(receipt.cost);
+    }
+
+    /// Add one request's cost: known costs sum, an unreported one is counted.
+    pub fn add_cost(&mut self, cost: Option<f64>) {
+        match cost {
             Some(cost) => self.cost += cost,
             None => self.unknown += 1,
         }

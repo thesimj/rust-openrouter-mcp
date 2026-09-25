@@ -42,7 +42,7 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Limits apply to decompressed response bytes, including chunked bodies.
 const MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
-const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MEDIA_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 2048;
 const MAX_UPSTREAM_REQUESTS: usize = 16;
 /// Bound upstream retry hints before converting them into timer deadlines.
@@ -101,21 +101,20 @@ impl BoundedResponse {
         Ok(bytes)
     }
 
-    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T> {
-        let bytes = self.read(MAX_JSON_BYTES).await?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    /// [`json`](Self::json) with the one decode-failure message every JSON
-    /// endpoint reports (tests pin its prefix), naming the endpoint by `label`.
+    /// Read the body (capped at [`MAX_JSON_BYTES`]) and decode it, with the
+    /// one decode-failure message every JSON endpoint reports (tests pin its
+    /// prefix), naming the endpoint by `label`.
     async fn decode<T: serde::de::DeserializeOwned>(self, label: &str) -> Result<T> {
-        self.json()
-            .await
-            .with_context(|| format!("failed to decode OpenRouter {label} response"))
+        async {
+            let bytes = self.read(MAX_JSON_BYTES).await?;
+            anyhow::Ok(serde_json::from_slice(&bytes)?)
+        }
+        .await
+        .with_context(|| format!("failed to decode OpenRouter {label} response"))
     }
 
     async fn bytes(self) -> Result<Vec<u8>> {
-        self.read(MAX_MEDIA_BYTES).await
+        self.read(MAX_MEDIA_RESPONSE_BYTES).await
     }
 
     /// Read a `text/event-stream` body, handing the `data` payload of every
@@ -177,7 +176,7 @@ async fn error_prefix(mut response: reqwest::Response) -> String {
 }
 
 /// Build the shared `reqwest::Client`, attaching the OpenRouter app-attribution
-/// headers (`HTTP-Referer` / `X-Title`) as defaults so every endpoint inherits
+/// headers (`HTTP-Referer` / `X-OpenRouter-Title`) as defaults so every endpoint inherits
 /// them. Invalid optional headers are omitted. Client construction errors propagate.
 fn build_http_client() -> Result<reqwest::Client> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -185,12 +184,14 @@ fn build_http_client() -> Result<reqwest::Client> {
     let title = std::env::var("OPENROUTER_X_TITLE").unwrap_or_else(|_| APP_TITLE.into());
     let mut headers = HeaderMap::new();
     // Header names are case-insensitive on the wire; `from_static` requires
-    // lowercase. OpenRouter documents them as `HTTP-Referer` / `X-Title`.
+    // lowercase. OpenRouter documents them as `HTTP-Referer` /
+    // `X-OpenRouter-Title` (the older `X-Title` is kept only for backwards
+    // compatibility; https://openrouter.ai/docs/app-attribution, 2026-09-25).
     if let Ok(v) = HeaderValue::from_str(&referer) {
         headers.insert(HeaderName::from_static("http-referer"), v);
     }
     if let Ok(v) = HeaderValue::from_str(&title) {
-        headers.insert(HeaderName::from_static("x-title"), v);
+        headers.insert(HeaderName::from_static("x-openrouter-title"), v);
     }
     // reqwest applies no timeout of any kind by default. Without one, a provider
     // that accepts the connection and then stalls hangs the MCP tool call
@@ -229,7 +230,8 @@ impl std::fmt::Display for HttpFailure {
 impl std::error::Error for HttpFailure {}
 
 fn retry_after(value: &str) -> Option<std::time::Duration> {
-    if let Ok(seconds) = value.trim().parse::<u64>() {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
         return Some(std::time::Duration::from_secs(
             seconds.min(MAX_RETRY_AFTER_SECS),
         ));
@@ -283,11 +285,50 @@ pub(in crate::openrouter) fn content_type(resp: &BoundedResponse, default: &str)
         .unwrap_or_else(|| default.to_string())
 }
 
+/// One URL path segment from an id (a video job id): RFC 3986 unreserved
+/// characters and `:` stay, everything else is percent-encoded, `/` included,
+/// so a `?`, `#`, space or slash cannot end the segment.
+pub(in crate::openrouter) fn path_segment(id: &str) -> String {
+    id.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~:".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// A model id (`author/slug`, `:free` variants included) as URL path
+/// segments: `/` still separates them and each is a [`path_segment`]. An
+/// empty, `.` or `..` segment is refused rather than encoded - URL parsers
+/// resolve `%2E%2E` like `..`, so it would climb to another endpoint.
+pub(in crate::openrouter) fn model_path(model_id: &str) -> Result<String> {
+    let segments: Vec<&str> = model_id.split('/').collect();
+    if segments
+        .iter()
+        .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        anyhow::bail!("invalid model id {model_id:?}: expected author/slug");
+    }
+    Ok(segments
+        .into_iter()
+        .map(path_segment)
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
 /// Most characters of an upstream error body kept in an error message. A JSON
 /// provider error is well under this; a proxy's HTML error page is not, and these
 /// errors surface in an MCP tool result, so an unbounded body would dump the whole
 /// page into the caller's context.
 const MAX_ERROR_BODY_CHARS: usize = 500;
+
+// A UTF-8 char is at most 4 bytes, so the error prefix read from the wire must
+// hold that many bytes for the cut (and its "[truncated]" marker) to happen
+// whenever the body is longer.
+const _: () = assert!(MAX_ERROR_BYTES >= 4 * MAX_ERROR_BODY_CHARS);
 
 /// Bound an upstream error body to [`MAX_ERROR_BODY_CHARS`], marking a cut.
 pub(crate) fn truncate_error_body(mut body: String) -> String {
@@ -330,6 +371,18 @@ impl OpenRouterClient {
     pub(in crate::openrouter) fn api_root(&self) -> &str {
         let trimmed = self.base_url.trim_end_matches('/');
         trimmed.strip_suffix("/api/v1").unwrap_or(trimmed)
+    }
+
+    /// A request to `path` under the API base URL, carrying the bearer key.
+    /// Every endpoint starts here; the same `path` is its label in errors.
+    pub(in crate::openrouter) fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key)
     }
 
     /// Hold shared admission from request send until body consumption finishes.

@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.13.0
+
+Fixes (each covered by a test):
+
+- `generate_music`: a stream that fails after reporting its cost (a bad audio
+  fragment) keeps that cost and the chunk's generation id in the billing
+  receipt, so `get_usage_stats` no longer counts it as an unknown cost.
+- `chat_completion`: whitespace stop sequences such as `"\n"` reach the wire
+  (they were dropped as blank). All inputs are checked locally before the
+  model-capability gate, and the catalog is asked once per call.
+- `describe_image`: a blank `prompt`, `system` or `reasoning_effort` counts as
+  unset (a blank prompt used to be sent as `" "`).
+- `generate_video`: blank `aspect_ratio`, `size`, `resolution`,
+  `first_frame` and `last_frame` count as absent; `reference_audio` and
+  `reference_videos` take at most 16 entries, like every other input list.
+  References are resolved before the job starts, so a missing file is an
+  invalid-params error naming the argument (it was a failed task), even when
+  a frame means the references would be ignored.
+- `transcribe_audio`: bad inline base64 or an unknown format is rejected as
+  invalid params before any call (it was an internal error counted as a failed
+  request). The result carries a `{"generation_id"}` block when OpenRouter
+  sends one.
+- `generate_audio`: the saved file and the recorded mime come from the audio
+  bytes first, then a known content type, then the requested format
+  (`audio/aac` replies were saved as `.mp3`). Music, speech and audio inputs
+  share one container rule.
+- `generate_image`: raster bytes beat a declared `image/svg+xml`; an SVG whose
+  size cannot be read says so in a warning. A `"512"` request no longer warns
+  that a 512 px image is `~0.5K`, and the `768` tier is recognized.
+- `embed_text`: a reply with fewer vectors than inputs, or indices that skip or
+  repeat, is a billed failure instead of a mismatched success.
+- Raw base64 inputs decode as leniently as data URLs (line breaks and missing
+  padding are accepted).
+- Tool errors keep their cause (`list_models`, `describe_model`, `get_account`,
+  manifest-write warnings); a missing output directory reports why it could not
+  be created.
+- `get_result`: over the retention bound, the result that finished longest ago
+  is evicted, not the task created first (a long video job lost its result
+  seconds after finishing).
+- A `.env` that fails to parse is named on stderr.
+- Model ids and video job ids are percent-encoded in request paths; a model
+  id with an empty, `.` or `..` segment is refused.
+- Blank-means-absent now also trims the kept value everywhere, e.g.
+  `generate_image` sends `quality: " high "` as `"high"`.
+- An output path with no file stem is named `output...` instead of `image...`.
+
+OpenRouter API alignment (checked against `openapi.json` and the docs,
+2026-09-25):
+
+- The app title header is `X-OpenRouter-Title` (`X-Title` is legacy); the
+  `OPENROUTER_X_TITLE` variable still sets it.
+- `describe_model` renders the live video SKU families
+  (`cents_per_video_output_second_*`, `cents_per_image_input`,
+  `minimum_cents_per_generation`, `text_to_video_` / `image_to_video_`
+  duration keys) in dollars with their unit.
+- `json_schema` titles become valid schema names (`[A-Za-z0-9_-]`, at most 64).
+- A chat reply whose `content` is an array of parts keeps its text.
+- Audio inputs also accept `aiff`, `pcm16` and `pcm24`.
+- Docs: `video_url.processing` is `agentic` / `static`, verbosity adds `xhigh`
+  and `max`, web-search engines, the `360p` video tier, `/credits` needing a
+  management key, and `is_provisioning_key` being deprecated.
+
+### Internal refactor (no behavior change)
+
+- One `request(method, path)` builder for every endpoint; `ChatWire` owns the
+  `stream` flag; one error-text rule; one numbered output-path rule; one wait
+  clamp; one "blank means absent" helper at the tool boundary; one
+  text-call result tail (`finish_text_call`); the task snapshot carries a
+  `Status` enum; the video job takes already-resolved references, so no domain
+  module imports the server layer; the base64 / data-URL codec moved from
+  `image_io` to `base64_codec`; shared test fixtures; unused fields and flags removed (`ImagesRequest.n`,
+  `fetch_urls`, never-set manifest fields, a string-pricing fallback on image
+  endpoints that never matched their array-shaped pricing).
+
 ## 0.12.1
 
 - `get_usage_stats` rounds `actual_cost_usd` to six decimals instead of four,

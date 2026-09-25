@@ -1,6 +1,7 @@
 //! `POST /api/v1/rerank`.
 
 use anyhow::Result;
+use reqwest::Method;
 
 use crate::openrouter::{OpenRouterClient, RerankBody, RerankResponse};
 
@@ -8,13 +9,9 @@ impl OpenRouterClient {
     /// `POST /api/v1/rerank` - synchronous document reranking. Returns the
     /// decoded body plus the `X-Generation-Id` header. A 2xx whose body cannot
     /// be decoded keeps a billing receipt on the error; an HTTP failure
-    /// surfaces the upstream error body (bounded to 500 chars).
+    /// surfaces the upstream error body (bounded to `MAX_ERROR_BODY_CHARS`).
     pub async fn rerank(&self, req: &RerankBody) -> Result<(RerankResponse, Option<String>)> {
-        let rb = self
-            .http
-            .post(format!("{}/rerank", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let rb = self.request(Method::POST, "/rerank").json(req);
         self.send_json_receipted(rb, "/rerank").await
     }
 }

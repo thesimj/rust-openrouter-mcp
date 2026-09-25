@@ -18,8 +18,9 @@ target/
 # Contains mutation testing data
 **/mutants.out*/
 
-# Local scratch folder (not committed)
+# Local scratch folder and task list (not committed)
 __local/
+/TASKS.md
 
 # MCPB build outputs (the bundled binary and packed extension are built in CI;
 # the manifest, icon, and generator script under mcpb/ ARE committed)

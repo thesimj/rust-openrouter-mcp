@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::decision_gen;
 use crate::openrouter::{DecisionQuestion, DecisionsBody, NoulCriteria};
 use crate::server::provider::ProviderRoutingArgs;
-use crate::server::result::json_text_result;
+use crate::server::result::{invalid_params_from, json_text_result};
 use crate::server::schema::{de_lenient, scalarize_nullable};
 
 use super::OpenRouterServer;
@@ -268,7 +268,6 @@ impl OpenRouterServer {
         Parameters(args): Parameters<MakeDecisionsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let model = args.model.clone();
         let questions = args
             .questions
             .into_iter()
@@ -280,19 +279,16 @@ impl OpenRouterServer {
             questions,
             provider: args.provider.into_routing()?,
         };
-        decision_gen::validate(&body)
-            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+        decision_gen::validate(&body).map_err(|e| invalid_params_from(&e))?;
 
-        match decision_gen::decide(&self.client, &body).await {
-            Ok(result) => {
-                self.stats.record_text(&model, result.cost).await;
-                json_text_result(&result.to_json())
-            }
-            Err(e) => {
-                self.stats.record_text_failure(&model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+        let outcome = decision_gen::decide(&self.client, &body).await;
+        self.finish_text_call(
+            &body.model,
+            outcome,
+            |r| r.cost,
+            |r| json_text_result(&r.to_json()),
+        )
+        .await
     }
 }
 

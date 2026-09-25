@@ -41,20 +41,20 @@ impl MediaKind {
 /// single `-`. Dots would be mistaken for file extensions by the output writers.
 fn model_token(model: &str) -> String {
     let tail = model.rsplit('/').next().unwrap_or(model);
-    sanitize(tail, true)
+    sanitize(tail).to_ascii_lowercase()
 }
 
 /// Sanitize one config/model token to filesystem-safe characters. Maps `:` to
 /// `x` (so "16:9" -> "16x9"), keeps alphanumerics/`-`, collapses any other
-/// run to a single `-`, and trims leading/trailing `-`. Config tokens keep their
-/// case ("2K", "720p"); the model token is lowercased.
-fn sanitize(s: &str, lowercase: bool) -> String {
+/// run to a single `-`, and trims leading/trailing `-`. Keeps case: config
+/// tokens stay "2K", "720p" (the model token lowercases the ASCII result).
+fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_dash = false;
     for c in s.chars() {
         let c = if c == ':' { 'x' } else { c };
         if c.is_ascii_alphanumeric() || c == '-' {
-            out.push(if lowercase { c.to_ascii_lowercase() } else { c });
+            out.push(c);
             prev_dash = c == '-';
         } else if !prev_dash {
             out.push('-');
@@ -93,7 +93,7 @@ pub(crate) fn auto_base_name(
         model_token(model),
     ];
     for t in config {
-        let token = sanitize(t, false);
+        let token = sanitize(t);
         if !token.is_empty() {
             parts.push(token);
         }

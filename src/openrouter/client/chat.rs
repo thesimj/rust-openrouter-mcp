@@ -2,25 +2,25 @@
 //! and audio output (music), which OpenRouter delivers only as an SSE stream.
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use reqwest::Method;
 
-use crate::image_io::Base64Assembler;
+use crate::base64_codec::Base64Assembler;
 use crate::openrouter::{
-    ChatAudioResult, ChatChunk, ChatCompletion, ChatRequest, MAX_MEDIA_BYTES, OpenRouterClient,
-    generation_id, truncate_error_body,
+    ChatAudioResult, ChatChunk, ChatCompletion, ChatRequest, ChatWire, MAX_MEDIA_RESPONSE_BYTES,
+    OpenRouterClient, error_text, generation_id, truncate_error_body,
 };
 
 impl OpenRouterClient {
     /// `POST /api/v1/chat/completions` - used for text and vision (describe)
-    /// calls. On a non-2xx status the upstream error body is surfaced (bounded to 500 chars)
+    /// calls. On a non-2xx status the upstream error body is surfaced (bounded to `MAX_ERROR_BODY_CHARS`)
     /// (OpenRouter wraps provider errors there). The result's `id` is the
     /// generation id: the `X-Generation-Id` header when present, else the body's.
     pub async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatCompletion> {
-        let rb = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let wire = ChatWire {
+            request: req,
+            stream: false,
+        };
+        let rb = self.request(Method::POST, "/chat/completions").json(&wire);
         let (mut completion, header_id): (ChatCompletion, _) =
             self.send_json_receipted(rb, "/chat/completions").await?;
         completion.id = header_id.or(completion.id);
@@ -31,41 +31,31 @@ impl OpenRouterClient {
     /// model (music: `google/lyria-3-*`). Audio output is stream-only upstream;
     /// this aggregates the stream as it arrives into one [`ChatAudioResult`],
     /// decoding each audio fragment on the spot. `req` must carry
-    /// `modalities: ["text", "audio"]` and `stream: true` - the caller
-    /// (`music_gen`) builds it that way. An `error` event mid-stream, or an
+    /// `modalities: ["text", "audio"]` - the caller (`music_gen`) builds it
+    /// that way; this method sets `stream: true`. An `error` event mid-stream, or an
     /// undecodable chunk, fails at once with the billing receipt attached (the
     /// provider may already have charged); a body that ends before `[DONE]`
     /// is returned with `complete: false` rather than discarded.
     pub async fn chat_completion_audio(&self, req: &ChatRequest) -> Result<ChatAudioResult> {
-        let rb = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
-        let response = self.send_checked(rb, "/chat/completions").await?;
-        let receipt = crate::billing::Receipt {
-            cost: None,
-            generation_id: generation_id(&response),
+        let wire = ChatWire {
+            request: req,
+            stream: true,
         };
-
+        let rb = self.request(Method::POST, "/chat/completions").json(&wire);
+        let response = self.send_checked(rb, "/chat/completions").await?;
         let mut result = ChatAudioResult {
-            generation_id: receipt.generation_id.clone(),
+            generation_id: generation_id(&response),
             ..Default::default()
         };
         let mut audio = Base64Assembler::default();
         let streamed = response
-            .sse_each(MAX_MEDIA_BYTES, |payload| {
+            .sse_each(MAX_MEDIA_RESPONSE_BYTES, |payload| {
                 let chunk: ChatChunk = serde_json::from_str(payload)
                     .context("failed to decode an OpenRouter /chat/completions stream chunk")?;
                 if let Some(error) = chunk.error {
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| error.to_string());
                     anyhow::bail!(
                         "OpenRouter /chat/completions stream reported an error: {}",
-                        truncate_error_body(message)
+                        truncate_error_body(error_text(&error))
                     );
                 }
                 if result.generation_id.is_none() {
@@ -93,7 +83,12 @@ impl OpenRouterClient {
             })
             .await
             .context("failed to read OpenRouter /chat/completions stream");
-        // From here on the provider has answered: every failure keeps the receipt.
+        // From here on the provider has answered: every failure keeps the
+        // receipt, with whatever cost and id the stream reported before failing.
+        let receipt = crate::billing::Receipt {
+            cost: result.cost,
+            generation_id: result.generation_id.clone(),
+        };
         result.complete = streamed.map_err(|error| receipt.clone().attach(error))?;
         result.audio = receipt.wrap(|| {
             audio
@@ -132,6 +127,9 @@ mod tests {
             }
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
+                .and(wiremock::matchers::body_partial_json(
+                    serde_json::json!({"stream": false}),
+                ))
                 .respond_with(template)
                 .mount(&server)
                 .await;
@@ -159,7 +157,6 @@ mod tests {
                 content: crate::openrouter::Content::Text("lo-fi loop".to_string()),
             }],
             modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            stream: true,
             ..Default::default()
         }
     }
@@ -292,6 +289,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A failure after the stream reported its cost and body id must not lose
+    /// them: the receipt carries what the stream said, not only the header.
+    #[tokio::test]
+    async fn chat_completion_audio_failure_after_usage_keeps_the_streamed_cost_and_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"id\":\"gen-1\",\"choices\":[{\"delta\":{\"audio\":{\"data\":\"QUJDR\"}}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"cost\":0.04}}\n\n",
+                "data: [DONE]\n\n",
+            )))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let error = client
+            .chat_completion_audio(&audio_request("m"))
+            .await
+            .expect_err("a dangling base64 character must fail");
+        let receipt = crate::billing::Receipt::from_error(&error).expect("receipt kept");
+        assert_eq!(receipt.cost, Some(0.04));
+        assert_eq!(receipt.generation_id.as_deref(), Some("gen-1"));
     }
 
     /// Fragments encoded one at a time each carry padding; the audio must be

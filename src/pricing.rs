@@ -7,23 +7,35 @@ use serde_json::{Map, Value};
 use crate::openrouter::Model;
 
 /// Trim a float to a compact decimal string (up to 8 places, no trailing zeros).
-pub(crate) fn trim_num(v: f64) -> String {
+fn trim_num(v: f64) -> String {
     let s = format!("{v:.8}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// Known video SKU families. Unknown names retain their names and raw rate.
+/// Known video SKU families, as `(factor to dollars, unit)`: `cents_*` and
+/// `second*` keys are quoted in cents, `duration_seconds` keys (bare or with a
+/// `text_to_video_`/`image_to_video_` task prefix) in dollars. Unknown names
+/// retain their names and raw rate.
 fn video_unit(key: &str) -> Option<(f64, &'static str)> {
+    let task_free = key
+        .strip_prefix("text_to_video_")
+        .or_else(|| key.strip_prefix("image_to_video_"))
+        .unwrap_or(key);
     if key.starts_with("cents_per_megapixel_second") {
         Some((0.01, "/MP-s"))
-    } else if key.starts_with("duration_seconds") {
+    } else if task_free.starts_with("duration_seconds") {
         Some((1.0, "/s"))
     } else if key.starts_with("second_")
         || key == "second"
         || key.starts_with("cents_per_second")
+        || key.starts_with("cents_per_video_output_second")
         || key == "per-video-second"
     {
         Some((0.01, "/s"))
+    } else if key == "cents_per_image_input" {
+        Some((0.01, "/input image"))
+    } else if key == "minimum_cents_per_generation" {
+        Some((0.01, " minimum/video"))
     } else if key.starts_with("video_tokens") || key == "video_token" {
         Some((1_000_000.0, "/M vid-tok"))
     } else if key == "generate" {
@@ -38,7 +50,7 @@ fn video_unit(key: &str) -> Option<(f64, &'static str)> {
 /// (per-second, cents-per-second, or per-1M video tokens); others get their
 /// natural unit. Zero, negative (sentinel), non-finite, and unparseable values
 /// return `None` so they are omitted as noise.
-pub(crate) fn humanize_price(key: &str, raw: &str) -> Option<String> {
+fn humanize_price(key: &str, raw: &str) -> Option<String> {
     let v: f64 = raw.parse().ok()?;
     if !v.is_finite() || v <= 0.0 {
         return None;
@@ -173,20 +185,20 @@ pub(crate) fn attach_image_pricing_human(endpoint: &mut Value) {
 
 /// Serialize a model list to JSON, attaching a `pricing_human` sibling to each
 /// model for the `list_models` MCP tool.
-pub(crate) fn models_to_json(models: &[Model]) -> Value {
-    let mut v = serde_json::to_value(models).unwrap_or_else(|_| Value::Array(Vec::new()));
+pub(crate) fn models_to_json(models: &[Model]) -> serde_json::Result<Value> {
+    let mut v = serde_json::to_value(models)?;
     if let Some(arr) = v.as_array_mut() {
         for m in arr {
             attach_pricing_human(m);
         }
     }
-    v
+    Ok(v)
 }
 
 /// Whether `pricing` expresses no price at all: every price (a decimal string
 /// as OpenRouter sends them, or a bare number) is zero, or the object is empty
 /// or absent. The non-price members are ignored: `discount` (a fraction) and
-/// `overrides` (an object). Audio-output chat models such as Lyria report 0
+/// `overrides` (a list of conditional rates). Audio-output chat models such as Lyria report 0
 /// token prices while billing a flat fee per track, so zero here means "not
 /// expressed in this object", not "free".
 pub(crate) fn is_zero_priced(pricing: &Value) -> bool {
@@ -272,7 +284,7 @@ mod tests {
             humanize_price("image_output", "0.00006").as_deref(),
             Some("$0.00006/unit (see image endpoint)")
         );
-        // Video SKUs use their real units (matching video_price).
+        // Video SKUs use their real units.
         assert_eq!(
             humanize_price("video_tokens", "0.000007").as_deref(),
             Some("$7/M vid-tok")
@@ -351,7 +363,7 @@ mod tests {
         assert!(humanize_pricing(&junk_only).is_none());
     }
 
-    /// F11: merged image endpoints carry numeric cost_usd lines; the human
+    /// Merged image endpoints carry numeric cost_usd lines; the human
     /// sibling renders them readably and skips zero/negative lines.
     #[test]
     fn attach_image_pricing_human_renders_numeric_cost_lines() {
@@ -416,13 +428,30 @@ mod audit_regression {
             Some("$2/unit (unit unknown)")
         );
     }
+
+    /// SKU names seen live on `GET /videos/models` (2026-09-25): cents keys
+    /// are cents, and the task-prefixed duration keys are dollars per second.
+    #[test]
+    fn video_rates_cover_the_live_sku_families() {
+        for (key, raw, human) in [
+            ("cents_per_video_output_second_1080p", "25", "$0.25/s"),
+            ("cents_per_video_output_second_480p", "8", "$0.08/s"),
+            ("cents_per_image_input", "1", "$0.01/input image"),
+            ("minimum_cents_per_generation", "56", "$0.56 minimum/video"),
+            ("text_to_video_duration_seconds_720p", "0.112", "$0.112/s"),
+            ("image_to_video_duration_seconds_1080p", "0.084", "$0.084/s"),
+            ("duration_seconds_with_audio_4k", "0.30", "$0.3/s"),
+        ] {
+            assert_eq!(humanize_price(key, raw).as_deref(), Some(human), "{key}");
+        }
+    }
     #[test]
     fn catalog_round_trip_preserves_one_hour_cache_write_pricing() {
         let model: Model = serde_json::from_value(serde_json::json!({
             "id":"anthropic/example", "pricing":{"input_cache_write_1h":"0.00001"}
         }))
         .unwrap();
-        let output = models_to_json(&[model]);
+        let output = models_to_json(&[model]).unwrap();
         assert_eq!(output[0]["pricing"]["input_cache_write_1h"], "0.00001");
         assert_eq!(
             output[0]["pricing_human"]["input_cache_write_1h"],

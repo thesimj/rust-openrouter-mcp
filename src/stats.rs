@@ -67,20 +67,33 @@ impl Inner {
         }
     }
 
-    /// Add a reported (or unreported) cost to both the global and a per-model
-    /// counter: known costs accumulate in `actual_cost_usd`, unknown ones bump
-    /// `unknown_cost_count`. Returns the per-model entry for further updates.
+    /// Add one request's reported (or unreported) cost to both the global and
+    /// the per-model counters. Returns the per-model entry for further updates.
     fn account_cost(&mut self, model: &str, cost: Option<f64>) -> &mut ModelStats {
-        match cost {
-            Some(c) => self.actual_cost_usd += c,
-            None => self.unknown_cost_count += 1,
-        }
+        let mut totals = crate::billing::Totals::default();
+        totals.add_cost(cost);
+        self.account_totals(model, &totals)
+    }
+
+    /// Add summed costs to both the global and the per-model counters: known
+    /// costs accumulate in `actual_cost_usd`, unknown ones in
+    /// `unknown_cost_count`. Returns the per-model entry for further updates.
+    fn account_totals(&mut self, model: &str, totals: &crate::billing::Totals) -> &mut ModelStats {
+        self.actual_cost_usd += totals.cost;
+        self.unknown_cost_count += totals.unknown;
         let m = self.by_model.entry(model.to_string()).or_default();
-        match cost {
-            Some(c) => m.actual_cost_usd += c,
-            None => m.unknown_cost_count += 1,
-        }
+        m.actual_cost_usd += totals.cost;
+        m.unknown_cost_count += totals.unknown;
         m
+    }
+
+    /// The counters every failed request moves, plus whatever receipt `error`
+    /// carries: a failed call that the provider answered is still billed.
+    fn record_failure(&mut self, model: &str, error: &anyhow::Error) {
+        self.requests_total += 1;
+        self.requests_failed += 1;
+        self.by_model.entry(model.to_string()).or_default().requests += 1;
+        self.record_failed_receipt(model, error);
     }
 }
 
@@ -109,29 +122,23 @@ impl UsageStats {
         }
     }
 
-    /// Record one finished job: `variants` image requests, of which `images`
-    /// succeeded; `cost` is the summed USD `usage.cost` and `unknown_cost` is the
-    /// number of successful images whose cost was not reported.
-    pub async fn record_job(
+    /// Record one finished image job: `variants` image requests, of which
+    /// `images` succeeded, with the summed `billing` of the answered requests.
+    pub async fn record_image_job(
         &self,
         model: &str,
         variants: u64,
         images: u64,
-        cost: f64,
-        unknown_cost: u64,
+        billing: &crate::billing::Totals,
     ) {
         let mut s = self.inner.lock().await;
         s.requests_total += variants;
         s.requests_failed += variants.saturating_sub(images);
         s.image_generations += variants;
         s.images_generated += images;
-        s.actual_cost_usd += cost;
-        s.unknown_cost_count += unknown_cost;
-        let m = s.by_model.entry(model.to_string()).or_default();
+        let m = s.account_totals(model, billing);
         m.requests += variants;
         m.images_generated += images;
-        m.actual_cost_usd += cost;
-        m.unknown_cost_count += unknown_cost;
     }
 
     /// Record one successful text-family request (chat, describe_image,
@@ -199,11 +206,7 @@ impl UsageStats {
     /// failure counters plus whatever receipt `error` carries. The two always
     /// go together - a failed call that the provider answered is still billed.
     pub async fn record_text_failure(&self, model: &str, error: &anyhow::Error) {
-        let mut s = self.inner.lock().await;
-        s.requests_total += 1;
-        s.requests_failed += 1;
-        s.by_model.entry(model.to_string()).or_default().requests += 1;
-        s.record_failed_receipt(model, error);
+        self.inner.lock().await.record_failure(model, error);
     }
 
     /// Record one failed audio generation (`generate_audio`, `generate_music`):
@@ -211,11 +214,8 @@ impl UsageStats {
     /// pairing as [`record_text_failure`](Self::record_text_failure).
     pub async fn record_audio_failure(&self, model: &str, error: &anyhow::Error) {
         let mut s = self.inner.lock().await;
-        s.requests_total += 1;
-        s.requests_failed += 1;
         s.audio_generations += 1;
-        s.by_model.entry(model.to_string()).or_default().requests += 1;
-        s.record_failed_receipt(model, error);
+        s.record_failure(model, error);
     }
 
     /// A JSON snapshot of the current counters.
@@ -272,8 +272,13 @@ mod tests {
     async fn record_and_snapshot_aggregates_by_model() {
         let stats = UsageStats::new();
         // A 4-variant job: 3 succeeded (one without cost), 1 failed.
-        stats.record_job("model-a", 4, 3, 0.20, 1).await;
-        stats.record_job("model-b", 1, 1, 0.04, 0).await;
+        let totals = |cost, unknown| crate::billing::Totals { cost, unknown };
+        stats
+            .record_image_job("model-a", 4, 3, &totals(0.20, 1))
+            .await;
+        stats
+            .record_image_job("model-b", 1, 1, &totals(0.04, 0))
+            .await;
 
         let s = stats.snapshot().await;
         assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
@@ -340,7 +345,11 @@ mod tests {
     #[tokio::test]
     async fn reset_clears_counters() {
         let stats = UsageStats::new();
-        stats.record_job("m", 2, 2, 0.1, 0).await;
+        let billing = crate::billing::Totals {
+            cost: 0.1,
+            unknown: 0,
+        };
+        stats.record_image_job("m", 2, 2, &billing).await;
         stats.reset().await;
         let s = stats.snapshot().await;
         assert_eq!(s["requests_total"], 0);

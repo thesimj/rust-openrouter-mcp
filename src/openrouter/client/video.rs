@@ -1,21 +1,19 @@
 //! Asynchronous video-generation endpoints: submit, poll, download.
 
 use anyhow::{Context, Result};
+use reqwest::Method;
 
 use crate::openrouter::{
     OpenRouterClient, VideoPollResponse, VideoSubmitBody, VideoSubmitResponse, content_type,
+    path_segment,
 };
 
 impl OpenRouterClient {
     /// `POST /api/v1/videos` - submit an asynchronous video-generation job. This
     /// is **not** the chat endpoint: it returns `202` with a job id to poll. On a
-    /// non-2xx status the upstream error body is surfaced (bounded to 500 chars).
+    /// non-2xx status the upstream error body is surfaced (bounded to `MAX_ERROR_BODY_CHARS`).
     pub async fn submit_video(&self, req: &VideoSubmitBody) -> Result<VideoSubmitResponse> {
-        let rb = self
-            .http
-            .post(format!("{}/videos", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let rb = self.request(Method::POST, "/videos").json(req);
         let (body, _generation_id) = self.send_json_receipted(rb, "/videos").await?;
         Ok(body)
     }
@@ -23,25 +21,20 @@ impl OpenRouterClient {
     /// `GET /api/v1/videos/{id}` - poll a submitted video job for its status and,
     /// once complete, the (unsigned) download URLs and usage.
     pub async fn poll_video(&self, job_id: &str) -> Result<VideoPollResponse> {
-        let rb = self
-            .http
-            .get(format!("{}/videos/{job_id}", self.base_url))
-            .bearer_auth(&self.api_key);
-        self.send_json(rb, &format!("/videos/{job_id}")).await
+        let path = format!("/videos/{}", path_segment(job_id));
+        let rb = self.request(Method::GET, &path);
+        self.send_json(rb, &path).await
     }
 
     /// `GET /api/v1/videos/{id}/content?index=N` - download one generated clip.
     /// Returns `(content_type, bytes)`; the content type (e.g. `video/mp4`) is
     /// used to choose the file extension.
     pub async fn download_video(&self, job_id: &str, index: usize) -> Result<(String, Vec<u8>)> {
+        let path = format!("/videos/{}/content", path_segment(job_id));
         let rb = self
-            .http
-            .get(format!("{}/videos/{job_id}/content", self.base_url))
-            .query(&[("index", index.to_string())])
-            .bearer_auth(&self.api_key);
-        let resp = self
-            .send_checked(rb, &format!("/videos/{job_id}/content"))
-            .await?;
+            .request(Method::GET, &path)
+            .query(&[("index", index.to_string())]);
+        let resp = self.send_checked(rb, &path).await?;
         let content_type = content_type(&resp, "video/mp4");
         let bytes = resp
             .bytes()
@@ -58,6 +51,21 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::openrouter::{OpenRouterClient, VideoSubmitBody};
+
+    /// A job id is one path segment: a `/` or `..` in it cannot reach
+    /// another endpoint.
+    #[tokio::test]
+    async fn video_job_ids_stay_one_path_segment() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/videos/..%2Fkey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "pending"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        client.poll_video("../key").await.unwrap();
+    }
 
     #[tokio::test]
     async fn submit_video_posts_body_and_parses_job_id() {

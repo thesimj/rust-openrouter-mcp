@@ -228,11 +228,11 @@ pub(crate) struct PreparedInput {
 /// [`image_io::svg_to_png`]), with the SVG's intrinsic viewBox size recorded as
 /// the "original" dimensions.
 pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<PreparedInput>> {
-    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_INPUTS, MAX_IMAGE_TOTAL_BYTES};
+    use crate::resources::{MAX_IMAGE_BYTES, MAX_IMAGE_TOTAL_BYTES, MAX_INPUTS_PER_LIST};
 
     anyhow::ensure!(
-        images.len() <= MAX_IMAGE_INPUTS,
-        "at most {MAX_IMAGE_INPUTS} input images are allowed"
+        images.len() <= MAX_INPUTS_PER_LIST,
+        "at most {MAX_INPUTS_PER_LIST} input images are allowed"
     );
     // Validate and read the complete batch before decoding any image. Borrow
     // inline buffers and retain each bounded file read for normalization.
@@ -276,7 +276,7 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
                     );
                 }
                 Ok(PreparedInput {
-                    data_url: image_io::data_url(&svg.png, "image/png"),
+                    data_url: crate::base64_codec::data_url(&svg.png, "image/png"),
                     normalized_mime: "image/png",
                     original_width: svg.intrinsic_width,
                     original_height: svg.intrinsic_height,
@@ -290,7 +290,7 @@ pub(crate) fn prepare_inputs(images: &[InputImage], max_dim: u32) -> Result<Vec<
                 let (encoded, mime) = image_io::normalize_for_send(&bytes, max_dim)?;
                 let (normalized_width, normalized_height) = image_io::decode_dimensions(&encoded)?;
                 Ok(PreparedInput {
-                    data_url: image_io::data_url(&encoded, mime),
+                    data_url: crate::base64_codec::data_url(&encoded, mime),
                     normalized_mime: mime,
                     original_width,
                     original_height,
@@ -373,7 +373,7 @@ pub(crate) async fn generate_core(
     let input_references = content
         .reference_urls
         .iter()
-        .map(|url| InputReference::new(ImageUrl { url: url.clone() }))
+        .map(|url| InputReference::image(ImageUrl { url: url.clone() }))
         .collect();
     let request = ImagesRequest {
         model: req.model.clone(),
@@ -381,7 +381,6 @@ pub(crate) async fn generate_core(
         resolution: req.image_size.as_deref().map(resolution_for),
         aspect_ratio: req.aspect_ratio.clone(),
         seed,
-        n: None,
         input_references,
         quality: req.quality.clone(),
         output_format: req.output_format.clone(),
@@ -404,12 +403,12 @@ pub(crate) async fn generate_core(
 
 /// Decode the first image of an Images API response into a [`GeneratedImage`].
 ///
-/// Sniff the raster magic bytes first - they are ground truth. A declared
-/// `image/svg+xml` is trusted as-is (sniffing never recognizes SVG text as a
-/// raster format, so there is nothing to cross-check it against). Otherwise,
-/// when the response also declared a `media_type` that disagrees with the
-/// sniffed bytes, the sniffed one wins and the mismatch is recorded as a
-/// warning rather than silently saving the file under the wrong extension.
+/// Sniff the raster magic bytes first - they are ground truth, even against a
+/// declared `image/svg+xml`. When the response declared a `media_type` that
+/// disagrees with the sniffed bytes, the sniffed one wins and the mismatch is
+/// recorded as a warning rather than silently saving the file under the wrong
+/// extension. Bytes no raster sniffer recognizes take the declared type (the
+/// only way to recognize SVG text), else PNG.
 fn decode_generated(
     resp: crate::openrouter::ImagesResponse,
     cost: Option<f64>,
@@ -421,27 +420,30 @@ fn decode_generated(
         .next()
         .context("model returned no image (it may have refused)")?;
 
-    let bytes = image_io::decode_base64(&item.b64_json)?;
+    let bytes = crate::base64_codec::decode_base64(&item.b64_json)?;
     let mut warnings = Vec::new();
-    let sniffed = image_io::sniff_mime(&bytes).map(str::to_string);
     let declared_canonical = item.media_type.as_deref().map(canonical_mime);
-    let mime = if declared_canonical.as_deref() == Some("image/svg+xml") {
-        "image/svg+xml".to_string()
-    } else if let Some(sniffed) = sniffed {
-        if let Some(declared) = &item.media_type
-            && canonical_mime(declared) != sniffed
-        {
-            warnings.push(format!(
-                "provider declared media_type {declared:?} but the image bytes are \
-                 actually {sniffed}; saved using the sniffed type"
-            ));
+    let mime = match image_io::sniff_mime(&bytes) {
+        Some(sniffed) => {
+            if let (Some(declared), Some(canonical)) = (&item.media_type, &declared_canonical)
+                && canonical != sniffed
+            {
+                warnings.push(format!(
+                    "provider declared media_type {declared:?} but the image bytes are \
+                     actually {sniffed}; saved using the sniffed type"
+                ));
+            }
+            sniffed.to_string()
         }
-        sniffed
-    } else {
-        declared_canonical.unwrap_or_else(|| "image/png".to_string())
+        None => declared_canonical.unwrap_or_else(|| "image/png".to_string()),
     };
     let (width, height) = if mime == "image/svg+xml" {
-        image_io::svg_dimensions(&bytes).unwrap_or((0, 0))
+        image_io::svg_dimensions(&bytes).unwrap_or_else(|| {
+            warnings.push(
+                "could not read the SVG's size; width and height are reported as 0".to_string(),
+            );
+            (0, 0)
+        })
     } else {
         image_io::decode_dimensions(&bytes)?
     };

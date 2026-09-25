@@ -11,7 +11,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::server::result::{
-    client_wants_inline_previews, job_call_result, json_text_result, snapshot_to_envelope,
+    client_wants_inline_previews, internal_error_from, job_call_result, json_text_result,
+    snapshot_to_envelope,
 };
 use crate::server::schema::{de_bool, scalarize_nullable};
 
@@ -86,12 +87,15 @@ impl OpenRouterServer {
         (GET /api/v1/key): label, creator_user_id (the owning user - the closest available \
         owner identity, not a name/email), credit usage (total and daily/weekly/monthly), \
         spending limit and remaining balance in USD (null means unlimited), byok_usage, the \
-        is_free_tier / is_provisioning_key / is_management_key flags, and a deprecated \
-        rate_limit (requests per interval; -1 means unlimited). Also includes a `credits` \
-        object (GET /api/v1/credits) with account-wide totals across ALL of the account's \
-        keys: total_credits (purchased/granted), total_usage (spent), and the derived \
-        remaining balance in USD - note these are account-wide and so usually larger than \
-        this key's own `usage`. This is account/key-level info, not a per-request cost.",
+        is_free_tier / is_management_key flags (plus is_provisioning_key, a deprecated \
+        alias of is_management_key), and a deprecated rate_limit (requests per interval; -1 \
+        means unlimited). Also includes a `credits` object (GET /api/v1/credits) with \
+        account-wide totals across ALL of the account's keys: total_credits \
+        (purchased/granted), total_usage (spent), and the derived remaining balance in USD - \
+        note these are account-wide and so usually larger than this key's own `usage`. \
+        OpenRouter serves /credits to management keys only, so with an ordinary key \
+        `credits` holds an `error` instead. This is account/key-level info, not a \
+        per-request cost.",
         annotations(
             title = "Get Account Info",
             read_only_hint = true,
@@ -105,7 +109,7 @@ impl OpenRouterServer {
         // tool if /key fails. Both calls are independent, so run them concurrently.
         let (key_res, credits_res) =
             tokio::join!(self.client.get_key_info(), self.client.get_credits());
-        let info = key_res.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let info = key_res.map_err(|e| internal_error_from(&e))?;
 
         let mut body = serde_json::to_value(&info)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -114,7 +118,7 @@ impl OpenRouterServer {
                 Ok(c) => serde_json::to_value(c)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
                 // Surface the failure inline rather than dropping the whole tool.
-                Err(e) => serde_json::json!({ "error": e.to_string() }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
             };
             map.insert("credits".to_string(), credits);
         }
@@ -128,9 +132,11 @@ impl OpenRouterServer {
         uptime_seconds, requests_total, requests_failed, image_generations, images_generated, \
         video_generations, videos_generated, audio_generations, audio_files (generate_audio \
         and generate_music), \
-        text_generations (describe_image, chat_completion, transcribe_audio, embed_text, \
-        rerank_documents, and make_decisions calls; get_generation lookups count only toward \
-        requests_total), \
+        text_generations (successful describe_image, chat_completion, transcribe_audio, \
+        embed_text, rerank_documents, and make_decisions calls - a failed one counts in \
+        requests_total and requests_failed but not here, while the other *_generations count \
+        attempts; get_generation lookups \
+        count only toward requests_total), \
         actual_cost_usd (summed from usage.cost), \
         unknown_cost_count, and a by_model breakdown. Counters reset when the server restarts.",
         annotations(
@@ -270,6 +276,33 @@ mod tests {
         let v = tool_result_json(&res);
         assert_eq!(v["label"], "sk-or-v1-x");
         assert!(v["credits"]["error"].is_string());
+    }
+
+    /// Both the fatal /key error and the inline /credits error keep their cause.
+    #[tokio::test]
+    async fn get_account_reports_the_cause_of_a_decode_failure() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock)
+            .await;
+        let err = server_for(mock.uri()).get_account().await.unwrap_err();
+        assert!(err.message.contains("expected"), "got: {}", err.message);
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock)
+            .await;
+        let res = server_for(mock.uri()).get_account().await.unwrap();
+        let credits_error = tool_result_json(&res)["credits"]["error"].to_string();
+        assert!(credits_error.contains("expected"), "got: {credits_error}");
     }
 
     /// Stringified booleans/floats are also accepted for the other tools.

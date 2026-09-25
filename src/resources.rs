@@ -7,17 +7,28 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-pub(crate) const MAX_IMAGE_INPUTS: usize = 16;
+/// Most entries in one input list (images, files, audio, video, references):
+/// OpenRouter's image `input_references` allow 16, and every other list
+/// shares the cap.
+pub(crate) const MAX_INPUTS_PER_LIST: usize = 16;
 pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 pub(crate) const MAX_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
+/// Blocking preparation jobs (file reads, image decode and encode) run at once
+/// on Tokio's blocking pool; later ones wait for a slot.
+const MAX_BLOCKING_JOBS: usize = 4;
+
+/// Run blocking `work` off the async runtime, at most [`MAX_BLOCKING_JOBS`] at
+/// a time.
 pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
     static CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let capacity = CAPACITY.get_or_init(|| Arc::new(Semaphore::new(4))).clone();
+    let capacity = CAPACITY
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_JOBS)))
+        .clone();
     run_blocking_with_capacity(capacity, work).await
 }
 

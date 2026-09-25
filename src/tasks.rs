@@ -25,7 +25,7 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             TaskKind::Image => "image",
             TaskKind::Video => "video",
@@ -33,7 +33,9 @@ impl TaskKind {
     }
 }
 
-enum Status {
+/// Where a task is in its lifecycle.
+#[derive(Clone, Debug)]
+pub enum Status {
     Pending,
     /// The lean result object (paths, dims, manifest, ...).
     Completed(Value),
@@ -43,7 +45,6 @@ enum Status {
 struct TaskEntry {
     kind: TaskKind,
     status: Status,
-    created_at: Instant,
     finished_at: Option<Instant>,
 }
 
@@ -51,12 +52,21 @@ const MAX_RETAINED_TASKS: usize = 256;
 const MAX_PENDING_TASKS: usize = 32;
 const TERMINAL_TASK_TTL: Duration = Duration::from_secs(60 * 60);
 
+impl Status {
+    /// The status name a response reports.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Completed(_) => "completed",
+            Status::Failed(_) => "failed",
+        }
+    }
+}
+
 /// A read-only view of a task for building a response.
 pub struct TaskSnapshot {
-    pub kind: &'static str,
-    pub status: &'static str,
-    pub result: Option<Value>,
-    pub error: Option<String>,
+    pub kind: TaskKind,
+    pub status: Status,
 }
 
 /// Process-local registry of generation jobs, cheaply cloneable (shared `Arc`).
@@ -189,7 +199,6 @@ impl TaskRegistry {
             TaskEntry {
                 kind,
                 status: Status::Pending,
-                created_at: now,
                 finished_at: None,
             },
         );
@@ -217,32 +226,17 @@ impl TaskRegistry {
 
     /// Snapshot a task's current state, or `None` if the id is unknown.
     ///
-    /// Reads before pruning, deliberately: the cap loop evicts the oldest
-    /// *terminal* entry, which a long-running job that just completed satisfies.
-    /// Pruning first meant a caller could evict the very result it was asking
-    /// for - so a finished job answered "unknown task_id" while its output sat
-    /// on disk. The prune still runs on every call, just one step later.
+    /// Reads before pruning, deliberately: when every other entry is pending,
+    /// the job that just completed is the only terminal one and so the one the
+    /// cap loop evicts. Pruning first meant a caller could evict the very
+    /// result it was asking for - so a finished job answered "unknown task_id"
+    /// while its output sat on disk. The prune still runs on every call, just
+    /// one step later.
     pub async fn snapshot(&self, id: &str) -> Option<TaskSnapshot> {
         let mut guard = self.inner.lock().unwrap();
-        let snap = guard.get(id).map(|entry| match &entry.status {
-            Status::Pending => TaskSnapshot {
-                kind: entry.kind.as_str(),
-                status: "pending",
-                result: None,
-                error: None,
-            },
-            Status::Completed(v) => TaskSnapshot {
-                kind: entry.kind.as_str(),
-                status: "completed",
-                result: Some(v.clone()),
-                error: None,
-            },
-            Status::Failed(err) => TaskSnapshot {
-                kind: entry.kind.as_str(),
-                status: "failed",
-                result: None,
-                error: Some(err.clone()),
-            },
+        let snap = guard.get(id).map(|entry| TaskSnapshot {
+            kind: entry.kind,
+            status: entry.status.clone(),
         });
         prune_terminal(&mut guard, Instant::now());
         snap
@@ -253,16 +247,15 @@ impl TaskSnapshot {
     /// A "still running" snapshot for a task the registry can no longer show.
     pub(crate) fn pending(kind: TaskKind) -> Self {
         Self {
-            kind: kind.as_str(),
-            status: "pending",
-            result: None,
-            error: None,
+            kind,
+            status: Status::Pending,
         }
     }
 }
 
-/// Drop expired terminal tasks, then evict the oldest terminal results until
-/// the registry is within its retention bound. Pending jobs are never evicted.
+/// Drop expired terminal tasks, then evict the results that finished longest
+/// ago until the registry is within its retention bound. Pending jobs are
+/// never evicted.
 fn prune_terminal(entries: &mut HashMap<String, TaskEntry>, now: Instant) {
     entries.retain(|_, entry| {
         entry
@@ -274,7 +267,7 @@ fn prune_terminal(entries: &mut HashMap<String, TaskEntry>, now: Instant) {
         let oldest = entries
             .iter()
             .filter(|(_, entry)| entry.finished_at.is_some())
-            .min_by_key(|(_, entry)| entry.created_at)
+            .min_by_key(|(_, entry)| entry.finished_at)
             .map(|(id, _)| id.clone());
         match oldest {
             Some(id) => {
@@ -298,20 +291,21 @@ mod tests {
 
         reg.insert_pending("a", TaskKind::Image).await;
         let s = reg.snapshot("a").await.unwrap();
-        assert_eq!(s.status, "pending");
-        assert_eq!(s.kind, "image");
+        assert!(matches!(s.status, Status::Pending));
+        assert_eq!(s.kind.as_str(), "image");
 
         reg.complete("a", json!({"ok": true, "n": 1})).await;
         let s = reg.snapshot("a").await.unwrap();
-        assert_eq!(s.status, "completed");
-        assert_eq!(s.result.unwrap()["n"], 1);
+        let Status::Completed(result) = &s.status else {
+            panic!("not completed: {:?}", s.status);
+        };
+        assert_eq!(result["n"], 1);
 
         reg.insert_pending("b", TaskKind::Video).await;
         reg.fail("b", "boom".to_string()).await;
         let s = reg.snapshot("b").await.unwrap();
-        assert_eq!(s.status, "failed");
-        assert_eq!(s.kind, "video");
-        assert_eq!(s.error.as_deref(), Some("boom"));
+        assert!(matches!(&s.status, Status::Failed(e) if e == "boom"));
+        assert_eq!(s.kind.as_str(), "video");
     }
 
     #[tokio::test]
@@ -331,8 +325,31 @@ mod tests {
         );
     }
 
+    /// Over the bound, the result that finished longest ago goes first - not
+    /// the task created first. A long job is created early and finishes late;
+    /// evicting it by creation time lost a result seconds after it was ready.
+    #[test]
+    fn prune_evicts_the_result_that_finished_longest_ago() {
+        let start = Instant::now();
+        let finished_at = |seconds: u64| TaskEntry {
+            kind: TaskKind::Image,
+            status: Status::Completed(json!({})),
+            finished_at: Some(start + Duration::from_secs(seconds)),
+        };
+        // The long video was created first (task ids are sequential) but
+        // finished last.
+        let mut entries = HashMap::new();
+        entries.insert("task-1".to_string(), finished_at(100));
+        for i in 2..=MAX_RETAINED_TASKS + 1 {
+            entries.insert(format!("task-{i}"), finished_at(11));
+        }
+        prune_terminal(&mut entries, start + Duration::from_secs(101));
+        assert_eq!(entries.len(), MAX_RETAINED_TASKS);
+        assert!(entries.contains_key("task-1"));
+    }
+
     /// A poll must not evict the entry it is polling for. `snapshot` prunes on
-    /// every call and the cap loop evicts the oldest *terminal* entry - so
+    /// every call and the cap loop evicts a *terminal* entry - so
     /// pruning before the lookup meant asking about a just-finished job was what
     /// destroyed it, and the caller got `unknown task_id` while the generated
     /// file sat on disk. Reads first, prunes second.
@@ -353,7 +370,6 @@ mod tests {
                     TaskEntry {
                         kind: TaskKind::Video,
                         status: Status::Pending,
-                        created_at: Instant::now(),
                         finished_at: None,
                     },
                 );
@@ -368,8 +384,10 @@ mod tests {
             "polling task-0 evicted it before answering the question"
         );
         let snap = snap.unwrap();
-        assert_eq!(snap.status, "completed");
-        assert_eq!(snap.result.unwrap()["i"], 0);
+        let Status::Completed(result) = &snap.status else {
+            panic!("not completed: {:?}", snap.status);
+        };
+        assert_eq!(result["i"], 0);
         // The prune still runs, just after the read: now that task-0 is terminal
         // and the registry is over its bound, the next call reclaims it.
         assert!(reg.snapshot("task-0").await.is_none());
@@ -405,8 +423,7 @@ mod audit_regression {
         let id = released.id.clone();
         drop(released);
         let snapshot = registry.snapshot(&id).await.unwrap();
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.error.unwrap().contains("cancelled"));
+        assert!(matches!(&snapshot.status, Status::Failed(e) if e.contains("cancelled")));
         assert!(registry.reserve(TaskKind::Video).is_some());
     }
 
@@ -421,8 +438,7 @@ mod audit_regression {
         assert!(done.await.is_err());
         registry.shutdown(Duration::from_secs(1)).await;
         let snapshot = registry.snapshot(&id).await.unwrap();
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.error.unwrap().contains("panicked"));
+        assert!(matches!(&snapshot.status, Status::Failed(e) if e.contains("panicked")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -441,8 +457,10 @@ mod audit_regression {
         assert_eq!(started.elapsed(), Duration::from_secs(2));
         done.await.unwrap();
         let snapshot = registry.snapshot(&id).await.unwrap();
-        assert_eq!(snapshot.status, "completed");
-        assert_eq!(snapshot.result.unwrap()["saved"], true);
+        let Status::Completed(result) = &snapshot.status else {
+            panic!("not completed: {:?}", snapshot.status);
+        };
+        assert_eq!(result["saved"], true);
         assert!(registry.reserve(TaskKind::Image).is_none());
     }
 
@@ -457,8 +475,7 @@ mod audit_regression {
         assert_eq!(started.elapsed(), Duration::from_secs(5));
         assert!(done.await.is_err());
         let snapshot = registry.snapshot(&id).await.unwrap();
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.error.unwrap().contains("cancelled"));
+        assert!(matches!(&snapshot.status, Status::Failed(e) if e.contains("cancelled")));
         assert!(registry.reserve(TaskKind::Image).is_none());
     }
 
@@ -476,7 +493,10 @@ mod audit_regression {
                 })
                 .is_none()
         );
-        assert_eq!(registry.snapshot(&id).await.unwrap().status, "failed");
+        assert!(matches!(
+            registry.snapshot(&id).await.unwrap().status,
+            Status::Failed(_)
+        ));
         registry.shutdown(Duration::from_secs(1)).await;
     }
 }

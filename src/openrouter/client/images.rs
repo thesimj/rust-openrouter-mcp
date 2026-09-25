@@ -5,6 +5,7 @@
 //! served here too, so all generation goes through this endpoint.
 
 use anyhow::Result;
+use reqwest::Method;
 
 use crate::openrouter::{ImagesRequest, ImagesResponse, OpenRouterClient};
 
@@ -12,16 +13,12 @@ impl OpenRouterClient {
     /// `POST /api/v1/images` - generate image(s) from a prompt (and optional
     /// reference images). Returns the parsed response plus the `X-Generation-Id`
     /// response header when present. On a non-2xx status the upstream error body
-    /// is surfaced (bounded to 500 chars) (OpenRouter wraps provider errors there).
+    /// is surfaced (bounded to `MAX_ERROR_BODY_CHARS`) (OpenRouter wraps provider errors there).
     pub async fn generate_images(
         &self,
         req: &ImagesRequest,
     ) -> Result<(ImagesResponse, Option<String>)> {
-        let rb = self
-            .http
-            .post(format!("{}/images", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(req);
+        let rb = self.request(Method::POST, "/images").json(req);
         self.send_json_receipted(rb, "/images").await
     }
 }
@@ -41,7 +38,6 @@ mod tests {
             resolution: Some("1K".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             seed: None,
-            n: None,
             input_references: vec![],
             quality: None,
             output_format: None,

@@ -95,7 +95,7 @@ pub struct VariantMeta {
 }
 
 /// Sidecar manifest path next to the outputs: `<stem>.manifest.json`. Shared by
-/// the image, video, and audio jobs.
+/// the image, video, speech, and music jobs.
 pub fn path(base: &Path) -> PathBuf {
     crate::output::in_parent_of(
         base,
@@ -104,15 +104,25 @@ pub fn path(base: &Path) -> PathBuf {
 }
 
 /// Serialize a manifest ([`Manifest`], [`VideoManifest`], [`AudioManifest`] or
-/// [`MusicManifest`])
-/// as pretty JSON and write it to `path`. Async: this runs on job-completion
-/// paths that share a Tokio worker with concurrent `get_result` polls.
+/// [`MusicManifest`]) as pretty JSON and write it to `path`. Async: this runs
+/// on job-completion paths that share a Tokio worker with concurrent
+/// `get_result` polls.
 pub async fn write(path: &Path, manifest: &impl Serialize) -> Result<()> {
     let json = serde_json::to_string_pretty(manifest).context("could not serialize manifest")?;
     crate::output::write_bytes(path, json.as_bytes())
         .await
         .with_context(|| format!("could not write manifest {}", path.display()))?;
     Ok(())
+}
+
+/// [`write`] for the end of a job, whose outputs are already saved and paid
+/// for: a failure must not fail the job, so it comes back as a message (with
+/// its cause) for the job's warnings or errors.
+pub async fn write_or_report(path: &Path, manifest: &impl Serialize) -> Option<String> {
+    write(path, manifest)
+        .await
+        .err()
+        .map(|e| format!("manifest write failed: {e:#}"))
 }
 
 /// The complete record for one video-generation job.
@@ -246,15 +256,12 @@ pub struct MusicManifest {
     pub output: AudioOutputMeta,
 }
 
-/// Output details for the saved audio file (or its `error`).
-#[derive(Debug, Default, Serialize)]
+/// Output details for the saved audio file. A job that fails writes no
+/// manifest, so there is always a file to describe.
+#[derive(Debug, Serialize)]
 pub struct AudioOutputMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
+    pub path: String,
+    pub mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }

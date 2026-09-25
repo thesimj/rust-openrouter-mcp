@@ -22,7 +22,7 @@ pub struct KeyInfo {
     /// Whether this is a free-tier key.
     #[serde(default)]
     pub is_free_tier: Option<bool>,
-    /// Whether this key can provision (create/manage) other keys.
+    /// Deprecated upstream: the same meaning as `is_management_key`.
     #[serde(default)]
     pub is_provisioning_key: Option<bool>,
     /// Whether this is an account management key.
@@ -84,7 +84,7 @@ pub struct Credits {
     pub total_usage: Option<f64>,
     /// Derived remaining balance (`total_credits - total_usage`, USD); `None`
     /// when either input is missing. Serialized for the caller, ignored on input.
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub remaining: Option<f64>,
 }
 

@@ -1,6 +1,7 @@
 //! `GET /api/v1/key` endpoint.
 
 use anyhow::Result;
+use reqwest::Method;
 
 use crate::openrouter::{Credits, CreditsResponse, KeyInfo, KeyInfoResponse, OpenRouterClient};
 
@@ -10,10 +11,7 @@ impl OpenRouterClient {
     /// limit / remaining balance, tier/management flags, and the (deprecated)
     /// rate limit. This is key/account-level info, not the owner's name or email.
     pub async fn get_key_info(&self) -> Result<KeyInfo> {
-        let rb = self
-            .http
-            .get(format!("{}/key", self.base_url))
-            .bearer_auth(&self.api_key);
+        let rb = self.request(Method::GET, "/key");
         let parsed: KeyInfoResponse = self.send_json(rb, "/key").await?;
         Ok(parsed.data)
     }
@@ -22,10 +20,7 @@ impl OpenRouterClient {
     /// across every key on the account, not just the one in use. The derived
     /// remaining balance is filled in before returning.
     pub async fn get_credits(&self) -> Result<Credits> {
-        let rb = self
-            .http
-            .get(format!("{}/credits", self.base_url))
-            .bearer_auth(&self.api_key);
+        let rb = self.request(Method::GET, "/credits");
         let parsed: CreditsResponse = self.send_json(rb, "/credits").await?;
         Ok(parsed.data.with_remaining())
     }
@@ -40,7 +35,8 @@ mod tests {
     use crate::openrouter::OpenRouterClient;
 
     /// Every request carries the OpenRouter app-attribution headers
-    /// (`HTTP-Referer` / `X-Title`) so usage shows under the app in rankings.
+    /// (`HTTP-Referer` / `X-OpenRouter-Title`) so usage shows under the app in
+    /// rankings.
     /// The mock only matches when both headers are present with the defaults.
     #[tokio::test]
     async fn requests_send_app_attribution_headers() {
@@ -51,7 +47,7 @@ mod tests {
                 "HTTP-Referer",
                 "https://github.com/thesimj/rust-openrouter-mcp",
             ))
-            .and(header("X-Title", "rust-openrouter-mcp"))
+            .and(header("X-OpenRouter-Title", "rust-openrouter-mcp"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
             .mount(&server)
             .await;

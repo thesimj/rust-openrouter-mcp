@@ -29,6 +29,16 @@ pub struct VideoInput {
     pub frame_type: String,
 }
 
+/// An audio or video reference as the caller gave it (`source`, recorded in
+/// the manifest) and as it goes on the wire (`url`: the URL itself, or a local
+/// file inlined as a data URL). The tool layer resolves it, with the same caps
+/// and MIME rules as the chat inputs.
+#[derive(Debug, Clone)]
+pub struct MediaReference {
+    pub source: String,
+    pub url: String,
+}
+
 /// Inputs for a single video generation (domain struct; the wire body is
 /// [`crate::openrouter::VideoSubmitBody`]).
 #[derive(Debug, Clone)]
@@ -48,11 +58,10 @@ pub struct VideoGenRequest {
     pub frames: Vec<VideoInput>,
     /// Reference images for reference-to-video.
     pub references: Vec<PathBuf>,
-    /// Reference audio clips: URLs or local paths, resolved at submit time by
-    /// [`crate::server::media::resolve_media_reference`].
-    pub reference_audio: Vec<String>,
-    /// Reference video clips: URLs or local paths, resolved like `reference_audio`.
-    pub reference_videos: Vec<String>,
+    /// Reference audio clips, already resolved.
+    pub reference_audio: Vec<MediaReference>,
+    /// Reference video clips, already resolved.
+    pub reference_videos: Vec<MediaReference>,
     /// Upscaling models only.
     pub creativity: Option<u32>,
     /// Upscaling models only; must be > 0.
@@ -197,7 +206,9 @@ mod tests {
         assert_eq!(parse_secs(Some("nope"), 5), 5, "garbage -> default");
     }
 
-    fn request() -> VideoGenRequest {
+    /// A text-to-video request for model "m" with prompt "p" and every other
+    /// input unset; the job tests build their fixtures on it too.
+    pub(super) fn request() -> VideoGenRequest {
         VideoGenRequest {
             model: "m".into(),
             prompt: Some("p".into()),
@@ -253,12 +264,18 @@ mod tests {
             },
             VideoGenRequest {
                 prompt: None,
-                reference_audio: vec!["a.mp3".into()],
+                reference_audio: vec![MediaReference {
+                    source: "a.mp3".into(),
+                    url: "https://cdn/a.mp3".into(),
+                }],
                 ..request()
             },
             VideoGenRequest {
                 prompt: None,
-                reference_videos: vec!["v.mp4".into()],
+                reference_videos: vec![MediaReference {
+                    source: "v.mp4".into(),
+                    url: "https://cdn/v.mp4".into(),
+                }],
                 ..request()
             },
         ] {

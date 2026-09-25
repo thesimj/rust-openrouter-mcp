@@ -55,21 +55,10 @@ pub struct MediaUrl {
 /// A first/last frame for image-to-video (`frame_type` is `first_frame` or
 /// `last_frame`), sent as a data-URL `image_url`.
 #[derive(Debug, Serialize)]
+#[serde(tag = "type", rename = "image_url")]
 pub struct FrameImage {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
     pub image_url: ImageUrl,
     pub frame_type: String,
-}
-
-impl FrameImage {
-    pub fn new(image_url: ImageUrl, frame_type: String) -> Self {
-        Self {
-            kind: "image_url",
-            image_url,
-            frame_type,
-        }
-    }
 }
 
 /// A reference for reference-to-video: an image (data-URL `image_url`), or an
@@ -87,7 +76,7 @@ pub enum InputReference {
 }
 
 impl InputReference {
-    pub fn new(image_url: ImageUrl) -> Self {
+    pub fn image(image_url: ImageUrl) -> Self {
         Self::Image { image_url }
     }
 
@@ -130,17 +119,7 @@ fn lenient_error<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|v| match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Object(ref map) => Some(
-            map.get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| v.to_string()),
-        ),
-        other => Some(other.to_string()),
-    }))
+    Ok(value.as_ref().map(super::error_text))
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,12 +140,12 @@ mod tests {
     // bare-string / wrong-key element (the shape upstream rejects with a ZodError).
     #[test]
     fn frame_image_serializes_to_documented_image_url_part() {
-        let fi = FrameImage::new(
-            ImageUrl {
+        let fi = FrameImage {
+            image_url: ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
             },
-            "first_frame".to_string(),
-        );
+            frame_type: "first_frame".to_string(),
+        };
         assert_eq!(
             serde_json::to_value(&fi).unwrap(),
             json!({
@@ -180,7 +159,7 @@ mod tests {
     // input_references use the same content-part shape, minus `frame_type`.
     #[test]
     fn input_reference_serializes_to_documented_image_url_part() {
-        let ir = InputReference::new(ImageUrl {
+        let ir = InputReference::image(ImageUrl {
             url: "https://example.com/ref.png".to_string(),
         });
         assert_eq!(

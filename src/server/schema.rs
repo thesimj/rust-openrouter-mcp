@@ -61,7 +61,6 @@ fn assert_props(obj: &serde_json::Map<String, serde_json::Value>, names: &[&str]
             "{ctx}: {name:?} is not a property of this schema"
         );
     }
-    let _ = (obj, names, ctx); // silence release-build unused warnings
 }
 
 impl schemars::transform::Transform for RequireFields {
@@ -217,13 +216,22 @@ where
     }
 }
 
-/// Trim every entry of a string-list argument and drop the blank ones (the
-/// repo-wide "blank means absent" rule), for provider slugs and domain lists.
+/// The repo-wide "blank means absent" rule for one optional string argument:
+/// trim it, and drop it when nothing is left. Clients often send `""` for a
+/// field they mean to leave unset; better a clear missing-parameter error, or
+/// the model's default, than a confusing provider 400.
+pub(crate) fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// [`non_blank`] for every entry of a string-list argument, for provider slugs
+/// and domain lists.
 pub(crate) fn clean_list(items: Vec<String>) -> Vec<String> {
     items
         .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter_map(|s| non_blank(Some(s)))
         .collect()
 }
 
@@ -465,6 +473,13 @@ mod tests {
         assert!(r.is_err(), "Option<Value> must be rejected: {bad_value}");
     }
 
+    #[test]
+    fn non_blank_trims_and_drops_blank_values() {
+        assert_eq!(super::non_blank(Some(" en ".into())).as_deref(), Some("en"));
+        assert_eq!(super::non_blank(Some(" \t".into())), None);
+        assert_eq!(super::non_blank(None), None);
+    }
+
     /// `de_lenient` accepts the object itself, a JSON string holding it, and
     /// `null`/blank (-> default); an absent field defaults via `serde(default)`.
     #[test]
@@ -515,11 +530,11 @@ mod tests {
             .unwrap_or(serde_json::Value::Null)
     }
 
-    /// F13: a `RequireFields` name that doesn't match any property (a typo, or
+    /// A `RequireFields` name that doesn't match any property (a typo, or
     /// a rename that forgot to update the transform) must fail loudly in a
     /// debug build rather than silently no-op in the generated schema.
     /// `debug_assert!` compiles out under `--release`, so this test would
-    /// simply not panic there (N1) - gate it on the same cfg the assert itself
+    /// simply not panic there - gate it on the same cfg the assert itself
     /// depends on rather than failing spuriously in a release run.
     #[cfg(debug_assertions)]
     #[test]
@@ -551,7 +566,7 @@ mod tests {
 
     /// The tools/list schema for each "REQUIRED (no default)" field must actually
     /// list it in `required`, not just say so in prose - otherwise a
-    /// schema-trusting client omits it and only fails at runtime (S1).
+    /// schema-trusting client omits it and only fails at runtime.
     #[test]
     fn required_no_default_fields_are_in_the_schema_required_array() {
         let chat = required_fields::<ChatCompletionArgs>();
@@ -598,7 +613,7 @@ mod tests {
     }
 
     /// `describe_image.images` must declare `minItems: 1` - the prose already
-    /// says at least one image is required (S13).
+    /// says at least one image is required.
     #[test]
     fn describe_image_images_has_min_items_one() {
         let images = prop::<DescribeImageArgs>("images");
@@ -606,7 +621,7 @@ mod tests {
     }
 
     /// `max_image_dimension` must cap at 4096 in the schema, matching the prose
-    /// cap, on every tool that carries it (S14/F6): chat_completion,
+    /// cap, on every tool that carries it: chat_completion,
     /// generate_image, describe_image, and generate_video.
     #[test]
     fn max_image_dimension_caps_at_4096_in_schema() {
@@ -671,7 +686,7 @@ mod tests {
         );
     }
 
-    /// S16: "needs one of these sources" is schema-encoded as anyOf
+    /// "needs one of these sources" is schema-encoded as anyOf
     /// object-typed single-required branches on the NESTED ImageInput only.
     /// Tool-args roots must stay plain objects: a real client rejected a root
     /// anyOf as "a union with a non-object branch", so TranscribeAudioArgs

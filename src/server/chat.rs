@@ -20,14 +20,14 @@ use crate::image_gen;
 use crate::openrouter::{JsonSchemaSpec, PdfOptions, Plugin, ResponseFormat, WebSearchOptions};
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::schema::{
-    RequireFields, clean_list, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, require_all,
-    scalarize_nullable,
+    RequireFields, clean_list, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, non_blank,
+    require_all, scalarize_nullable,
 };
 
 use super::OpenRouterServer;
 use super::image::{ImageInput, check_image_input, resolve_image_inputs};
 use super::media::{
-    AudioInput, FileInput, InputKind, VideoInput, check_audio_input, check_file_input,
+    AudioInput, FileInput, InputKind, VideoInput, check_audio_input, check_count, check_file_input,
     check_video_input, resolve_audio_inputs, resolve_file_inputs, resolve_video_inputs,
 };
 
@@ -103,7 +103,8 @@ pub(crate) struct ChatCompletionArgs {
     /// Presence penalty (-2 to 2): penalize tokens that appeared at all.
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub presence_penalty: Option<f64>,
-    /// Response verbosity: "low", "medium" or "high" (models that support it).
+    /// Response verbosity: "low", "medium", "high", "xhigh" or "max" (models
+    /// that support it).
     #[serde(default)]
     pub verbosity: Option<String>,
     /// true = ask for a JSON object reply (`response_format: {"type":
@@ -114,7 +115,8 @@ pub(crate) struct ChatCompletionArgs {
     /// A JSON Schema object the reply must conform to (structured outputs):
     /// sent as `response_format: {"type": "json_schema", "json_schema": {"name",
     /// "strict": true, "schema"}}`. The schema's top-level "title" becomes the
-    /// name (default "response"). Mutually exclusive with `json_mode`. Check
+    /// name, with characters outside A-Z, a-z, 0-9, `_` and `-` turned into `_`
+    /// and cut to 64 (default "response"). Mutually exclusive with `json_mode`. Check
     /// `supported_parameters` for "structured_outputs" / "response_format".
     #[serde(default, deserialize_with = "de_lenient")]
     pub json_schema: BTreeMap<String, serde_json::Value>,
@@ -161,8 +163,9 @@ pub(crate) struct WebSearchArgs {
     /// also attaches it; false with other fields set is an error.
     #[serde(default, deserialize_with = "de_opt_bool")]
     pub enabled: Option<bool>,
-    /// Search engine: "native" (the provider's own built-in search) or "exa".
-    /// Omit to let OpenRouter pick (native when the model has one, else exa).
+    /// Search engine: "native" (the provider's own built-in search), "exa",
+    /// "firecrawl", "parallel" or "perplexity". Omit to let OpenRouter pick
+    /// (native when the model has one, else exa).
     #[serde(default)]
     pub engine: Option<String>,
     /// Plugin mode, passed through as documented by OpenRouter (e.g. "auto").
@@ -184,11 +187,6 @@ pub(crate) struct WebSearchArgs {
     /// (`web_search_options.search_context_size`; affects price).
     #[serde(default)]
     pub search_context_size: Option<String>,
-}
-
-/// Trim and drop blank strings (the repo-wide "blank means absent" rule).
-fn non_blank(s: Option<String>) -> Option<String> {
-    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 impl WebSearchArgs {
@@ -257,10 +255,9 @@ pub(crate) fn response_format(
     let name = json_schema
         .get("title")
         .and_then(|t| t.as_str())
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("response")
-        .to_string();
+        .map(schema_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "response".to_string());
     Ok(Some(ResponseFormat::JsonSchema {
         json_schema: JsonSchemaSpec {
             name,
@@ -268,6 +265,27 @@ pub(crate) fn response_format(
             schema: serde_json::Value::Object(json_schema.into_iter().collect()),
         },
     }))
+}
+
+/// Longest `response_format.json_schema.name` OpenRouter accepts.
+const MAX_SCHEMA_NAME_CHARS: usize = 64;
+
+/// A schema title made into a valid `json_schema.name`: OpenRouter allows only
+/// `[A-Za-z0-9_-]`, up to [`MAX_SCHEMA_NAME_CHARS`], so other characters
+/// become `_` and the rest is cut. Empty when the title is blank.
+fn schema_name(title: &str) -> String {
+    title
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_SCHEMA_NAME_CHARS)
+        .collect()
 }
 
 /// `pdf_engine` -> the file-parser plugin entry; `None` when unset.
@@ -439,38 +457,29 @@ impl OpenRouterServer {
         let plugins: Vec<Plugin> = web_plugin.into_iter().chain(pdf_plugin).collect();
         let provider = args.provider.into_routing()?;
 
-        // Validate each input's shape cheaply (no fetch) so a malformed entry
-        // reports the accurate "exactly one of ..." error rather than being
-        // masked by the capability gate below. Then gate each present kind on
-        // the model's declared capabilities before any network-bound
-        // resolution. All of it is skipped for text-only calls.
-        if !args.images.is_empty() {
-            for img in &args.images {
-                check_image_input(img)?;
+        // Every input's shape and count first (cheap, no fetch), so a
+        // malformed entry reports the accurate "exactly one of ..." error
+        // rather than being masked by the capability gate. Then one catalog
+        // lookup gates each present kind before any network-bound resolution.
+        // Text-only calls skip the lookup.
+        check_inputs(InputKind::Image, &args.images, check_image_input)?;
+        check_inputs(InputKind::File, &args.files, check_file_input)?;
+        check_inputs(InputKind::Audio, &args.audio, check_audio_input)?;
+        check_inputs(InputKind::Video, &args.videos, check_video_input)?;
+        let present_kinds: Vec<InputKind> = [
+            (InputKind::Image, args.images.is_empty()),
+            (InputKind::File, args.files.is_empty()),
+            (InputKind::Audio, args.audio.is_empty()),
+            (InputKind::Video, args.videos.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, empty)| (!empty).then_some(kind))
+        .collect();
+        if !present_kinds.is_empty() {
+            let modalities = self.input_modalities(&args.model).await;
+            for kind in present_kinds {
+                check_modality(&args.model, &modalities, kind)?;
             }
-            self.ensure_input_modality(&args.model, InputKind::Image)
-                .await?;
-        }
-        if !args.files.is_empty() {
-            for f in &args.files {
-                check_file_input(f)?;
-            }
-            self.ensure_input_modality(&args.model, InputKind::File)
-                .await?;
-        }
-        if !args.audio.is_empty() {
-            for a in &args.audio {
-                check_audio_input(a)?;
-            }
-            self.ensure_input_modality(&args.model, InputKind::Audio)
-                .await?;
-        }
-        if !args.videos.is_empty() {
-            for v in &args.videos {
-                check_video_input(v)?;
-            }
-            self.ensure_input_modality(&args.model, InputKind::Video)
-                .await?;
         }
         let images = resolve_image_inputs(args.images).await?;
         let files = resolve_file_inputs(args.files).await?;
@@ -484,11 +493,13 @@ impl OpenRouterServer {
         };
 
         let prompt = args.prompt.unwrap_or_default();
+        let system = non_blank(args.system);
+        let verbosity = non_blank(args.verbosity);
         let outcome = chat_gen::complete(
             &self.client,
             &chat_gen::ChatInputs {
                 model: &args.model,
-                system: args.system.as_deref(),
+                system: system.as_deref(),
                 prompt: &prompt,
                 temperature: args.temperature,
                 max_tokens: args.max_tokens,
@@ -506,7 +517,7 @@ impl OpenRouterServer {
                 stop: &args.stop,
                 frequency_penalty: args.frequency_penalty,
                 presence_penalty: args.presence_penalty,
-                verbosity: args.verbosity.as_deref(),
+                verbosity: verbosity.as_deref(),
                 response_format,
                 plugins,
                 web_search_options,
@@ -532,78 +543,87 @@ impl OpenRouterServer {
             })
     }
 
-    /// The shared tail of `chat_completion` and `describe_image`: record the
-    /// outcome in the usage stats, then render the text plus the metadata
-    /// block (generation id, reasoning, citations, truncation) on success or
-    /// the upstream error on failure. Success is recorded only here, after the
-    /// text was actually extracted - an empty reply is a failure.
+    /// The shared tail of `chat_completion` and `describe_image`: the text,
+    /// then the metadata block (generation id, reasoning, citations,
+    /// truncation) when there is one. An empty reply is already a failure.
     pub(crate) async fn finish_chat_call(
         &self,
         model: &str,
         outcome: anyhow::Result<chat_gen::ChatResult>,
     ) -> Result<CallToolResult, ErrorData> {
-        match outcome {
-            Ok(result) => {
-                self.stats.record_text(model, result.cost).await;
+        self.finish_text_call(
+            model,
+            outcome,
+            |r| r.cost,
+            |result| {
                 let meta = result_meta(&result);
                 let mut blocks = vec![ContentBlock::text(result.text)];
                 blocks.extend(meta.map(ContentBlock::text));
                 Ok(CallToolResult::success(blocks))
-            }
-            Err(e) => {
-                self.stats.record_text_failure(model, &e).await;
-                Err(ErrorData::internal_error(format!("{e:#}"), None))
-            }
-        }
+            },
+        )
+        .await
     }
 
-    /// Best-effort early rejection when `model` is *known* not to accept
-    /// `kind` input (image, file, audio, video). The model's input modalities
-    /// are looked up via list_models and cached (after the first call
-    /// completes; a burst of concurrent first-time calls for the same model
-    /// may each fetch).
+    /// The model's input modalities (e.g. `["text", "image"]`), looked up via
+    /// list_models and cached (after the first call completes; a burst of
+    /// concurrent first-time calls for the same model may each fetch). Empty
+    /// means unknown.
     ///
     /// This is deliberately fail-open: the lookup is a fuzzy catalog search, so
     /// if it errors (network blip, an id the search doesn't surface, a routing-
     /// suffixed id like `:nitro`/`:floor`) or reports no modality metadata, the
-    /// request is allowed through and the actual `/chat/completions` call remains
-    /// the authority on compatibility. We reject only when the catalog positively
-    /// reports input modalities that don't include `kind` — the common, clear
-    /// case (e.g. sending an image to a text-only model).
-    async fn ensure_input_modality(&self, model: &str, kind: InputKind) -> Result<(), ErrorData> {
-        let cached = self.model_caps.lock().await.get(model).cloned();
-        let modalities = match cached {
-            Some(cached) => cached,
-            None => match self.client.model_input_modalities(model).await {
-                Ok(modalities) => {
-                    // Cache only a definite answer; an empty list means "unknown"
-                    // (missing/lagging catalog metadata) and must not be pinned for
-                    // the process lifetime.
-                    if !modalities.is_empty() {
-                        self.model_caps
-                            .lock()
-                            .await
-                            .insert(model.to_string(), modalities.clone());
-                    }
-                    modalities
-                }
-                // Capabilities couldn't be verified — don't block a possibly-valid call.
-                Err(_) => return Ok(()),
-            },
-        };
-        let noun = kind.noun();
-        if !modalities.is_empty() && !modalities.iter().any(|m| m == noun) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "model '{model}' does not accept {noun} input (input modalities: [{}]). \
-                     Use list_models with input_modalities={noun} to find a model that does.",
-                    modalities.join(", ")
-                ),
-                None,
-            ));
+    /// answer is "unknown" and the actual `/chat/completions` call remains the
+    /// authority on compatibility.
+    async fn input_modalities(&self, model: &str) -> Vec<String> {
+        if let Some(cached) = self.model_caps.lock().await.get(model).cloned() {
+            return cached;
         }
-        Ok(())
+        let modalities = self
+            .client
+            .model_input_modalities(model)
+            .await
+            .unwrap_or_default();
+        // Cache only a definite answer; an empty list means "unknown"
+        // (missing/lagging catalog metadata) and must not be pinned for the
+        // process lifetime.
+        if !modalities.is_empty() {
+            self.model_caps
+                .lock()
+                .await
+                .insert(model.to_string(), modalities.clone());
+        }
+        modalities
     }
+}
+
+/// Every entry of one input list, checked locally: the count cap, then each
+/// entry's shape.
+fn check_inputs<T>(
+    kind: InputKind,
+    inputs: &[T],
+    check: fn(&T) -> Result<(), ErrorData>,
+) -> Result<(), ErrorData> {
+    check_count(kind, inputs.len())?;
+    inputs.iter().try_for_each(check)
+}
+
+/// Reject `kind` input only when the catalog *positively* reports input
+/// modalities that don't include it - the common, clear case (e.g. an image
+/// sent to a text-only model). Unknown (empty) modalities let the call through.
+fn check_modality(model: &str, modalities: &[String], kind: InputKind) -> Result<(), ErrorData> {
+    let noun = kind.noun();
+    if !modalities.is_empty() && !modalities.iter().any(|m| m == noun) {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "model '{model}' does not accept {noun} input (input modalities: [{}]). \
+                 Use list_models with input_modalities={noun} to find a model that does.",
+                modalities.join(", ")
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -819,6 +839,20 @@ mod tests {
         }
     }
 
+    /// Whitespace is the content of a stop sequence, so `"\n"` reaches the wire.
+    /// Only the empty string, which can match nothing, is dropped.
+    #[tokio::test]
+    async fn chat_completion_keeps_whitespace_stop_sequences() {
+        let mock = mock_chat(serde_json::json!({"stop": ["\n", "\n\n"]})).await;
+        server_for(mock.uri())
+            .chat_completion(Parameters(ChatCompletionArgs {
+                stop: vec!["\n".to_string(), String::new(), "\n\n".to_string()],
+                ..args("m", "hi")
+            }))
+            .await
+            .expect("the stop sequences must match the mock");
+    }
+
     /// Routing goes out as `provider` with the exact keys OpenRouter documents
     /// for chat; the block arrives the way a client sends it (lenient path).
     #[tokio::test]
@@ -848,6 +882,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("sort"), "got: {}", err.message);
+    }
+
+    /// OpenRouter limits `json_schema.name` to `[A-Za-z0-9_-]{1,64}`; a
+    /// human title is made to fit instead of failing upstream.
+    #[test]
+    fn json_schema_name_is_made_valid_from_the_title() {
+        let name = |title: serde_json::Value| {
+            let schema = BTreeMap::from([("title".to_string(), title)]);
+            match response_format(None, schema).unwrap() {
+                Some(ResponseFormat::JsonSchema { json_schema }) => json_schema.name,
+                other => panic!("expected a json_schema format, got {other:?}"),
+            }
+        };
+        assert_eq!(name(serde_json::json!("Weather Report")), "Weather_Report");
+        assert_eq!(name(serde_json::json!("math-answer_2")), "math-answer_2");
+        assert_eq!(name(serde_json::json!("x".repeat(80))).len(), 64);
+        assert_eq!(name(serde_json::json!("  ")), "response");
+        assert_eq!(name(serde_json::json!(42)), "response");
     }
 
     #[tokio::test]
@@ -1015,8 +1067,6 @@ mod tests {
         );
     }
 
-    /// Reasoning text, web citations, a truncation finish_reason and the token
-    /// counts come back in a second JSON block; the reply stays block 0.
     /// OpenRouter rejects a decisions model on `/chat/completions` with a 400
     /// naming it as such; the error keeps the upstream text and points at
     /// `make_decisions`. Other 400s get no hint.
@@ -1050,6 +1100,8 @@ mod tests {
         assert!(!err.message.contains("make_decisions"), "{}", err.message);
     }
 
+    /// Reasoning text, web citations, a truncation finish_reason and the token
+    /// counts come back in a second JSON block; the reply stays block 0.
     #[tokio::test]
     async fn chat_completion_surfaces_reasoning_annotations_and_truncation() {
         let mock = MockServer::start().await;
@@ -1131,7 +1183,7 @@ mod tests {
     }
 
     /// chat_completion writes nothing (like describe_image/transcribe_audio), so
-    /// its tools/list annotation must say so (S11).
+    /// its tools/list annotation must say so.
     #[test]
     fn chat_completion_is_annotated_read_only() {
         let server = server_for("http://127.0.0.1:9".to_string());
@@ -1300,7 +1352,7 @@ mod tests {
                     {"type": "file", "file": {"filename": "doc.pdf"}},
                     {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}},
                     {"type": "video_url", "video_url": {
-                        "url": "https://example.com/v.mp4", "processing": "low"}}
+                        "url": "https://example.com/v.mp4", "processing": "agentic"}}
                 ]}]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1316,7 +1368,7 @@ mod tests {
             "images": [{"base64": valid_png_b64()}],
             "files": [{"base64": pdf_b64, "filename": "doc.pdf"}],
             "audio": [{"base64": "data:audio/mp3;base64,QUJD"}],
-            "videos": [{"url": "https://example.com/v.mp4", "processing": "low"}]
+            "videos": [{"url": "https://example.com/v.mp4", "processing": "agentic"}]
         }))
         .unwrap();
         let res = server_for(mock.uri())
@@ -1346,6 +1398,58 @@ mod tests {
             "{}",
             parts[2]
         );
+    }
+
+    /// Every input is checked locally before the capability gate, so a
+    /// malformed later list is reported even when an earlier kind would fail
+    /// the gate. The catalog is asked once per call, however many kinds are
+    /// present, even when its answer is "unknown" and so is not cached.
+    #[tokio::test]
+    async fn chat_completion_checks_all_inputs_before_one_catalog_lookup() {
+        let mock = MockServer::start().await;
+        mock_model_modalities(&mock, "text/only", &["text"]).await;
+        let server = server_for(mock.uri());
+        let malformed: ChatCompletionArgs = serde_json::from_value(serde_json::json!({
+            "model": "text/only", "prompt": "hi",
+            "images": [{"base64": valid_png_b64()}],
+            "files": [{"filename": "a.pdf"}]
+        }))
+        .unwrap();
+        let err = server
+            .chat_completion(Parameters(malformed))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exactly one of"), "{}", err.message);
+        assert!(mock.received_requests().await.unwrap().is_empty());
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "obscure/model" }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            })))
+            .mount(&mock)
+            .await;
+        let all_kinds: ChatCompletionArgs = serde_json::from_value(serde_json::json!({
+            "model": "obscure/model", "prompt": "hi",
+            "images": [{"base64": valid_png_b64()}],
+            "files": [{"base64": "JVBERi0=", "filename": "a.pdf"}],
+            "audio": [{"base64": "QUJD", "format": "mp3"}],
+            "videos": [{"url": "https://example.com/v.mp4"}]
+        }))
+        .unwrap();
+        server_for(mock.uri())
+            .chat_completion(Parameters(all_kinds))
+            .await
+            .unwrap();
     }
 
     /// The capability gate is per kind: a model whose catalog entry lists only

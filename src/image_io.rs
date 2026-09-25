@@ -1,41 +1,12 @@
-//! Image byte helpers: decode base64 and `data:` URLs (inputs, and the
-//! `b64_json` OpenRouter returns), map MIME types to file extensions, read
-//! image dimensions, and normalize inputs for upload.
+//! Image byte helpers: map MIME types to file extensions, read image
+//! dimensions, and normalize inputs for upload. The base64 and `data:` URL
+//! codec they share with audio and file inputs is [`crate::base64_codec`].
 //!
 //! The output format is provider-chosen and not stable (the same model has
 //! returned both JPEG and PNG for identical requests), so the format is always
 //! sniffed from the response rather than assumed.
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-
-/// Parse a `data:image/<mime>;base64,<data>` URL into `(mime, bytes)`.
-pub fn parse_data_url(url: &str) -> Result<(String, Vec<u8>)> {
-    let (mime, data) = split_data_url(url)?;
-    let bytes = decode_base64(data).context("failed to base64-decode data URL")?;
-    Ok((mime.to_string(), bytes))
-}
-
-/// Split a `data:<mime>[;<param>...];base64,<data>` URL into its MIME type and
-/// still-encoded payload. Shared by every inline input (image and audio) so
-/// they agree on what counts as a base64 data URL.
-pub fn split_data_url(url: &str) -> Result<(&str, &str)> {
-    let rest = url
-        .trim()
-        .strip_prefix("data:")
-        .context("not a data URL (missing `data:` prefix)")?;
-    let (meta, data) = rest
-        .split_once(',')
-        .context("malformed data URL (missing comma)")?;
-    if !meta
-        .split(';')
-        .any(|part| part.trim().eq_ignore_ascii_case("base64"))
-    {
-        bail!("unsupported data URL: not base64-encoded");
-    }
-    let mime = meta.split(';').next().unwrap_or_default().trim();
-    Ok((mime, data))
-}
 
 /// Decode an input image (png/jpeg/webp/gif), downscale so its longest side is
 /// at most `max_side` (aspect preserved), and re-encode as PNG bytes. PNG gives
@@ -126,11 +97,14 @@ pub fn svg_to_png(bytes: &[u8], max_side: u32) -> Result<RasterizedSvg> {
 
     let opt = svg_options();
     let tree = usvg::Tree::from_data(bytes, &opt).context("could not parse SVG")?;
-    let size = tree.size();
-    let (w, h) = (size.width(), size.height());
-    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
-        bail!("SVG has a degenerate size ({w}x{h})");
-    }
+    let Some((w, h)) = usable_size(&tree) else {
+        let size = tree.size();
+        bail!(
+            "SVG has a degenerate size ({}x{})",
+            size.width(),
+            size.height()
+        );
+    };
 
     let scale = f64::from(max_side) / f64::from(w.max(h));
     let out_w = ((f64::from(w) * scale).round() as u32).max(1);
@@ -154,15 +128,6 @@ pub fn svg_to_png(bytes: &[u8], max_side: u32) -> Result<RasterizedSvg> {
     })
 }
 
-/// Build a `data:<mime>;base64,...` URL from encoded image bytes (for sending
-/// inputs).
-pub fn data_url(bytes: &[u8], mime: &str) -> String {
-    format!(
-        "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    )
-}
-
 /// File extension for an image MIME type. Falls back to `bin` for unknowns.
 pub fn extension_for(mime: &str) -> &'static str {
     match mime {
@@ -172,86 +137,6 @@ pub fn extension_for(mime: &str) -> &'static str {
         "image/gif" => "gif",
         "image/svg+xml" => "svg",
         _ => "bin",
-    }
-}
-
-/// Decode raw base64 bytes (no `data:` prefix). Lenient on purpose: interior
-/// whitespace (line-wrapping encoders such as `base64 file`) is ignored and
-/// padding is optional, since inline payloads are often hand-assembled and the
-/// bytes, not the encoding style, are what matters.
-pub fn decode_base64(data: &str) -> Result<Vec<u8>> {
-    LENIENT_BASE64
-        .decode(compact_base64(data).as_bytes())
-        .context("failed to base64-decode data")
-}
-
-/// Standard alphabet, whitespace already removed by [`compact_base64`],
-/// padding accepted but not required.
-const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
-    &base64::alphabet::STANDARD,
-    base64::engine::general_purpose::PAD
-        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
-);
-
-/// Reassemble bytes from base64 fragments that arrive one at a time (a
-/// streamed `delta.audio.data`), without assuming how the sender split them.
-/// A fragment that ends in `=` padding was encoded on its own and is decoded
-/// on its own - padding cannot appear mid-string, so concatenating it with the
-/// next fragment would fail. An unpadded fragment may be an arbitrary cut of
-/// one long encoding, so only whole 4-character groups are decoded and the
-/// remainder waits for the next fragment. Decoding as fragments arrive also
-/// keeps the buffered form at the size of the bytes, not 4/3 of it.
-#[derive(Debug, Default)]
-pub struct Base64Assembler {
-    /// Characters not yet decodable: fewer than one whole group.
-    pending: Vec<u8>,
-    bytes: Vec<u8>,
-}
-
-impl Base64Assembler {
-    /// Append one fragment (whitespace ignored) and decode what is decodable.
-    pub fn push(&mut self, fragment: &str) -> Result<()> {
-        let fragment = compact_base64(fragment);
-        self.pending.extend_from_slice(fragment.as_bytes());
-        // A padded fragment is self-contained once it is whole groups; a cut
-        // inside the padding run ("Mg=" then "=") waits for the rest of it.
-        let decodable = if fragment.ends_with('=') && self.pending.len().is_multiple_of(4) {
-            self.pending.len()
-        } else {
-            self.pending.len() / 4 * 4
-        };
-        if decodable > 0 {
-            self.decode_pending(decodable)?;
-        }
-        Ok(())
-    }
-
-    /// Decode whatever remains (a final partial group, padding optional) and
-    /// return every byte assembled so far.
-    pub fn finish(mut self) -> Result<Vec<u8>> {
-        if !self.pending.is_empty() {
-            self.decode_pending(self.pending.len())?;
-        }
-        Ok(self.bytes)
-    }
-
-    fn decode_pending(&mut self, len: usize) -> Result<()> {
-        let decoded = LENIENT_BASE64
-            .decode(&self.pending[..len])
-            .context("failed to base64-decode data")?;
-        self.bytes.extend_from_slice(&decoded);
-        self.pending.drain(..len);
-        Ok(())
-    }
-}
-
-/// `data` with ASCII whitespace removed, borrowed when there was none.
-pub fn compact_base64(data: &str) -> std::borrow::Cow<'_, str> {
-    let data = data.trim();
-    if data.bytes().any(|b| b.is_ascii_whitespace()) {
-        std::borrow::Cow::Owned(data.chars().filter(|c| !c.is_ascii_whitespace()).collect())
-    } else {
-        std::borrow::Cow::Borrowed(data)
     }
 }
 
@@ -274,12 +159,15 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
 pub fn svg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     use resvg::usvg;
     let tree = usvg::Tree::from_data(bytes, &svg_options()).ok()?;
+    let (w, h) = usable_size(&tree)?;
+    Some((w.round() as u32, h.round() as u32))
+}
+
+/// An SVG document's size, when it is finite and positive on both axes.
+fn usable_size(tree: &resvg::usvg::Tree) -> Option<(f32, f32)> {
     let size = tree.size();
     let (w, h) = (size.width(), size.height());
-    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    Some((w.round() as u32, h.round() as u32))
+    (w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0).then_some((w, h))
 }
 
 /// Apply the same resource policy to top-level and embedded SVG documents.
@@ -335,14 +223,37 @@ pub fn aspect_matches(requested: &str, width: u32, height: u32) -> Option<bool> 
     Some((requested - actual).abs() / requested <= 0.04)
 }
 
-/// Nearest standard resolution tier (`0.5K`/`1K`/`2K`/`4K`) for the longest side.
+/// OpenRouter's image `resolution` tiers (`512`, `768`, `1K`, `2K`, `4K` in
+/// its enum) with their longest side in pixels. `512` is labelled `0.5K`,
+/// the spelling the tools also accept.
+const SIZE_TIERS: [(&str, u32); 5] = [
+    ("0.5K", 512),
+    ("768", 768),
+    ("1K", 1024),
+    ("2K", 2048),
+    ("4K", 4096),
+];
+
+/// Nearest standard resolution tier (see [`SIZE_TIERS`]) for the longest side.
 pub fn classify_image_size(longest_side: u32) -> &'static str {
-    const TIERS: [(&str, u32); 4] = [("0.5K", 512), ("1K", 1024), ("2K", 2048), ("4K", 4096)];
-    TIERS
+    SIZE_TIERS
         .iter()
         .min_by_key(|(_, px)| px.abs_diff(longest_side))
         .map(|(tier, _)| *tier)
         .unwrap_or("1K")
+}
+
+/// The longest side of a requested tier, under either spelling of 512
+/// (`"512"` on the wire, `"0.5K"`); `None` for a value that is not a tier.
+fn tier_pixels(tier: &str) -> Option<u32> {
+    let tier = tier.trim();
+    if tier == "512" {
+        return Some(512);
+    }
+    SIZE_TIERS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tier))
+        .map(|(_, px)| *px)
 }
 
 /// Result of verifying a generated image's dimensions against the request.
@@ -375,7 +286,7 @@ pub fn check_dimensions(
         ));
     }
     if let Some(req) = requested_size
-        && !req.eq_ignore_ascii_case(actual_image_size)
+        && tier_pixels(req) != tier_pixels(actual_image_size)
     {
         warnings.push(format!(
             "requested image_size {req} but image is ~{actual_image_size} ({}px)",
@@ -393,29 +304,10 @@ pub fn check_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     // A 1x1 transparent PNG.
     const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
-
-    #[test]
-    fn parse_data_url_extracts_mime_and_bytes() {
-        let url = format!("data:image/png;base64,{PNG_1X1_B64}");
-        let (mime, bytes) = parse_data_url(&url).unwrap();
-        assert_eq!(mime, "image/png");
-        assert!(!bytes.is_empty());
-        assert_eq!(&bytes[1..4], b"PNG");
-    }
-
-    #[test]
-    fn parse_data_url_rejects_non_data_and_non_base64() {
-        assert!(parse_data_url("https://example.com/x.png").is_err());
-        assert!(parse_data_url("data:image/png,notbase64").is_err());
-        // Parameter order, case and spacing around the base64 marker vary.
-        assert_eq!(
-            split_data_url(" data:audio/mp3;charset=x; BASE64,QUJD ").unwrap(),
-            ("audio/mp3", "QUJD")
-        );
-    }
 
     const SVG_200X100: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100" fill="#1e50a0"/></svg>"##;
 
@@ -466,58 +358,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_base64_reads_raw_png_bytes() {
-        let bytes = decode_base64(PNG_1X1_B64).unwrap();
-        assert_eq!(&bytes[1..4], b"PNG");
-        assert!(decode_base64("!!!not base64!!!").is_err());
-        // Line-wrapped and unpadded encodings decode to the same bytes.
-        assert_eq!(decode_base64("QUJD\nRA==").unwrap(), b"ABCD");
-        assert_eq!(decode_base64("QUJDRA").unwrap(), b"ABCD");
-        assert_eq!(compact_base64(" QUJD\r\nRA== "), "QUJDRA==");
-        assert!(matches!(
-            compact_base64("QUJD"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn base64_assembler_handles_padded_fragments_and_arbitrary_cuts() {
-        // Independently encoded fragments, each padded: the concatenation
-        // "SUQzAwAAAAAvMg==AAAA" is not valid base64, but the bytes are.
-        let mut a = Base64Assembler::default();
-        a.push("SUQzAwAAAAAvMg==").unwrap();
-        a.push("AAAA").unwrap();
-        a.push("/w==").unwrap();
-        assert_eq!(
-            a.finish().unwrap(),
-            b"ID3\x03\x00\x00\x00\x00/2\x00\x00\x00\xff"
-        );
-
-        // One long encoding cut at arbitrary (non-group) positions.
-        let whole = "SUQzAwAAAAAvMg==";
-        for cut in 0..whole.len() {
-            let mut a = Base64Assembler::default();
-            a.push(&whole[..cut]).unwrap();
-            a.push(&whole[cut..]).unwrap();
-            assert_eq!(
-                a.finish().unwrap(),
-                b"ID3\x03\x00\x00\x00\x00/2",
-                "cut {cut}"
-            );
-        }
-
-        // Whitespace and a missing final padding are tolerated; garbage is not.
-        let mut a = Base64Assembler::default();
-        a.push(" QUJD\n").unwrap();
-        a.push("RA").unwrap();
-        assert_eq!(a.finish().unwrap(), b"ABCD");
-        assert_eq!(Base64Assembler::default().finish().unwrap(), b"");
-        assert!(Base64Assembler::default().push("!!!!").is_err());
-    }
-
-    #[test]
     fn sniff_mime_identifies_raster_and_skips_svg() {
-        let png = decode_base64(PNG_1X1_B64).unwrap();
+        let png = crate::base64_codec::decode_base64(PNG_1X1_B64).unwrap();
         assert_eq!(sniff_mime(&png), Some("image/png"));
         // SVG is not a raster format the `image` crate recognizes.
         assert_eq!(sniff_mime(SVG_200X100.as_bytes()), None);
@@ -526,7 +368,7 @@ mod tests {
     #[test]
     fn svg_dimensions_reads_viewbox_and_rejects_raster() {
         assert_eq!(svg_dimensions(SVG_200X100.as_bytes()), Some((200, 100)));
-        let png = decode_base64(PNG_1X1_B64).unwrap();
+        let png = crate::base64_codec::decode_base64(PNG_1X1_B64).unwrap();
         assert_eq!(svg_dimensions(&png), None);
     }
 
@@ -556,12 +398,6 @@ mod tests {
         img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
         let png = normalize_to_png(buf.get_ref(), 800).unwrap();
         assert_eq!(decode_dimensions(&png).unwrap(), (2, 2));
-    }
-
-    #[test]
-    fn data_url_has_mime_prefix() {
-        assert!(data_url(&[1, 2, 3], "image/png").starts_with("data:image/png;base64,"));
-        assert!(data_url(&[1, 2, 3], "image/jpeg").starts_with("data:image/jpeg;base64,"));
     }
 
     #[test]
@@ -603,6 +439,31 @@ mod tests {
         let check = check_dimensions(1024, 1024, Some("1:1"), Some("1K"));
         assert!(check.warnings.is_empty());
     }
+
+    /// Every tier in OpenRouter's `resolution` enum (512, 768, 1K, 2K, 4K),
+    /// under either of its spellings, matches an image of that size.
+    #[test]
+    fn check_dimensions_accepts_every_tier_spelling() {
+        for (side, requested) in [
+            (512, "512"),
+            (512, "0.5K"),
+            (768, "768"),
+            (1024, "1k"),
+            (2048, "2K"),
+            (4096, "4K"),
+        ] {
+            let check = check_dimensions(side, side, None, Some(requested));
+            assert!(
+                check.warnings.is_empty(),
+                "{requested}: {:?}",
+                check.warnings
+            );
+        }
+        assert_eq!(classify_image_size(768), "768");
+        assert_eq!(classify_image_size(512), "0.5K");
+        let check = check_dimensions(512, 512, None, Some("1K"));
+        assert_eq!(check.warnings.len(), 1, "a real mismatch still warns");
+    }
 }
 
 #[cfg(test)]
@@ -627,7 +488,10 @@ mod audit_regression {
                 .to_str()
                 .unwrap(),
         );
-        let nested = wrap(&data_url(absolute.as_bytes(), "image/svg+xml"));
+        let nested = wrap(&crate::base64_codec::data_url(
+            absolute.as_bytes(),
+            "image/svg+xml",
+        ));
         for input in [&absolute, &relative, &nested] {
             assert_eq!(svg_dimensions(input.as_bytes()), Some((4, 4)));
             let png = svg_to_png(input.as_bytes(), 4).unwrap().png;
@@ -635,7 +499,10 @@ mod audit_regression {
             assert!(pixels.pixels().all(|p| p.0[3] == 0));
         }
         // Data references remain usable, including nested vector content.
-        let embedded = wrap(&data_url(red.as_bytes(), "image/svg+xml"));
+        let embedded = wrap(&crate::base64_codec::data_url(
+            red.as_bytes(),
+            "image/svg+xml",
+        ));
         let png = svg_to_png(embedded.as_bytes(), 4).unwrap().png;
         assert_eq!(
             image::load_from_memory(&png)
