@@ -24,8 +24,8 @@ permissions: {}
 # `contents: write` and produces the binary users install, so a moved tag on any
 # of these would be a direct path into a shipped artifact. actions/* are
 # first-party and keep a floating major tag.
-#   dtolnay/rust-toolchain@master      -> 6c977a6 (2026-08)
-#   Swatinem/rust-cache@v2.9.2         -> 6323deb
+#   dtolnay/rust-toolchain@master      -> 683b588 (2026-10)
+#   Swatinem/rust-cache@v2.9.3         -> d1527c8
 #   softprops/action-gh-release@v3.0.2 -> 3d0d988
 
 jobs:
@@ -67,12 +67,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
           targets: ${{ matrix.targets }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
 
       - uses: actions/setup-node@v7
         with:

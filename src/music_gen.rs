@@ -32,8 +32,8 @@ pub struct MusicGenRequest {
     /// only when set; whether a model honors it is model-specific.
     pub format: Option<String>,
     pub seed: Option<u64>,
-    /// Provider routing, already validated. Music is a chat call, so it takes
-    /// the routing block and no per-provider `options` passthrough.
+    /// Provider routing and per-provider `options`, already validated. Music is
+    /// a chat call, so it takes the chat routing block.
     pub provider: Option<ProviderRouting>,
 }
 

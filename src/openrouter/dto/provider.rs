@@ -1,16 +1,17 @@
 //! The `provider` request block OpenRouter accepts on its POST endpoints.
 //!
-//! Three shapes, because the OpenAPI specs differ per endpoint and the chat
+//! Four shapes, because the OpenAPI specs differ per endpoint and the chat
 //! family declares its block `additionalProperties: false`, so the *type* has
 //! to decide what may be sent:
 //!
 //! - [`ProviderRouting`] - chat completions, `/embeddings`, `/rerank` and
-//!   `/api/alpha/decisions`: routing fields only. There is no `options`
-//!   passthrough on these endpoints.
+//!   `/api/alpha/decisions` (`ProviderPreferences`): routing fields plus
+//!   `options`.
 //! - [`ImageProvider`] - `/images`: the routing subset OpenRouter documents
 //!   there (`order`, `only`, `ignore`, `allow_fallbacks`, `sort`) plus `options`.
-//! - [`ProviderOptions`] - `/audio/speech`, `/audio/transcriptions`, `/videos`:
-//!   `options` only; routing is documented as ignored on these endpoints.
+//! - [`AudioProvider`] - `/audio/speech`, `/audio/transcriptions`: the
+//!   data-policy keys (`zdr`, `data_collection`) plus `options`.
+//! - [`ProviderOptions`] - `/videos`: `options` only.
 //!
 //! `options` is keyed by provider slug (`"deepgram": {"diarize": true}`). Only
 //! the slug that serves the request is forwarded; unknown keys are dropped
@@ -23,7 +24,8 @@
 //! Routing vocabulary is the subset users reach for (YAGNI): `order`, `only`,
 //! `ignore`, `allow_fallbacks`, `require_parameters`, `zdr`, `sort`. The rest of
 //! OpenRouter's `ProviderPreferences` (quantizations, max_price, preferred_*,
-//! data_collection, enforce_distillable_text) is added on demand.
+//! data_collection, enforce_distillable_text) is added on demand; the audio
+//! endpoints document `data_collection` in their own block, so it is there.
 
 use std::collections::BTreeMap;
 
@@ -40,8 +42,8 @@ pub enum ProviderSort {
     Partitioned { by: String, partition: String },
 }
 
-/// Routing-only block for chat completions, `/embeddings`, `/rerank` and
-/// `/api/alpha/decisions`.
+/// Routing block for chat completions, `/embeddings`, `/rerank` and
+/// `/api/alpha/decisions`: routing fields plus per-provider passthrough.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProviderRouting {
     /// Provider slugs to try in order; disables load balancing.
@@ -63,6 +65,8 @@ pub struct ProviderRouting {
     pub zdr: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort: Option<ProviderSort>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: ProviderOptionsMap,
 }
 
 impl ProviderRouting {
@@ -95,7 +99,28 @@ impl ImageProvider {
     }
 }
 
-/// Passthrough-only block for the endpoints where OpenRouter ignores routing.
+/// The `/audio/speech` and `/audio/transcriptions` block: data-policy routing
+/// plus passthrough.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AudioProvider {
+    /// Zero-data-retention endpoints only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zdr: Option<bool>,
+    /// `"allow"` or `"deny"`; `deny` routes only to providers that do not
+    /// store user data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_collection: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: ProviderOptionsMap,
+}
+
+impl AudioProvider {
+    pub fn non_empty(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
+}
+
+/// Passthrough-only block for `/videos`, where OpenRouter takes no routing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProviderOptions {
     pub options: ProviderOptionsMap,
@@ -129,8 +154,9 @@ mod tests {
         assert_eq!(ProviderOptions::default().non_empty(), None);
     }
 
-    /// Locks the documented chat/embeddings/rerank wire shape: snake_case
-    /// names, string sort, and - because that schema is closed - no `options`.
+    /// Locks the documented chat/embeddings/rerank/decisions wire shape
+    /// (`ProviderPreferences`): snake_case names, string sort, and `options`
+    /// keyed by provider slug, omitted when empty.
     #[test]
     fn routing_matches_the_documented_wire_shape() {
         let p = ProviderRouting {
@@ -141,6 +167,7 @@ mod tests {
             require_parameters: Some(true),
             zdr: Some(true),
             sort: Some(ProviderSort::By("price".into())),
+            options: options("anthropic", json!({"max_tokens": 100})),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -151,10 +178,18 @@ mod tests {
                 "allow_fallbacks": false,
                 "require_parameters": true,
                 "zdr": true,
-                "sort": "price"
+                "sort": "price",
+                "options": {"anthropic": {"max_tokens": 100}}
             })
         );
-        assert!(v.get("options").is_none());
+        let no_options = ProviderRouting {
+            zdr: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&no_options).unwrap(),
+            json!({"zdr": true})
+        );
     }
 
     #[test]
@@ -186,6 +221,24 @@ mod tests {
                 "options": {"black-forest-labs": {"steps": 28, "guidance": 3.5}}
             })
         );
+    }
+
+    #[test]
+    fn audio_provider_emits_data_policy_and_options_and_drops_when_empty() {
+        let p = AudioProvider {
+            zdr: Some(true),
+            data_collection: Some("deny".into()),
+            options: options("deepgram", json!({"diarize": true})),
+        };
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({
+                "zdr": true,
+                "data_collection": "deny",
+                "options": {"deepgram": {"diarize": true}}
+            })
+        );
+        assert_eq!(AudioProvider::default().non_empty(), None);
     }
 
     #[test]

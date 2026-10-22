@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::audio_gen::{self, SpeechGenRequest};
 use crate::server::naming;
-use crate::server::provider::ProviderOptionsArgs;
+use crate::server::provider::AudioProviderArgs;
 use crate::server::result::{
     attach_warnings_errors, client_wants_inline_previews, inline_audio_block, internal_error_from,
     invalid_params_from, json_text_result,
@@ -60,17 +60,16 @@ pub(crate) struct TranscribeAudioArgs {
     /// Sampling temperature (select providers only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
-    /// Provider block for this request: per-provider passthrough only, as
-    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// Provider block for this request: {"zdr": bool, "data_collection":
+    /// "allow"|"deny", "options": {"<provider-slug>": {...}}}; describe_model lists each
     /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
     /// request is forwarded. Speaker diarization:
     /// {"options": {"deepgram": {"diarize": true}}} or
     /// {"options": {"azure": {"diarization": {"enabled": true}}}}; with
     /// response_format="verbose_json" the segments/words then carry a "speaker"
     /// index. Groq takes vocabulary hints as {"options": {"groq": {"prompt": "..."}}}.
-    /// Routing fields are ignored by this endpoint.
     #[serde(default, deserialize_with = "de_lenient")]
-    pub provider: ProviderOptionsArgs,
+    pub provider: AudioProviderArgs,
 }
 
 /// Arguments for the `generate_audio` tool.
@@ -109,15 +108,14 @@ pub(crate) struct GenerateAudioArgs {
     /// improves cloning fidelity on models that use it. Needs `voice_reference`.
     #[serde(default)]
     pub voice_reference_text: Option<String>,
-    /// Provider block for this request: per-provider passthrough only, as
-    /// {"options": {"<provider-slug>": {...}}}; describe_model lists each
+    /// Provider block for this request: {"zdr": bool, "data_collection":
+    /// "allow"|"deny", "options": {"<provider-slug>": {...}}}; describe_model lists each
     /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
     /// request is forwarded. Examples: OpenAI speaking-style instructions
     /// {"options": {"openai": {"instructions": "speak like a calm narrator"}}};
     /// Azure style {"options": {"azure": {"style": "cheerful", "styledegree": 1.0}}}.
-    /// Routing fields are ignored by this endpoint.
     #[serde(default, deserialize_with = "de_lenient")]
-    pub provider: ProviderOptionsArgs,
+    pub provider: AudioProviderArgs,
     /// Output file path (extension corrected to the returned format, e.g. .mp3).
     /// Optional: when omitted, an auto-named file is written under
     /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
@@ -139,8 +137,9 @@ impl OpenRouterServer {
         pass the sample as `voice_reference` ({\"path\": ...} for a local file, or \
         {\"base64\": ..., \"format\"?: ...} for inline data or a data: URL; 15 MiB decoded max), \
         optionally with `voice_reference_text` (its transcript, max 10000 characters); it is \
-        sent as `input_references` and needs no `voice`. Provider-specific \
-        settings go in `provider.options` keyed by provider slug, e.g. \
+        sent as `input_references` and needs no `voice`. `provider.zdr` and \
+        `provider.data_collection` (\"allow\"/\"deny\") restrict routing by data policy. \
+        Provider-specific settings go in `provider.options` keyed by provider slug, e.g. \
         {\"openai\": {\"instructions\": \"speak like a calm narrator\"}} for OpenAI speaking-style \
         instructions or {\"azure\": {\"style\": \"cheerful\", \"styledegree\": 1.0}} for Azure \
         styles. `output` is optional - omit it for an auto-named file under \
@@ -186,7 +185,7 @@ impl OpenRouterServer {
         }
         require_all("generate_audio", "speech", &missing)?;
 
-        let provider = args.provider.into_options()?;
+        let provider = args.provider.into_audio_provider()?;
         let voice_reference =
             resolve_voice_reference(args.voice_reference, args.voice_reference_text).await?;
 
@@ -260,7 +259,9 @@ impl OpenRouterServer {
         reports a generation id, a second block carries {\"generation_id\"} for \
         get_generation. \
         timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
-        an OpenAI-compatible provider. Provider-specific settings go in `provider.options` keyed \
+        an OpenAI-compatible provider. `provider.zdr` and `provider.data_collection` \
+        (\"allow\"/\"deny\") restrict routing by data policy. Provider-specific settings go \
+        in `provider.options` keyed \
         by provider slug - e.g. speaker diarization with {\"deepgram\": {\"diarize\": true}} or \
         {\"azure\": {\"diarization\": {\"enabled\": true}}}; when the provider diarizes, \
         verbose_json segments and words carry a \"speaker\" index. Discover \
@@ -324,7 +325,7 @@ async fn resolve_transcribe_request(
         response_format: args.response_format,
         timestamp_granularities: args.timestamp_granularities,
         temperature: args.temperature,
-        provider: args.provider.into_options()?,
+        provider: args.provider.into_audio_provider()?,
     })
 }
 
@@ -675,11 +676,78 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "hello there");
     }
 
+    /// The data-policy keys reach `/audio/transcriptions` next to `options`.
+    #[tokio::test]
+    async fn transcribe_audio_forwards_data_policy_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "provider": { "zdr": true, "data_collection": "deny" }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })),
+            )
+            .mount(&mock)
+            .await;
+
+        let args: TranscribeAudioArgs = serde_json::from_value(serde_json::json!({
+            "model": "openai/whisper-1",
+            "base64": "data:audio/mp3;base64,QUJD",
+            "provider": { "zdr": "true", "data_collection": "deny" }
+        }))
+        .unwrap();
+        server_for(mock.uri())
+            .transcribe_audio(Parameters(args))
+            .await
+            .expect("zdr and data_collection must reach the wire");
+    }
+
+    /// The data-policy keys reach `/audio/speech` and the manifest records them.
+    #[tokio::test]
+    async fn generate_audio_forwards_data_policy_to_the_wire() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "provider": { "zdr": true, "data_collection": "allow" }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3-FAKE".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+
+        let out = std::env::temp_dir().join("openrouter-mcp-audio-policy/voice.mp3");
+        let mut args = speech_args(&out);
+        args.provider = serde_json::from_value(serde_json::json!({
+            "zdr": true, "data_collection": "Allow"
+        }))
+        .unwrap();
+        let res = server_for(mock.uri())
+            .run_generate_audio(args, false)
+            .await
+            .expect("zdr and data_collection must reach the wire");
+        let manifest_path = tool_result_json(&res)["manifest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["provider"]["data_collection"], "allow");
+    }
+
     /// The shared fixture later phases reuse produces exactly the block it
     /// promises, and an invalid block is rejected before any HTTP call.
     #[tokio::test]
     async fn transcribe_audio_uses_the_shared_provider_fixture_and_rejects_bad_options() {
-        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let (options, expected) = crate::server::test_support::provider_options_fixture();
+        let provider = AudioProviderArgs {
+            options,
+            ..Default::default()
+        };
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/audio/transcriptions"))
@@ -712,7 +780,10 @@ mod tests {
         options.insert("deepgram".to_string(), serde_json::json!("diarize"));
         let err = server
             .transcribe_audio(Parameters(args(
-                crate::server::provider::ProviderOptionsArgs { options },
+                crate::server::provider::AudioProviderArgs {
+                    options,
+                    ..Default::default()
+                },
             )))
             .await
             .unwrap_err();
@@ -734,10 +805,14 @@ mod tests {
     }
 
     /// The `provider.options` recipe from the tool description reaches the
-    /// wire under `provider`, via the shared fixture every options-only tool uses.
+    /// wire under `provider`, via the shared options fixture.
     #[tokio::test]
     async fn generate_audio_forwards_provider_options_to_the_wire() {
-        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let (options, expected) = crate::server::test_support::provider_options_fixture();
+        let provider = AudioProviderArgs {
+            options,
+            ..Default::default()
+        };
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/audio/speech"))
@@ -763,7 +838,10 @@ mod tests {
         let mut options = std::collections::BTreeMap::new();
         options.insert("openai".to_string(), serde_json::json!("cheerful"));
         let mut args = speech_args(&out);
-        args.provider = crate::server::provider::ProviderOptionsArgs { options };
+        args.provider = crate::server::provider::AudioProviderArgs {
+            options,
+            ..Default::default()
+        };
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("openai"), "got: {}", err.message);

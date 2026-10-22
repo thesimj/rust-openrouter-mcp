@@ -14,12 +14,13 @@ fn trim_num(v: f64) -> String {
 
 /// Known video SKU families, as `(factor to dollars, unit)`: `cents_*` and
 /// `second*` keys are quoted in cents, `duration_seconds` keys (bare or with a
-/// `text_to_video_`/`image_to_video_` task prefix) in dollars. Unknown names
-/// retain their names and raw rate.
+/// `text_to_video_`/`image_to_video_`/`reference_` prefix) and reference image
+/// keys in dollars. Unknown names retain their names and raw rate.
 fn video_unit(key: &str) -> Option<(f64, &'static str)> {
     let task_free = key
         .strip_prefix("text_to_video_")
         .or_else(|| key.strip_prefix("image_to_video_"))
+        .or_else(|| key.strip_prefix("reference_"))
         .unwrap_or(key);
     if key.starts_with("cents_per_megapixel_second") {
         Some((0.01, "/MP-s"))
@@ -32,6 +33,8 @@ fn video_unit(key: &str) -> Option<(f64, &'static str)> {
         || key == "per-video-second"
     {
         Some((0.01, "/s"))
+    } else if key == "reference_images" || key == "reference_input_images" {
+        Some((1.0, "/reference image"))
     } else if key == "cents_per_image_input" {
         Some((0.01, "/input image"))
     } else if key == "minimum_cents_per_generation" {
@@ -429,8 +432,10 @@ mod audit_regression {
         );
     }
 
-    /// SKU names seen live on `GET /videos/models` (2026-09-25): cents keys
-    /// are cents, and the task-prefixed duration keys are dollars per second.
+    /// SKU names seen live on `GET /videos/models` (2026-09-25, 2026-10-22):
+    /// cents keys are cents, and the task-prefixed and reference duration keys
+    /// are dollars per second. Reference image keys are dollars per image
+    /// (minimax/hailuo-3 page: "$0.04/image for Reference Image").
     #[test]
     fn video_rates_cover_the_live_sku_families() {
         for (key, raw, human) in [
@@ -441,6 +446,9 @@ mod audit_regression {
             ("text_to_video_duration_seconds_720p", "0.112", "$0.112/s"),
             ("image_to_video_duration_seconds_1080p", "0.084", "$0.084/s"),
             ("duration_seconds_with_audio_4k", "0.30", "$0.3/s"),
+            ("reference_duration_seconds_480p", "0.07", "$0.07/s"),
+            ("reference_images", "0.04", "$0.04/reference image"),
+            ("reference_input_images", "0.04", "$0.04/reference image"),
         ] {
             assert_eq!(humanize_price(key, raw).as_deref(), Some(human), "{key}");
         }

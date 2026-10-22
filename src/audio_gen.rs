@@ -14,7 +14,7 @@ use base64::Engine;
 
 use crate::manifest::{self, AudioManifest, AudioOutputMeta};
 use crate::openrouter::{
-    InputAudio, OpenRouterClient, ProviderOptions, SpeechBody, SpeechInputReference,
+    AudioProvider, InputAudio, OpenRouterClient, SpeechBody, SpeechInputReference,
     SpeechReferenceAudio, TranscriptionBody,
 };
 
@@ -71,8 +71,8 @@ pub struct TranscribeRequest {
     /// "segment"/"word"; verbose_json + OpenAI-compatible providers only.
     pub timestamp_granularities: Vec<String>,
     pub temperature: Option<f64>,
-    /// Per-provider passthrough (`provider.options.<slug>`), already validated.
-    pub provider: Option<ProviderOptions>,
+    /// Data policy and per-provider passthrough, already validated.
+    pub provider: Option<AudioProvider>,
 }
 
 /// A transcript plus the reported USD cost, when present. `verbose` carries the
@@ -316,8 +316,8 @@ pub struct SpeechGenRequest {
     pub speed: Option<f64>,
     /// Stateless voice-cloning sample, sent as `input_references`.
     pub voice_reference: Option<VoiceReference>,
-    /// Per-provider passthrough (`provider.options.<slug>`), already validated.
-    pub provider: Option<ProviderOptions>,
+    /// Data policy and per-provider passthrough, already validated.
+    pub provider: Option<AudioProvider>,
 }
 
 /// The saved audio file plus the metadata worth recording.
@@ -616,7 +616,10 @@ mod tests {
             voice_reference: Some(
                 VoiceReference::new("QUJD", Some("mpeg"), Some(" sample words ")).unwrap(),
             ),
-            provider: Some(ProviderOptions { options }),
+            provider: Some(AudioProvider {
+                options,
+                ..Default::default()
+            }),
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-ref/speech.mp3");
         let result = run_job(&client, &req, &base).await.unwrap();

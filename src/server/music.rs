@@ -49,11 +49,11 @@ pub(crate) struct GenerateMusicArgs {
     /// OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).
     #[serde(default)]
     pub output: Option<String>,
-    /// Provider block for this request: routing only, as {"order": [...],
-    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
-    /// "zdr", "sort", "sort_partition"}. Music is a chat completion, so there is
-    /// no per-provider `options` passthrough (describe_model's
-    /// allowed_passthrough_parameters do not apply here).
+    /// Provider block for this request: routing plus per-provider passthrough,
+    /// as {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks",
+    /// "require_parameters", "zdr", "sort", "sort_partition", "options":
+    /// {slug: {param: value}}} (see describe_model's
+    /// allowed_passthrough_parameters for what each provider accepts).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -74,9 +74,9 @@ impl OpenRouterServer {
         $0.08 per song); the actual charge comes back as cost_usd. Returns JSON with the saved \
         path, mime, the model's text (lyrics, or \"<instrumental>\"), cost_usd, \
         generation_id, and the manifest path; for sandboxed clients also an inline audio \
-        block when the file is small enough. `provider` carries routing only (order, only, \
-        ignore, allow_fallbacks, require_parameters, zdr, sort) - chat completions have no \
-        passthrough options. If the stream ends before its [DONE] sentinel the track is still saved but \
+        block when the file is small enough. `provider` carries routing (order, only, ignore, \
+        allow_fallbacks, require_parameters, zdr, sort) and per-provider `options` keyed by \
+        provider slug. If the stream ends before its [DONE] sentinel the track is still saved but \
         the result carries a `warnings` entry saying it may be cut short. `output` is optional - \
         omit it for an auto-named file under \
         OPENROUTER_MCP_OUTPUT_DIR (default $HOME/Downloads/openrouter-mcp).",
@@ -204,6 +204,45 @@ mod tests {
             output: Some(output.to_string_lossy().into_owned()),
             provider: Default::default(),
         }
+    }
+
+    /// `provider.options` goes out in the chat body and the manifest records it.
+    #[tokio::test]
+    async fn generate_music_forwards_provider_options_and_records_them() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "provider": {"options": {"google-vertex": {"seed": 7}}}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(LYRIA_STREAM),
+            )
+            .mount(&mock)
+            .await;
+        let out = std::env::temp_dir().join("openrouter-mcp-music-options/track.mp3");
+        let args: GenerateMusicArgs = serde_json::from_value(serde_json::json!({
+            "model": "google/lyria-3-clip-preview",
+            "prompt": "warm lo-fi loop",
+            "output": out.to_string_lossy(),
+            "provider": {"options": {"google-vertex": {"seed": 7}}}
+        }))
+        .unwrap();
+        let res = server_for(mock.uri())
+            .run_generate_music(args, false)
+            .await
+            .expect("provider.options must reach the wire");
+        let v = tool_result_json(&res);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(v["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["provider"],
+            serde_json::json!({"options": {"google-vertex": {"seed": 7}}})
+        );
     }
 
     /// Music is a chat call: `provider` goes out as the routing block, is

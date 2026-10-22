@@ -25,7 +25,8 @@ pub struct DecideResult {
 
 impl DecideResult {
     /// The result envelope returned by the MCP tool. Answers keep the wire
-    /// shape (`type` plus `noul` / `choice` / `score` and their optionals).
+    /// shape (`type` plus `noul` / `choice` / `score` / `box` and their
+    /// optionals).
     pub fn to_json(&self) -> Value {
         json!({
             "model": self.model,
@@ -132,6 +133,9 @@ fn check_question(name: &str, question: &DecisionQuestion) -> Result<()> {
             for (i, guidance) in criteria.iter().enumerate() {
                 check_guidance(&field(&format!("criteria[{i}]")), guidance)?;
             }
+        }
+        DecisionQuestion::Box { instructions } => {
+            check_guidance(&field("instructions"), instructions)?;
         }
     }
     Ok(())

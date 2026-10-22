@@ -145,11 +145,11 @@ pub(crate) struct ChatCompletionArgs {
     /// response (`reasoning.exclude`).
     #[serde(default, deserialize_with = "de_opt_bool")]
     pub reasoning_exclude: Option<bool>,
-    /// Provider block for this request: routing only, as {"order": [...],
-    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
-    /// "zdr", "sort", "sort_partition"}. Chat completions have no per-provider
-    /// `options` passthrough (describe_model's allowed_passthrough_parameters
-    /// do not apply here).
+    /// Provider block for this request: routing plus per-provider passthrough,
+    /// as {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks",
+    /// "require_parameters", "zdr", "sort", "sort_partition", "options":
+    /// {slug: {param: value}}} (see describe_model's
+    /// allowed_passthrough_parameters for what each provider accepts).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -406,9 +406,9 @@ impl OpenRouterServer {
         OpenRouter web plugin; citations come back as `annotations`. `pdf_engine` (mistral-ocr, \
         cloudflare-ai, native) attaches the file-parser plugin for PDF inputs. Reasoning: \
         `reasoning_effort` OR `reasoning_max_tokens` (not both), plus `reasoning_exclude` to \
-        keep the reasoning text out of the reply. `provider` takes routing fields only (order, \
-        only, ignore, allow_fallbacks, require_parameters, zdr, sort) - chat completions have \
-        no per-provider `options` passthrough. Multimodal input: `images` (path/url/base64) \
+        keep the reasoning text out of the reply. `provider` takes routing fields (order, only, \
+        ignore, allow_fallbacks, require_parameters, zdr, sort) and per-provider `options` \
+        keyed by provider slug. Multimodal input: `images` (path/url/base64) \
         for a VISION-capable model, `files` (PDF and other documents; path/url/base64 + \
         filename; use `pdf_engine` to pick the parser), `audio` (path/base64 + format) and \
         `videos` (url passed through, or path/base64 as a data URL). Parts are sent in the \
@@ -882,6 +882,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("sort"), "got: {}", err.message);
+    }
+
+    /// `ProviderPreferences.options` (openapi.json, 2026-10-22) reaches the
+    /// chat body keyed by provider slug, next to the routing keys.
+    #[tokio::test]
+    async fn chat_completion_forwards_provider_options() {
+        let mock = mock_chat(serde_json::json!({
+            "provider": {"only": ["openai"], "options": {"openai": {"max_tokens": 50}}}
+        }))
+        .await;
+        let args: ChatCompletionArgs = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5",
+            "prompt": "hi",
+            "provider": {"only": ["openai"], "options": {"openai": {"max_tokens": 50}}}
+        }))
+        .unwrap();
+        server_for(mock.uri())
+            .chat_completion(Parameters(args))
+            .await
+            .expect("provider.options must reach the wire");
     }
 
     /// OpenRouter limits `json_schema.name` to `[A-Za-z0-9_-]{1,64}`; a

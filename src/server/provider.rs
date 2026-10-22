@@ -2,9 +2,10 @@
 //! conversion to the wire types in [`crate::openrouter`].
 //!
 //! This is the one place MCP tool arguments become
-//! [`ProviderRouting`] / [`ImageProvider`] / [`ProviderOptions`], so the
-//! vocabulary checks live here once. Three arg structs mirror the three wire
-//! types because the endpoints differ in what they accept (see the DTO docs).
+//! [`ProviderRouting`] / [`ImageProvider`] / [`AudioProvider`] /
+//! [`ProviderOptions`], so the vocabulary checks live here once. Four arg
+//! structs mirror the four wire types because the endpoints differ in what
+//! they accept (see the DTO docs).
 //!
 //! Schema safety: these are nested `$defs` types in every tool-args schema, so
 //! each carries its own `scalarize_nullable`, every field has
@@ -20,7 +21,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::openrouter::{
-    ImageProvider, ProviderOptions, ProviderOptionsMap, ProviderRouting, ProviderSort,
+    AudioProvider, ImageProvider, ProviderOptions, ProviderOptionsMap, ProviderRouting,
+    ProviderSort,
 };
 use crate::server::schema::{clean_list, de_lenient, de_opt_bool, non_blank, scalarize_nullable};
 
@@ -28,9 +30,11 @@ use crate::server::schema::{clean_list, de_lenient, de_opt_bool, non_blank, scal
 const SORT_VALUES: [&str; 4] = ["price", "throughput", "latency", "exacto"];
 /// Accepted `sort_partition` values (`sort.partition` in the object form).
 const SORT_PARTITIONS: [&str; 2] = ["model", "none"];
+/// Accepted `data_collection` values on the audio endpoints.
+const DATA_COLLECTION_VALUES: [&str; 2] = ["allow", "deny"];
 
-/// Routing-only `provider` block for chat completions, `/embeddings`, `/rerank`
-/// and `/api/alpha/decisions` - the endpoints whose schema rejects `options`.
+/// Routing `provider` block for chat completions, `/embeddings`, `/rerank`
+/// and `/api/alpha/decisions`: routing keys plus per-provider `options`.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct ProviderRoutingArgs {
@@ -61,6 +65,12 @@ pub(crate) struct ProviderRoutingArgs {
     /// together with `sort`.
     #[serde(default)]
     pub sort_partition: Option<String>,
+    /// Per-provider passthrough, keyed by provider slug, each value an object of
+    /// that provider's parameters (see `allowed_passthrough_parameters` from
+    /// describe_model), e.g. {"openai": {"max_tokens": 1000}}. Only the slug
+    /// that serves the request is forwarded; unknown keys are dropped upstream.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub options: BTreeMap<String, serde_json::Value>,
 }
 
 impl ProviderRoutingArgs {
@@ -75,6 +85,7 @@ impl ProviderRoutingArgs {
             require_parameters: self.require_parameters,
             zdr: self.zdr,
             sort,
+            options: validate_options(self.options)?,
         }
         .non_empty())
     }
@@ -128,15 +139,58 @@ impl ImageProviderArgs {
     }
 }
 
-/// Passthrough-only `provider` block for `/audio/speech`,
-/// `/audio/transcriptions` and `/videos`, where routing fields are ignored.
+/// The `/audio/speech` and `/audio/transcriptions` `provider` block: the
+/// data-policy keys plus per-provider passthrough `options`.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
-pub(crate) struct ProviderOptionsArgs {
+pub(crate) struct AudioProviderArgs {
+    /// Zero-data-retention endpoints only.
+    #[serde(default, deserialize_with = "de_opt_bool")]
+    pub zdr: Option<bool>,
+    /// "allow" (default upstream) or "deny": deny routes only to providers
+    /// that do not store user data; if none serves the model, the call fails.
+    #[serde(default)]
+    pub data_collection: Option<String>,
     /// Per-provider passthrough, keyed by provider slug, each value an object of
     /// that provider's parameters, e.g. {"deepgram": {"diarize": true}}. Only
     /// the slug that serves the request is forwarded; unknown keys are dropped
     /// upstream.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub options: BTreeMap<String, serde_json::Value>,
+}
+
+impl AudioProviderArgs {
+    /// Validate and convert; `Ok(None)` when nothing is set.
+    pub(crate) fn into_audio_provider(self) -> Result<Option<AudioProvider>, ErrorData> {
+        let data_collection = non_blank(self.data_collection).map(|s| s.to_ascii_lowercase());
+        if let Some(value) = &data_collection
+            && !DATA_COLLECTION_VALUES.contains(&value.as_str())
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "provider.data_collection must be one of {}; got {value:?}",
+                    DATA_COLLECTION_VALUES.join(", ")
+                ),
+                None,
+            ));
+        }
+        Ok(AudioProvider {
+            zdr: self.zdr,
+            data_collection,
+            options: validate_options(self.options)?,
+        }
+        .non_empty())
+    }
+}
+
+/// Passthrough-only `provider` block for `/videos`, which takes no routing.
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
+#[schemars(transform = scalarize_nullable)]
+pub(crate) struct ProviderOptionsArgs {
+    /// Per-provider passthrough, keyed by provider slug, each value an object of
+    /// that provider's parameters, e.g. {"google-vertex": {"negativePrompt":
+    /// "people, text"}}. Only the slug that serves the request is forwarded;
+    /// unknown keys are dropped upstream.
     #[serde(default, deserialize_with = "de_lenient")]
     pub options: BTreeMap<String, serde_json::Value>,
 }
@@ -266,6 +320,7 @@ mod tests {
             zdr: Some(true),
             sort: Some("price".into()),
             sort_partition: None,
+            options: opts("anthropic", json!({"max_tokens": 100})),
         };
         let routing = args.into_routing().unwrap().unwrap();
         assert_eq!(
@@ -278,6 +333,7 @@ mod tests {
                 require_parameters: Some(true),
                 zdr: Some(true),
                 sort: Some(ProviderSort::By("price".into())),
+                options: opts("anthropic", json!({"max_tokens": 100})),
             }
         );
     }
@@ -400,6 +456,60 @@ mod tests {
             ..Default::default()
         };
         assert!(img.into_image_provider().is_err());
+        // So do routing options.
+        let routing = ProviderRoutingArgs {
+            options: opts("openai", json!("fast")),
+            ..Default::default()
+        };
+        assert!(routing.into_routing().is_err());
+    }
+
+    /// `/audio/speech` and `/audio/transcriptions` take the data-policy keys
+    /// (`zdr`, `data_collection`) beside `options` (openapi.json, 2026-10-22).
+    #[test]
+    fn audio_provider_args_carry_data_policy_and_options() {
+        let args = AudioProviderArgs {
+            zdr: Some(true),
+            data_collection: Some(" Deny ".into()),
+            options: opts("deepgram", json!({"diarize": true})),
+        };
+        assert_eq!(
+            args.into_audio_provider().unwrap(),
+            Some(AudioProvider {
+                zdr: Some(true),
+                data_collection: Some("deny".into()),
+                options: opts("deepgram", json!({"diarize": true})),
+            })
+        );
+        assert_eq!(
+            AudioProviderArgs::default().into_audio_provider().unwrap(),
+            None
+        );
+        let blank = AudioProviderArgs {
+            data_collection: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(blank.into_audio_provider().unwrap(), None);
+    }
+
+    #[test]
+    fn audio_provider_args_reject_unknown_data_collection_and_bad_options() {
+        let unknown = AudioProviderArgs {
+            data_collection: Some("never".into()),
+            ..Default::default()
+        };
+        let err = unknown.into_audio_provider().unwrap_err();
+        assert!(
+            err.message.contains("data_collection"),
+            "got: {}",
+            err.message
+        );
+        assert!(err.message.contains("allow, deny"), "got: {}", err.message);
+        let bad_options = AudioProviderArgs {
+            options: opts("openai", json!("cheerful")),
+            ..Default::default()
+        };
+        assert!(bad_options.into_audio_provider().is_err());
     }
 
     /// Args deserialize leniently: `options` as an object or as a JSON string,
@@ -435,7 +545,7 @@ mod tests {
         let provider = &schema["properties"]["provider"];
         assert_eq!(
             provider["$ref"],
-            json!("#/$defs/ProviderOptionsArgs"),
+            json!("#/$defs/AudioProviderArgs"),
             "got: {provider}"
         );
         assert!(
@@ -444,7 +554,7 @@ mod tests {
                 .is_some_and(|d| d.contains("deepgram")),
             "field doc carries the diarization recipe: {provider}"
         );
-        assert!(schema["$defs"]["ProviderOptionsArgs"].is_object());
+        assert!(schema["$defs"]["AudioProviderArgs"].is_object());
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(!required.contains(&json!("provider")), "{required:?}");
     }
@@ -468,9 +578,15 @@ mod tests {
             expected
         );
         assert_eq!(options_schema(schema_json::<ImageProviderArgs>()), expected);
+        assert_eq!(
+            options_schema(schema_json::<ProviderRoutingArgs>()),
+            expected
+        );
+        assert_eq!(options_schema(schema_json::<AudioProviderArgs>()), expected);
         for (name, schema) in [
             ("ProviderRoutingArgs", schema_json::<ProviderRoutingArgs>()),
             ("ImageProviderArgs", schema_json::<ImageProviderArgs>()),
+            ("AudioProviderArgs", schema_json::<AudioProviderArgs>()),
             ("ProviderOptionsArgs", schema_json::<ProviderOptionsArgs>()),
         ] {
             let text = schema.to_string();

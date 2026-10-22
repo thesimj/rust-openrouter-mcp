@@ -123,9 +123,9 @@ pub(crate) struct GenerateImageArgs {
     #[serde(default)]
     pub aspect_ratio: Option<String>,
     /// REQUIRED unless `size` is given (no default): resolution TIER (not
-    /// pixel dimensions), e.g. "512" (or "0.5K"), "768", "1K", "2K", "4K" (maps to
-    /// the Images API `resolution`). Cannot be combined with a pixel-form
-    /// `size`.
+    /// pixel dimensions), e.g. "512" (or "0.5K"), "768", "1K", "1.5K", "2K",
+    /// "4K" (maps to the Images API `resolution`). Cannot be combined with a
+    /// pixel-form `size`.
     #[serde(default)]
     pub image_size: Option<String>,
     /// Output size as "WIDTHxHEIGHT" pixels (e.g. "2048x2048") or a tier
@@ -227,11 +227,11 @@ pub(crate) struct DescribeImageArgs {
     /// Optional maximum number of tokens to generate.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub max_tokens: Option<u64>,
-    /// Provider block for this request: routing only, as {"order": [...],
-    /// "only": [...], "ignore": [...], "allow_fallbacks", "require_parameters",
-    /// "zdr", "sort", "sort_partition"}. Chat completions have no per-provider
-    /// `options` passthrough (describe_model's allowed_passthrough_parameters
-    /// do not apply here).
+    /// Provider block for this request: routing plus per-provider passthrough,
+    /// as {"order": [...], "only": [...], "ignore": [...], "allow_fallbacks",
+    /// "require_parameters", "zdr", "sort", "sort_partition", "options":
+    /// {slug: {param: value}}} (see describe_model's
+    /// allowed_passthrough_parameters for what each provider accepts).
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -449,8 +449,8 @@ impl OpenRouterServer {
         token counts - the same shape chat_completion returns. Images are downscaled before \
         sending. Optional `system`, \
         `temperature`, `max_tokens` and `reasoning_effort` are passed through; `provider` \
-        takes routing fields only (order, only, ignore, allow_fallbacks, require_parameters, \
-        zdr, sort) - there is no per-provider `options` passthrough on chat completions. \
+        takes routing fields (order, only, ignore, allow_fallbacks, require_parameters, zdr, \
+        sort) and per-provider `options` keyed by provider slug. \
         To create or edit an image instead, use generate_image.",
         annotations(
             title = "Describe Image",

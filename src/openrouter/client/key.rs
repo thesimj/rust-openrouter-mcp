@@ -61,7 +61,7 @@ mod tests {
     async fn get_key_info_parses_live_shaped_response() {
         let server = MockServer::start().await;
         // Body mirrors the real GET /api/v1/key payload (extra fields ignored,
-        // rate_limit.requests is -1 = unlimited, limit is null = unlimited).
+        // rate_limit.requests is -1 = unlimited, limit is null = no key limit).
         Mock::given(method("GET"))
             .and(path("/key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(info.creator_user_id.as_deref(), Some("user_39wcop8"));
         assert_eq!(info.is_free_tier, Some(false));
         assert_eq!(info.is_management_key, Some(false));
-        assert!(info.limit.is_none(), "null limit -> unlimited");
+        assert!(info.limit.is_none(), "null limit -> no key limit");
         assert!(info.limit_remaining.is_none());
         assert_eq!(info.usage, Some(63.17));
         assert_eq!(info.usage_monthly, Some(10.46));
@@ -101,6 +101,51 @@ mod tests {
         let rl = info.rate_limit.unwrap();
         assert_eq!(rl.requests, Some(-1));
         assert_eq!(rl.interval.as_deref(), Some("10s"));
+    }
+
+    /// Guardrail and workspace budgets can block a key whose own `limit` is
+    /// null. Body from the `GET /key` example in openapi.json (2026-10-22).
+    #[tokio::test]
+    async fn get_key_info_parses_budget_layers() {
+        let server = MockServer::start().await;
+        let member_budget = json!({
+            "budget_id": null,
+            "guardrail_id": "0df9e665-d932-5740-b2c7-b52af166bc11",
+            "include_byok": false,
+            "limit_usd": 50,
+            "remaining_usd": 17.5,
+            "reset_interval": "weekly",
+            "resets_at": "2026-10-12T00:00:00.000Z",
+            "scope": "member",
+            "spend_usd": 32.5
+        });
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "limit": null,
+                    "budgets": [member_budget],
+                    "effective_budget": member_budget
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
+        let info = client.get_key_info().await.unwrap();
+        assert!(info.limit.is_none());
+        assert_eq!(info.budgets.as_ref().map(Vec::len), Some(1));
+        let effective = info.effective_budget.unwrap();
+        assert_eq!(effective.scope.as_deref(), Some("member"));
+        assert_eq!(effective.limit_usd, Some(50.0));
+        assert_eq!(effective.spend_usd, Some(32.5));
+        assert_eq!(effective.remaining_usd, Some(17.5));
+        assert_eq!(effective.reset_interval.as_deref(), Some("weekly"));
+        assert_eq!(
+            effective.resets_at.as_deref(),
+            Some("2026-10-12T00:00:00.000Z")
+        );
+        assert_eq!(effective.include_byok, Some(false));
     }
 
     #[tokio::test]

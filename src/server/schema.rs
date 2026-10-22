@@ -363,7 +363,7 @@ mod tests {
         use crate::server::embeddings::{EmbedTextArgs, GetGenerationArgs, RerankDocumentsArgs};
         use crate::server::models::DescribeModelArgs;
         use crate::server::provider::{
-            ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
+            AudioProviderArgs, ImageProviderArgs, ProviderOptionsArgs, ProviderRoutingArgs,
         };
         let chat = schema_json::<ChatCompletionArgs>();
         for nested in ["ImageInput", "FileInput", "AudioInput", "VideoInput"] {
@@ -394,6 +394,7 @@ mod tests {
             ("ResetUsageStatsArgs", schema_json::<ResetUsageStatsArgs>()),
             ("ProviderRoutingArgs", schema_json::<ProviderRoutingArgs>()),
             ("ImageProviderArgs", schema_json::<ImageProviderArgs>()),
+            ("AudioProviderArgs", schema_json::<AudioProviderArgs>()),
             ("ProviderOptionsArgs", schema_json::<ProviderOptionsArgs>()),
         ];
         for (name, schema) in &schemas {

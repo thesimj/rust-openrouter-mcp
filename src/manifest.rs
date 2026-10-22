@@ -223,7 +223,7 @@ pub struct AudioManifest {
     pub speed: Option<f64>,
     /// The `provider` block sent, when one was.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<crate::openrouter::ProviderOptions>,
+    pub provider: Option<crate::openrouter::AudioProvider>,
     pub created_at: String,
     pub output: AudioOutputMeta,
 }

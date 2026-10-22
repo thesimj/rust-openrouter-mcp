@@ -86,7 +86,11 @@ impl OpenRouterServer {
         description = "Return basic information about the OpenRouter API key in use \
         (GET /api/v1/key): label, creator_user_id (the owning user - the closest available \
         owner identity, not a name/email), credit usage (total and daily/weekly/monthly), \
-        spending limit and remaining balance in USD (null means unlimited), byok_usage, the \
+        the key's own spending limit and remaining balance in USD (null when the key has no \
+        limit of its own), `budgets` (every budget layer checked for the key: guardrail, \
+        workspace, and key limit, each with scope, limit_usd, spend_usd, remaining_usd, \
+        reset_interval, resets_at) and `effective_budget` (the layer that blocks requests \
+        first; remaining_usd <= 0 means requests are refused until resets_at), byok_usage, the \
         is_free_tier / is_management_key flags (plus is_provisioning_key, a deprecated \
         alias of is_management_key), and a deprecated rate_limit (requests per interval; -1 \
         means unlimited). Also includes a `credits` object (GET /api/v1/credits) with \
@@ -251,6 +255,41 @@ mod tests {
         assert_eq!(v["credits"]["total_credits"], 130.0);
         assert_eq!(v["credits"]["total_usage"], 110.04);
         assert_eq!(v["credits"]["remaining"], 130.0 - 110.04);
+    }
+
+    /// A spent workspace budget blocks the key while its own `limit` is null,
+    /// so the tool must show the blocking layer, not just the key limit.
+    #[tokio::test]
+    async fn get_account_shows_the_budget_that_blocks_first() {
+        let mock = MockServer::start().await;
+        let workspace_budget = json!({
+            "scope": "workspace", "guardrail_id": null, "budget_id": "b1",
+            "limit_usd": 10, "spend_usd": 10, "remaining_usd": 0,
+            "reset_interval": "monthly", "resets_at": "2026-11-01T00:00:00.000Z",
+            "include_byok": false
+        });
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "label": "sk-or-v1-x", "limit": null,
+                    "budgets": [workspace_budget], "effective_budget": workspace_budget
+                }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock)
+            .await;
+
+        let res = server_for(mock.uri()).get_account().await.unwrap();
+        let v = tool_result_json(&res);
+        assert!(v["limit"].is_null());
+        assert_eq!(v["effective_budget"]["scope"], "workspace");
+        assert_eq!(v["effective_budget"]["remaining_usd"], 0.0);
+        assert_eq!(v["budgets"][0]["resets_at"], "2026-11-01T00:00:00.000Z");
     }
 
     /// /key succeeds but /credits is unavailable: the tool still returns the key

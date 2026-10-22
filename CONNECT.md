@@ -299,9 +299,10 @@ the endpoint. Routing keys (`order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `zdr`, `sort`) on `chat_completion`, `describe_image`,
 `generate_music`, `embed_text`, `rerank_documents` and `make_decisions`;
 `generate_image` takes the subset `order`, `only`, `ignore`, `allow_fallbacks`,
-`sort` (plus `sort_partition`). A `provider.options` map keyed by provider slug, for that provider's own
-parameters, on `generate_image`, `generate_audio`, `transcribe_audio` and
-`generate_video` (the last three take no routing keys), e.g.
+`sort` (plus `sort_partition`); `generate_audio` and `transcribe_audio` take
+`zdr` and `data_collection` (`"allow"` or `"deny"`); `generate_video` takes no
+routing keys. Every one of them takes a `provider.options` map keyed by
+provider slug, for that provider's own parameters, e.g.
 `{"options": {"deepgram": {"diarize": true}}}`. Check
 `describe_model` for each endpoint's `allowed_passthrough_parameters` first.
 

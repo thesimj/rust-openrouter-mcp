@@ -20,7 +20,7 @@ pub struct EmbeddingsBody {
     /// Provider-specific hint such as "query" / "document" (Cohere, Voyage).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_type: Option<String>,
-    /// Routing-only block; this endpoint's schema rejects `options`.
+    /// Routing plus per-provider `options` (`ProviderPreferences`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
 }

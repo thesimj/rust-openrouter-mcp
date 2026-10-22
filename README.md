@@ -29,8 +29,8 @@ Desktop, Claude Code, Cursor and other clients. Bring your own OpenRouter API ke
 - **Embed and rerank text.** Vectors for search, and best-first ranking of
   documents against a query.
 - **Ask a decision model.** Send TypeSafe Jev a state and typed questions
-  (true/false, pick one, score on a scale). Get calibrated probabilities back
-  in about a quarter of a second, with no text generation.
+  (true/false, pick one, score on a scale, find it in an image). Get calibrated
+  probabilities back in about a quarter of a second, with no text generation.
 - **Know what you paid.** Every generation result (or its manifest) carries a
   generation id, and one tool looks up the real charge for it.
 
@@ -110,10 +110,10 @@ Generic MCP client config:
 | `describe_image` | Describe one or more images with a vision model. |
 | `embed_text` | Float vectors for a list of texts. |
 | `rerank_documents` | Rank documents against a query, best first. |
-| `make_decisions` | Ask a decisions model (TypeSafe Jev) named `noul`, `choice` and `score` questions about a `state`. Returns typed answers with probabilities and confidence. See [Decisions](#decisions). |
+| `make_decisions` | Ask a decisions model (such as TypeSafe Jev) named `noul`, `choice`, `score` and `box` questions about a `state` of text and images. Returns typed answers with probabilities and confidence. See [Decisions](#decisions). |
 | `get_generation` | The stored record for a `generation_id`: real cost, provider, tokens, latency. |
 | `get_result` | Fetch an async job by `task_id`. |
-| `get_account` | Your API key's label, credits, and limits. |
+| `get_account` | Your API key's label, credits, its own limit, and every budget layer (guardrail, workspace) with the one that blocks first. |
 | `get_usage_stats` | This process's request and cost counters. |
 | `reset_usage_stats` | Clear those counters. Needs `confirm: true`. |
 
@@ -129,15 +129,16 @@ each generation tool lets you steer that.
 rerank_documents, make_decisions): `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `zdr`, `sort` (plus `sort_partition`). `generate_image`
 takes the subset `order`, `only`, `ignore`, `allow_fallbacks`, `sort` (plus
-`sort_partition`), next to its `options`.
+`sort_partition`). `generate_audio` and `transcribe_audio` take the data-policy
+keys `zdr` and `data_collection` (`"allow"` or `"deny"`).
 
 ```json
 { "provider": { "order": ["anthropic", "google-vertex"], "allow_fallbacks": false } }
 ```
 
-**Passthrough** (generate_image, generate_audio, transcribe_audio,
-generate_video): `options`, keyed by provider slug, holding that provider's own
-parameters. Only the provider that serves the request receives them.
+**Passthrough** (every tool with a `provider` object): `options`, keyed by
+provider slug, holding that provider's own parameters. Only the provider that
+serves the request receives them. `generate_video` takes `options` only.
 
 ```json
 { "provider": { "options": { "deepgram": { "diarize": true } } } }
@@ -149,25 +150,29 @@ uses: `{"openai": {"instructions": "speak like a calm narrator"}}` on speech,
 `{"google-vertex": {"negativePrompt": "people, text"}}` on Veo video. Run
 `describe_model` to see which keys a provider accepts.
 
-Chat-family tools take routing only. OpenRouter's chat schema has no
-passthrough field.
-
 ## Decisions
 
 A decisions model does not write text. It reads a `state` and answers a set of
 questions you define, each with a probability. OpenRouter serves TypeSafe's Jev
-(`typesafe/jev-1.13`, alias `~typesafe/jev-latest` - the tilde is required) on
-`POST /api/alpha/decisions`, an alpha endpoint outside `/api/v1`.
+(`typesafe/jev-1.14`, alias `~typesafe/jev-latest` - the tilde is required) and
+other decisions models on `POST /api/alpha/decisions`, an alpha endpoint
+outside `/api/v1`.
 `chat_completion` cannot use these models. `make_decisions` can. Find them with
 `list_models` and `output_modalities="decisions"`.
 
-Three question types:
+Four question types:
 
 | `type` | Asks | `criteria` | Answer |
 | --- | --- | --- | --- |
 | `noul` | Is it true? | optional `{"true": "...", "false": "..."}` | `{"noul": 0.96}` |
 | `choice` | Which label? | required `{label: description or null}` | `{"choice": "payments", "confidence": 0.75, "probabilities": {...}}` |
 | `score` | How much, on this scale? | required array of 2 to 10 levels, lowest first | `{"score": 1.99, "confidence": 0.99, "legend": {...}, "probabilities": {...}}` |
+| `box` | Where in the image is it? | none | `{"box": {"top": 0.49, "bottom": 0.89, "left": 0.58, "right": 0.96}, "confidence": 0.93}` |
+
+`state` may be an array that mixes text with image parts,
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`, on
+models that take images. A `box` question needs one. Its edges are fractions of
+the image height (`top`, `bottom`) and width (`left`, `right`).
 
 ```json
 {

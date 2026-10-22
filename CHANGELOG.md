@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+OpenRouter API changes (checked against openapi.json on 2026-10-22):
+
+- `get_account`: shows `budgets` (every guardrail, workspace and key-limit
+  layer, with limit, spend, remaining and reset time) and `effective_budget`,
+  the layer that blocks first. A null `limit` now reads as "no key limit", not
+  "unlimited": a guardrail or workspace budget can still refuse requests.
+- `provider.options` is accepted on `chat_completion`, `describe_image`,
+  `generate_music`, `embed_text`, `rerank_documents` and `make_decisions`
+  (OpenRouter added `options` to `ProviderPreferences`).
+- `generate_audio` and `transcribe_audio`: `provider.zdr` and
+  `provider.data_collection` (`"allow"`/`"deny"`) reach the wire next to
+  `options`, and the audio manifest records them.
+- `make_decisions`: the `box` question type finds a described target in an
+  image in `state` and answers with edges as fractions of the image size.
+  `state` may mix text with `image_url` parts.
+- `generate_image`: the `1.5K` resolution tier is known, so a 1536 px image
+  no longer warns about a size mismatch. `actual_image_size` now comes from the
+  image area (the side of a square of the same area), not the longest side:
+  1344x768 at `1K` reads `1K`, and a wide 1K image such as 1584x672 no longer
+  reads `2K`.
+- `list_models` / `describe_model`: video prices `reference_duration_seconds_*`
+  show as $/s and `reference_images` / `reference_input_images` as $/reference
+  image (they read "unit unknown").
+
+Dependencies:
+
+- `cargo update`: rmcp 3.4 -> 3.7, tokio 1.54, serde_json 1.0.154 and about 60
+  transitive patch updates. `uuid` stays at 1.26 because 1.28 needs Rust 1.89.
+- CI: `dtolnay/rust-toolchain` pinned to 683b588 (safe input handling, install
+  retries) and `Swatinem/rust-cache` to v2.9.3.
+- rmcp 3.5 made `2026-07-28` its default protocol version. The server now pins
+  `2025-11-25` (the newest version with an `initialize` handshake), so the
+  handshake clients see does not change.
+
 ## 0.13.0
 
 Fixes (each covered by a test):

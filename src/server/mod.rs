@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig},
     tool_handler,
     transport::stdio,
 };
@@ -88,14 +88,17 @@ impl OpenRouterServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OpenRouterServer {
-    /// Advertises the protocol version rmcp treats as current
-    /// ([`rmcp::model::ProtocolVersion::default`], i.e. `LATEST`). rmcp 3.0 also knows
-    /// `2026-07-28` (stateless lifecycle, MRTR, tasks extension) but does not
-    /// default to it: over stdio those changes buy us nothing, and naming a
-    /// version ahead of what clients speak only risks a failed handshake.
-    /// Opting in is a deliberate change - see the test below.
+    /// Advertises `2025-11-25`, the newest protocol version with an `initialize`
+    /// handshake. Since rmcp 3.5 the default (`LATEST`) is `2026-07-28`
+    /// (stateless lifecycle, MRTR, tasks extension), so the version is pinned:
+    /// over stdio those changes buy us nothing, and naming a version ahead of
+    /// what clients speak only risks a failed handshake. rmcp still echoes any
+    /// supported version a client asks for in `initialize`; this is the
+    /// fallback. Opting in to `2026-07-28` is a deliberate change - see the
+    /// test below.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_instructions(
                 "MCP server for OpenRouter. Use `list_models` to discover models, \
                 their capabilities, and pricing (`describe_model` for one model in \
@@ -165,13 +168,12 @@ async fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::ProtocolVersion;
 
     /// Pins the handshake we advertise. A silent bump here changes what every
     /// client negotiates, so moving to `2026-07-28` must be a deliberate edit
-    /// (and an rmcp upgrade must not do it for us).
+    /// (and an rmcp upgrade must not do it for us - rmcp 3.5 tried).
     #[test]
-    fn advertises_the_sdk_default_protocol_version_and_tools_only() {
+    fn advertises_the_pinned_2025_11_25_protocol_version_and_tools_only() {
         let info =
             crate::server::test_support::server_for("http://127.0.0.1:9".to_string()).get_info();
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);

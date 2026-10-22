@@ -2,8 +2,9 @@
 //! TypeSafe's System One models (`typesafe/jev-1.13`, `~typesafe/jev-latest`).
 //!
 //! A decisions model does not generate text. It reads a `state` and answers a
-//! map of named questions, each of one of three kinds: `noul` (a true/false
-//! probability), `choice` (one label from a set) or `score` (a graded scale).
+//! map of named questions, each of one of four kinds: `noul` (a true/false
+//! probability), `choice` (one label from a set), `score` (a graded scale) or
+//! `box` (where a described target is in an image in `state`).
 //! Guidance values (`instructions`, `criteria` entries) are a string, a JSON
 //! object or an array - the OpenAPI spec calls the union "guidance", so they
 //! travel as [`serde_json::Value`] here.
@@ -27,7 +28,7 @@ pub struct DecisionsBody {
     /// Questions keyed by the caller's own names; answers come back under
     /// the same keys. The model never sees the keys.
     pub questions: BTreeMap<String, DecisionQuestion>,
-    /// Routing-only block, the same subset chat, `/embeddings` and `/rerank` take.
+    /// Routing plus `options`, the same block chat, `/embeddings` and `/rerank` take.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
 }
@@ -52,6 +53,8 @@ pub enum DecisionQuestion {
         instructions: Value,
         criteria: Vec<Value>,
     },
+    /// Find the target `instructions` describe in an image in `state`.
+    Box { instructions: Value },
 }
 
 /// Optional `noul` criteria: what makes the answer true, and what makes it
@@ -78,8 +81,8 @@ pub struct DecisionsResponse {
 }
 
 /// One answer, discriminated by `type`. `confidence` (0..1) appears only on
-/// `choice` and `score`; `probabilities` is keyed by label (choice) or by the
-/// level index as a string (score).
+/// `choice`, `score` and `box`; `probabilities` is keyed by label (choice) or
+/// by the level index as a string (score).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DecisionAnswer {
@@ -105,6 +108,22 @@ pub enum DecisionAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probabilities: Option<BTreeMap<String, f64>>,
     },
+    Box {
+        #[serde(rename = "box")]
+        edges: BoxEdges,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+    },
+}
+
+/// A box answer's edges as fractions (0..1) of the image's height (`top`,
+/// `bottom`) and width (`left`, `right`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxEdges {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -188,6 +207,39 @@ mod tests {
             "provider": "TypeSafe",
             "usage": { "cost": 0.000019992, "input_tokens": 476, "output_tokens": 70 }
         })
+    }
+
+    /// The Box example from OpenRouter's Jev guide
+    /// (docs/guides/community/jev, 2026-10-22): a question with instructions
+    /// only, answered with edges as fractions of the image size.
+    #[test]
+    fn box_question_and_answer_match_the_documented_wire_shape() {
+        let question = DecisionQuestion::Box {
+            instructions: json!("the product in the listing photo"),
+        };
+        assert_eq!(
+            serde_json::to_value(&question).unwrap(),
+            json!({"type": "box", "instructions": "the product in the listing photo"})
+        );
+        let wire = json!({
+            "type": "box",
+            "box": { "top": 0.49, "bottom": 0.89, "left": 0.58, "right": 0.96 },
+            "confidence": 0.93
+        });
+        let answer: DecisionAnswer = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            answer,
+            DecisionAnswer::Box {
+                edges: BoxEdges {
+                    top: 0.49,
+                    bottom: 0.89,
+                    left: 0.58,
+                    right: 0.96
+                },
+                confidence: Some(0.93),
+            }
+        );
+        assert_eq!(serde_json::to_value(&answer).unwrap(), wire);
     }
 
     /// Serde lock: the three question kinds, built as Rust values, serialize

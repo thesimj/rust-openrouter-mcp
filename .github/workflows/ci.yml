@@ -27,8 +27,8 @@ env:
 # Third-party actions are pinned to a full commit SHA, not a tag: a tag can be
 # moved to point at different code, and these run in the same job as our build.
 # actions/* are first-party and keep a floating major tag.
-#   dtolnay/rust-toolchain@master  -> 6c977a6 (2026-08)
-#   Swatinem/rust-cache@v2.9.2     -> 6323deb
+#   dtolnay/rust-toolchain@master  -> 683b588 (2026-10)
+#   Swatinem/rust-cache@v2.9.3     -> d1527c8
 # The `master` branch of rust-toolchain makes `toolchain` a required input, so
 # each job states the toolchain it wants instead of encoding it in the ref.
 
@@ -42,12 +42,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
 
       - name: Format
         run: cargo fmt --check
@@ -78,11 +78,11 @@ jobs:
           echo "Declared MSRV: $version"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
 
       # Build tests too: a dev-dependency or test-only construct can raise the
       # real floor just as easily as library code.

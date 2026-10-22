@@ -720,7 +720,8 @@ mod tests {
     /// any HTTP call.
     #[tokio::test]
     async fn generate_video_forwards_provider_options_and_rejects_bad_ones() {
-        let (provider, expected) = crate::server::test_support::provider_options_fixture();
+        let (options, expected) = crate::server::test_support::provider_options_fixture();
+        let provider = crate::server::provider::ProviderOptionsArgs { options };
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/videos"))

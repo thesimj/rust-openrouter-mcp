@@ -35,12 +35,12 @@ pub(crate) struct EmbedTextArgs {
     /// Voyage). Omit when the model does not distinguish.
     #[serde(default)]
     pub input_type: Option<String>,
-    /// Provider block for this request: routing only, as {"order": [slugs],
+    /// Provider block for this request: routing plus passthrough, as {"order": [slugs],
     /// "only": [slugs], "ignore": [slugs], "allow_fallbacks": bool,
     /// "require_parameters": bool, "zdr": bool, "sort":
-    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none"}.
-    /// This endpoint has no per-provider `options` passthrough (describe_model's
-    /// allowed_passthrough_parameters do not apply here).
+    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none",
+    /// "options": {slug: {param: value}}} - per-provider passthrough; only the
+    /// slug that serves the request is forwarded.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -61,12 +61,12 @@ pub(crate) struct RerankDocumentsArgs {
     /// Return only the best N documents. Omit for every document, ranked.
     #[serde(default, deserialize_with = "de_opt_uint")]
     pub top_n: Option<u32>,
-    /// Provider block for this request: routing only, as {"order": [slugs],
+    /// Provider block for this request: routing plus passthrough, as {"order": [slugs],
     /// "only": [slugs], "ignore": [slugs], "allow_fallbacks": bool,
     /// "require_parameters": bool, "zdr": bool, "sort":
-    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none"}.
-    /// This endpoint has no per-provider `options` passthrough (describe_model's
-    /// allowed_passthrough_parameters do not apply here).
+    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none",
+    /// "options": {slug: {param: value}}} - per-provider passthrough; only the
+    /// slug that serves the request is forwarded.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -88,9 +88,9 @@ impl OpenRouterServer {
         model) and return the float vectors. This is a synchronous call. `input` is a list of \
         strings (at least one, none blank); one vector comes back per text, in input order. \
         `dimensions` truncates the vectors on models that support it; `input_type` (\"query\" / \
-        \"document\") is a hint some providers use. `provider` carries routing only (order, \
-        only, ignore, allow_fallbacks, require_parameters, zdr, sort) - this endpoint has no \
-        passthrough options. Returns JSON: model, dimensions (vector length), count, \
+        \"document\") is a hint some providers use. `provider` carries routing (order, only, \
+        ignore, allow_fallbacks, require_parameters, zdr, sort) and per-provider `options` keyed \
+        by provider slug. Returns JSON: model, dimensions (vector length), count, \
         embeddings (array of number arrays), usage {prompt_tokens, total_tokens, cost in USD}, \
         and generation_id - pass that to get_generation for the full cost record. Discover \
         embeddings models with list_models using output_modalities=\"embeddings\" - they are \
@@ -130,9 +130,9 @@ impl OpenRouterServer {
         description = "Rerank candidate documents against a query with an OpenRouter rerank \
         model (e.g. cohere/rerank-v3.5) and return them best-first with a relevance score. \
         This is a synchronous call. `documents` is a list of plain-text strings (at least one, \
-        none blank); `top_n` keeps only the best N. `provider` carries routing only (order, \
-        only, ignore, allow_fallbacks, require_parameters, zdr, sort) - this endpoint has no \
-        passthrough options. Returns JSON: model, results (in the provider's ranked order, \
+        none blank); `top_n` keeps only the best N. `provider` carries routing (order, only, \
+        ignore, allow_fallbacks, require_parameters, zdr, sort) and per-provider `options` keyed \
+        by provider slug. Returns JSON: model, results (in the provider's ranked order, \
         each {index into your documents, relevance_score, text}), usage {cost in USD, \
         search_units, total_tokens}, and generation_id - pass that to get_generation for the \
         full cost record. Discover rerank models with list_models using \
@@ -247,6 +247,32 @@ mod tests {
     /// The documented body - array input, dimensions, input_type and
     /// `provider.order` - reaches `/embeddings`; the result is the flattened
     /// envelope and the cost lands in the usage stats as a text generation.
+    /// `/embeddings` takes `ProviderPreferences`, so `options` goes out too.
+    #[tokio::test]
+    async fn embed_text_forwards_provider_options() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(body_partial_json(json!({
+                "provider": {"options": {"openai": {"user": "u1"}}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-emb-1",
+                "data": [{"index": 0, "embedding": [0.1]}]
+            })))
+            .mount(&mock)
+            .await;
+
+        server_for(mock.uri())
+            .embed_text(embed_args(json!({
+                "model": "openai/text-embedding-3-small",
+                "input": ["a"],
+                "provider": {"options": {"openai": {"user": "u1"}}}
+            })))
+            .await
+            .expect("provider.options must reach the wire");
+    }
+
     #[tokio::test]
     async fn embed_text_forwards_the_body_with_provider_order_and_returns_vectors() {
         let mock = MockServer::start().await;

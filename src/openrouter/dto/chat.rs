@@ -55,8 +55,7 @@ pub struct ChatRequest {
     /// `default_effort` from the models catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
-    /// Provider routing. Chat completions accept routing fields only (the
-    /// schema is closed: no per-provider `options` passthrough here).
+    /// Provider routing plus per-provider `options` (`ProviderPreferences`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
     /// Audio-output options (container format); only meaningful together with

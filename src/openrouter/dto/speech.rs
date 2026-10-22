@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use super::provider::ProviderOptions;
+use super::provider::AudioProvider;
 
 /// Request body for `POST /api/v1/audio/speech`. Every optional field is
 /// omitted when unset: `voice` is provider-dependent (voice-cloning models
@@ -23,9 +23,10 @@ pub struct SpeechBody {
     /// by a `text` transcript of it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_references: Vec<SpeechInputReference>,
-    /// Per-provider passthrough (`options.<slug>`); routing is ignored here.
+    /// Data policy (`zdr`, `data_collection`) and per-provider passthrough
+    /// (`options.<slug>`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderOptions>,
+    pub provider: Option<AudioProvider>,
 }
 
 /// One `input_references[]` part of the speech request, tagged by `type`:
@@ -73,9 +74,10 @@ pub struct TranscriptionBody {
     pub timestamp_granularities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Per-provider passthrough (`options.<slug>`); routing is ignored here.
+    /// Data policy (`zdr`, `data_collection`) and per-provider passthrough
+    /// (`options.<slug>`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderOptions>,
+    pub provider: Option<AudioProvider>,
 }
 
 /// Inline audio payload. `data` is **raw** base64 - a `data:` URL prefix is
@@ -92,7 +94,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn body(provider: Option<ProviderOptions>) -> TranscriptionBody {
+    fn body(provider: Option<AudioProvider>) -> TranscriptionBody {
         TranscriptionBody {
             model: "openai/whisper-1".into(),
             input_audio: InputAudio {
@@ -110,7 +112,7 @@ mod tests {
     fn speech_body(
         voice: Option<&str>,
         input_references: Vec<SpeechInputReference>,
-        provider: Option<ProviderOptions>,
+        provider: Option<AudioProvider>,
     ) -> SpeechBody {
         SpeechBody {
             model: "openai/gpt-4o-mini-tts".into(),
@@ -149,7 +151,10 @@ mod tests {
                     text: "the words spoken in the sample".into(),
                 },
             ],
-            Some(ProviderOptions { options }),
+            Some(AudioProvider {
+                options,
+                ..Default::default()
+            }),
         ))
         .unwrap();
         assert_eq!(full["voice"], "alloy");
@@ -180,7 +185,7 @@ mod tests {
 
     /// Serde lock: `provider` is omitted entirely when unset (a bare
     /// `"provider": null` or `{}` is not what the endpoint documents), and
-    /// serializes as the options-only block when set.
+    /// nests `options` under it when set.
     #[test]
     fn transcription_body_omits_provider_when_none_and_nests_options_when_set() {
         let none = serde_json::to_value(body(None)).unwrap();
@@ -188,7 +193,11 @@ mod tests {
 
         let mut options = std::collections::BTreeMap::new();
         options.insert("deepgram".to_string(), json!({"diarize": true}));
-        let some = serde_json::to_value(body(Some(ProviderOptions { options }))).unwrap();
+        let some = serde_json::to_value(body(Some(AudioProvider {
+            options,
+            ..Default::default()
+        })))
+        .unwrap();
         assert_eq!(
             some["provider"],
             json!({"options": {"deepgram": {"diarize": true}}})

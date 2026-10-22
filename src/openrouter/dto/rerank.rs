@@ -16,7 +16,7 @@ pub struct RerankBody {
     /// Return only the best `top_n` documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
-    /// Routing-only block; this endpoint's schema rejects `options`.
+    /// Routing plus per-provider `options` (`ProviderPreferences`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
 }

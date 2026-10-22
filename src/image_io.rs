@@ -223,22 +223,24 @@ pub fn aspect_matches(requested: &str, width: u32, height: u32) -> Option<bool> 
     Some((requested - actual).abs() / requested <= 0.04)
 }
 
-/// OpenRouter's image `resolution` tiers (`512`, `768`, `1K`, `2K`, `4K` in
-/// its enum) with their longest side in pixels. `512` is labelled `0.5K`,
-/// the spelling the tools also accept.
-const SIZE_TIERS: [(&str, u32); 5] = [
+/// OpenRouter's image `resolution` tiers (`512`, `768`, `1K`, `1.5K`, `2K`,
+/// `4K` in its enum) with the side of their square size in pixels. `512` is
+/// labelled `0.5K`, the spelling the tools also accept.
+const SIZE_TIERS: [(&str, u32); 6] = [
     ("0.5K", 512),
     ("768", 768),
     ("1K", 1024),
+    ("1.5K", 1536),
     ("2K", 2048),
     ("4K", 4096),
 ];
 
-/// Nearest standard resolution tier (see [`SIZE_TIERS`]) for the longest side.
-pub fn classify_image_size(longest_side: u32) -> &'static str {
+/// Nearest standard resolution tier (see [`SIZE_TIERS`]) for the side of a
+/// square image.
+pub fn classify_image_size(square_side: u32) -> &'static str {
     SIZE_TIERS
         .iter()
-        .min_by_key(|(_, px)| px.abs_diff(longest_side))
+        .min_by_key(|(_, px)| px.abs_diff(square_side))
         .map(|(tier, _)| *tier)
         .unwrap_or("1K")
 }
@@ -275,7 +277,10 @@ pub fn check_dimensions(
     requested_size: Option<&str>,
 ) -> DimensionCheck {
     let actual_aspect_ratio = aspect_ratio_string(width, height);
-    let actual_image_size = classify_image_size(width.max(height));
+    // A tier names an area, not a longest side: the documented 16:9 size at
+    // 1K is 1344x768, about 1024x1024 in pixels but 1344 px on its long side.
+    let equal_area_side = (f64::from(width) * f64::from(height)).sqrt().round() as u32;
+    let actual_image_size = classify_image_size(equal_area_side);
     let mut warnings = Vec::new();
 
     if let Some(req) = requested_aspect
@@ -440,8 +445,19 @@ mod tests {
         assert!(check.warnings.is_empty());
     }
 
-    /// Every tier in OpenRouter's `resolution` enum (512, 768, 1K, 2K, 4K),
-    /// under either of its spellings, matches an image of that size.
+    /// Non-square images keep the tier their area says: the documented 16:9
+    /// size at 1K (1344x768) has a longest side nearer 1.5K than 1K.
+    #[test]
+    fn check_dimensions_classifies_wide_images_by_area() {
+        for (width, height, aspect) in [(1344, 768, "16:9"), (1584, 672, "21:9")] {
+            let check = check_dimensions(width, height, Some(aspect), Some("1K"));
+            assert_eq!(check.actual_image_size, "1K", "{width}x{height}");
+            assert!(check.warnings.is_empty(), "{:?}", check.warnings);
+        }
+    }
+
+    /// Every tier in OpenRouter's `resolution` enum (512, 768, 1K, 1.5K, 2K,
+    /// 4K), under either of its spellings, matches an image of that size.
     #[test]
     fn check_dimensions_accepts_every_tier_spelling() {
         for (side, requested) in [
@@ -449,6 +465,7 @@ mod tests {
             (512, "0.5K"),
             (768, "768"),
             (1024, "1k"),
+            (1536, "1.5K"),
             (2048, "2K"),
             (4096, "4K"),
         ] {
@@ -461,6 +478,7 @@ mod tests {
         }
         assert_eq!(classify_image_size(768), "768");
         assert_eq!(classify_image_size(512), "0.5K");
+        assert_eq!(classify_image_size(1536), "1.5K");
         let check = check_dimensions(512, 512, None, Some("1K"));
         assert_eq!(check.warnings.len(), 1, "a real mismatch still warns");
     }

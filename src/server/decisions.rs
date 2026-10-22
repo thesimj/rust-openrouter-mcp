@@ -121,8 +121,9 @@ impl<'de> Deserialize<'de> for Criteria {
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct QuestionArgs {
     /// "noul" (a true/false question answered with a probability), "choice"
-    /// (pick one label from `criteria`), or "score" (place the state on the
-    /// scale `criteria` defines).
+    /// (pick one label from `criteria`), "score" (place the state on the
+    /// scale `criteria` defines), or "box" (find the target `instructions`
+    /// describe in an image in `state`; no criteria).
     #[serde(rename = "type")]
     pub kind: String,
     /// What to decide about the state, e.g. "Is the customer reporting a
@@ -131,7 +132,7 @@ pub(crate) struct QuestionArgs {
     /// noul: optional {"true": "...", "false": "..."} describing each outcome.
     /// choice: REQUIRED object, label -> description (or null), up to 255
     /// labels. score: REQUIRED array of 2 to 10 levels, lowest first; the
-    /// answer's `score` is a float over the index range.
+    /// answer's `score` is a float over the index range. box: none.
     #[serde(default)]
     pub criteria: Criteria,
 }
@@ -189,8 +190,14 @@ impl QuestionArgs {
                     "score requires criteria: an array of levels, lowest first".into(),
                 )),
             },
+            "box" => match self.criteria.0 {
+                Value::Null => Ok(DecisionQuestion::Box { instructions }),
+                _ => Err(invalid(
+                    "box takes no criteria: `instructions` describes the target to find".into(),
+                )),
+            },
             other => Err(invalid(format!(
-                "type must be one of \"noul\", \"choice\", \"score\" (got {other:?})"
+                "type must be one of \"noul\", \"choice\", \"score\", \"box\" (got {other:?})"
             ))),
         }
     }
@@ -200,27 +207,31 @@ impl QuestionArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct MakeDecisionsArgs {
-    /// Decisions model id: "typesafe/jev-1.13", or the alias
-    /// "~typesafe/jev-latest" (the leading tilde is required). Discover them
-    /// with list_models using output_modalities="decisions".
+    /// Decisions model id, e.g. "typesafe/jev-1.14" (box questions need it or
+    /// later), or the alias "~typesafe/jev-latest" (the leading tilde is
+    /// required). Discover them with list_models using
+    /// output_modalities="decisions".
     pub model: String,
     /// The content to evaluate: a string, a JSON object (e.g. {"ticket": "...",
     /// "customer_tier": "enterprise"}), or an array of strings/objects. Pass
-    /// objects as JSON objects, not as JSON text. Text only - no images or audio.
+    /// objects as JSON objects, not as JSON text. Images go in an array as
+    /// {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+    /// parts, on models that take them; a box question needs one.
     pub state: Guidance,
     /// Questions keyed by names you choose (the model never sees the names);
     /// each answer comes back under its name. Every question has a `type`
-    /// ("noul" | "choice" | "score"), `instructions`, and - for choice and
-    /// score - `criteria`.
+    /// ("noul" | "choice" | "score" | "box"), `instructions`, and - for choice
+    /// and score - `criteria`.
     // No `serde(default)` on purpose: `questions` must appear in the schema's
     // `required` list. `de_lenient` still accepts a stringified object.
     #[serde(deserialize_with = "de_lenient")]
     pub questions: BTreeMap<String, QuestionArgs>,
-    /// Provider block for this request: routing only, as {"order": [slugs],
+    /// Provider block for this request: routing plus passthrough, as {"order": [slugs],
     /// "only": [slugs], "ignore": [slugs], "allow_fallbacks": bool,
     /// "require_parameters": bool, "zdr": bool, "sort":
-    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none"}.
-    /// This endpoint has no per-provider `options` passthrough.
+    /// "price"|"throughput"|"latency"|"exacto", "sort_partition": "model"|"none",
+    /// "options": {slug: {param: value}}} - per-provider passthrough; only the
+    /// slug that serves the request is forwarded.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: ProviderRoutingArgs,
 }
@@ -228,13 +239,15 @@ pub(crate) struct MakeDecisionsArgs {
 #[tool_router(router = decisions_router, vis = "pub(crate)")]
 impl OpenRouterServer {
     #[tool(
-        description = "Ask an OpenRouter decisions model (TypeSafe Jev: typesafe/jev-1.13, alias \
-        ~typesafe/jev-latest - the tilde is required) typed questions about a `state` and get \
+        description = "Ask an OpenRouter decisions model (e.g. TypeSafe Jev: typesafe/jev-1.14, \
+        alias ~typesafe/jev-latest - the tilde is required) typed questions about a `state` and get \
         back probabilities, not text. This is a synchronous call to POST /api/alpha/decisions \
         (an alpha endpoint; chat_completion cannot use these models). Use it for routing, \
         classification, triage, verification of another model's answer, or any decision point \
         where a fast (~250 ms), calibrated, structured answer beats generated prose. `state` is \
-        what to judge: a string, a JSON object, or an array of them (text only). `questions` is \
+        what to judge: a string, a JSON object, or an array of them; images go in the array as \
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,...\"}} \
+        parts on models that take them. `questions` is \
         an object keyed by names you choose; each value is {type, instructions, criteria}: \
         type \"noul\" - a true/false question, optional criteria {\"true\": what makes it true, \
         \"false\": what makes it false}, answered as {noul: probability 0..1}; type \"choice\" - \
@@ -242,15 +255,18 @@ impl OpenRouterServer {
         answered as {choice: label, confidence, probabilities: {label: p}}; type \"score\" - a \
         graded scale, criteria REQUIRED as an array of 2 to 10 levels lowest first, answered as \
         {score: float over the level indexes, confidence, legend: {index: level}, \
-        probabilities: {index: p}}. Example: {\"state\": {\"ticket\": \"Checkout shows a blank \
+        probabilities: {index: p}}; type \"box\" - find the target `instructions` describe in \
+        an image in `state`, no criteria, answered as {box: {top, bottom, left, right} as \
+        fractions of the image height and width, confidence}. Example: {\"state\": {\"ticket\": \"Checkout shows a blank \
         page after Pay\"}, \"questions\": {\"is_bug\": {\"type\": \"noul\", \"instructions\": \
         \"Is the customer reporting a software defect?\"}, \"team\": {\"type\": \"choice\", \
         \"instructions\": \"Which team should own this ticket?\", \"criteria\": {\"payments\": \
         \"Checkout or billing\", \"frontend\": \"Rendering or layout\"}}, \"urgency\": {\"type\": \
         \"score\", \"instructions\": \"How urgent is this ticket?\", \"criteria\": [\"Can wait\", \
-        \"This week\", \"Blocking revenue now\"]}}}. `confidence` (0..1) appears only on choice \
-        and score answers. `provider` carries routing only (order, only, ignore, \
-        allow_fallbacks, require_parameters, zdr, sort) - no passthrough options. Returns JSON: \
+        \"This week\", \"Blocking revenue now\"]}}}. `confidence` (0..1) appears only on choice, \
+        score and box answers. `provider` carries routing (order, only, ignore, \
+        allow_fallbacks, require_parameters, zdr, sort) and per-provider `options` keyed by \
+        provider slug. Returns JSON: \
         model, id, provider, answers {name: answer}, usage {input_tokens, output_tokens, cost in \
         USD}, and generation_id - pass that to get_generation for the full cost record. \
         Pricing is per input token only (Jev: $0.042/M). Discover decisions models with \
@@ -461,6 +477,87 @@ mod tests {
 
     /// Shape errors are invalid params caught before any HTTP call and name
     /// the question; nothing is counted as a request.
+    /// `provider.options` reaches the alpha decisions path next to routing.
+    #[tokio::test]
+    async fn make_decisions_forwards_provider_options() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/alpha/decisions"))
+            .and(body_partial_json(json!({
+                "provider": {"only": ["typesafe"], "options": {"typesafe": {"k": 1}}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "answers": {"q": {"type": "noul", "noul": 0.5}},
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })))
+            .mount(&mock)
+            .await;
+
+        server_for(mock.uri())
+            .make_decisions(args(json!({
+                "model": "typesafe/jev-1.14",
+                "state": "text",
+                "questions": {"q": {"type": "noul", "instructions": "Is it?"}},
+                "provider": {"only": ["typesafe"], "options": {"typesafe": {"k": 1}}}
+            })))
+            .await
+            .expect("provider.options must reach the wire");
+    }
+
+    /// A box question about an image in `state` (an `image_url` part, as the
+    /// Jev guide shows) goes out as `{type, instructions}` and its edges come
+    /// back under the question's name.
+    #[tokio::test]
+    async fn make_decisions_asks_a_box_question_about_an_image_state() {
+        let state = json!([
+            "Product photo from the listing:",
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+        ]);
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/alpha/decisions"))
+            .and(body_partial_json(json!({
+                "state": state,
+                "questions": {
+                    "product": {"type": "box", "instructions": "the product in the listing photo"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-dec-box",
+                "model": "typesafe/jev-1.14-20261014",
+                "answers": {
+                    "product": {
+                        "type": "box",
+                        "box": {"top": 0.49, "bottom": 0.89, "left": 0.58, "right": 0.96},
+                        "confidence": 0.93
+                    }
+                },
+                "usage": {"input_tokens": 900, "output_tokens": 4}
+            })))
+            .mount(&mock)
+            .await;
+
+        let res = server_for(mock.uri())
+            .make_decisions(args(json!({
+                "model": "typesafe/jev-1.14",
+                "state": state,
+                "questions": {
+                    "product": {"type": "Box", "instructions": "the product in the listing photo"}
+                }
+            })))
+            .await
+            .unwrap();
+        let v = tool_result_json(&res);
+        assert_eq!(
+            v["answers"]["product"],
+            json!({
+                "type": "box",
+                "box": {"top": 0.49, "bottom": 0.89, "left": 0.58, "right": 0.96},
+                "confidence": 0.93
+            })
+        );
+    }
+
     #[tokio::test]
     async fn make_decisions_rejects_bad_shapes_before_any_call() {
         let mock = MockServer::start().await;
@@ -471,11 +568,19 @@ mod tests {
             })))
         };
 
-        let cases: [(Value, &str); 7] = [
+        let cases: [(Value, &str); 9] = [
             (json!({}), "at least one question"),
             (
                 json!({"q": {"type": "maybe", "instructions": "x"}}),
-                "\"noul\", \"choice\", \"score\"",
+                "\"noul\", \"choice\", \"score\", \"box\"",
+            ),
+            (
+                json!({"q": {"type": "box", "instructions": "x", "criteria": ["a", "b"]}}),
+                "box takes no criteria",
+            ),
+            (
+                json!({"q": {"type": "box", "instructions": " "}}),
+                "instructions must not be blank",
             ),
             (
                 json!({"q": {"type": "noul", "instructions": "x", "criteria": {"yes": "y"}}}),
