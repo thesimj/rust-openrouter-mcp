@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.1
 
 OpenRouter API changes (checked against openapi.json and the changelog on
 2026-10-26):
