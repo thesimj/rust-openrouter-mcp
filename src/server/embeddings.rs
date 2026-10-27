@@ -22,6 +22,7 @@ use super::OpenRouterServer;
 pub(crate) struct EmbedTextArgs {
     /// Embeddings model id, e.g. "openai/text-embedding-3-small". Discover
     /// them with list_models using output_modalities="embeddings".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// The texts to embed: one or more strings, none blank. One vector comes
     /// back per text, in the same order.
@@ -51,6 +52,7 @@ pub(crate) struct EmbedTextArgs {
 pub(crate) struct RerankDocumentsArgs {
     /// Rerank model id, e.g. "cohere/rerank-v3.5". Discover them with
     /// list_models using output_modalities="rerank".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// The query to rank the documents against.
     pub query: String,
@@ -203,25 +205,32 @@ impl OpenRouterServer {
 
         match self.client.get_generation(id).await {
             Ok(record) => {
-                self.stats.record_lookup(true).await;
+                self.stats.record_lookup(true);
                 json_text_result(&record)
             }
             Err(e) => {
-                self.stats.record_lookup(false).await;
-                let not_found = e
-                    .downcast_ref::<HttpFailure>()
-                    .is_some_and(|f| f.status == reqwest::StatusCode::NOT_FOUND);
-                if not_found {
-                    return Err(ErrorData::invalid_params(
+                self.stats.record_lookup(false);
+                match e.downcast_ref::<HttpFailure>().map(|f| f.status) {
+                    Some(reqwest::StatusCode::NOT_FOUND) => Err(ErrorData::invalid_params(
                         format!(
                             "generation {id:?} was not found (404): the id is unknown, or its \
                              record is not available yet - records can lag the request by a \
                              few seconds, so retry shortly. Upstream: {e:#}"
                         ),
                         None,
-                    ));
+                    )),
+                    // Documented since 2026-10-23: "The management key does not
+                    // have permission for this request".
+                    Some(reqwest::StatusCode::FORBIDDEN) => Err(ErrorData::internal_error(
+                        format!(
+                            "OpenRouter refused to show generation {id:?} (403): the configured \
+                             key has no permission to read this record. Set OPENROUTER_API_KEY \
+                             to a key with access to it. Upstream: {e:#}"
+                        ),
+                        None,
+                    )),
+                    _ => Err(internal_error_from(&e)),
                 }
-                Err(internal_error_from(&e))
             }
         }
     }
@@ -587,5 +596,30 @@ mod tests {
         let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
         assert_eq!(stats["requests_total"], 2);
         assert_eq!(stats["requests_failed"], 2);
+    }
+
+    /// A 403 (documented 2026-10-23 for a key without permission) says which
+    /// key setting to change instead of a bare internal error.
+    #[tokio::test]
+    async fn get_generation_explains_a_403() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/generation"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&mock)
+            .await;
+        let err = server_for(mock.uri())
+            .get_generation(Parameters(GetGenerationArgs {
+                generation_id: "gen-locked".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+        assert!(err.message.contains("gen-locked"), "got: {}", err.message);
+        assert!(
+            err.message.contains("OPENROUTER_API_KEY"),
+            "got: {}",
+            err.message
+        );
     }
 }

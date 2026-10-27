@@ -20,7 +20,7 @@ use crate::server::result::{
     invalid_params_from, json_text_result,
 };
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_f64, non_blank, require_all, scalarize_nullable,
+    RequireFields, de_lenient, de_opt_f64, non_blank, require_text, scalarize_nullable,
 };
 
 use super::OpenRouterServer;
@@ -33,6 +33,7 @@ pub(crate) struct TranscribeAudioArgs {
     /// Speech-to-text model id, e.g. "openai/gpt-4o-mini-transcribe" or
     /// "openai/whisper-1". Discover them with list_models using
     /// output_modalities="transcription".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// Local audio file to transcribe. One of path/base64.
     #[serde(default)]
@@ -80,6 +81,7 @@ pub(crate) struct GenerateAudioArgs {
     /// TTS model id, e.g. "hexgrad/kokoro-82m". Voice ids are model-specific, so
     /// pair this with a voice the model actually declares - `list_models` with
     /// output_modalities=speech reports each model's `supported_voices`.
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// REQUIRED (no default): the text to synthesize.
     #[serde(default)]
@@ -173,17 +175,12 @@ impl OpenRouterServer {
         // No defaults: input is the thing agents forget. `voice` is optional
         // because it is provider-dependent (cloning models take none); a model
         // that needs one rejects the request upstream with its own message.
-        let mut missing: Vec<&str> = Vec::new();
-        if args
-            .input
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        {
-            missing.push("input (the text to synthesize)");
-        }
-        require_all("generate_audio", "speech", &missing)?;
+        let input = require_text(
+            "generate_audio",
+            "speech",
+            "input (the text to synthesize)",
+            args.input,
+        )?;
 
         let provider = args.provider.into_audio_provider()?;
         let voice_reference =
@@ -192,7 +189,7 @@ impl OpenRouterServer {
         let model = args.model.clone();
         let req = SpeechGenRequest {
             model: args.model,
-            input: args.input.unwrap_or_default(),
+            input,
             voice: args.voice,
             response_format: args.response_format,
             speed: args.speed,
@@ -214,9 +211,9 @@ impl OpenRouterServer {
             None,
         );
 
-        match audio_gen::run_job(&self.client, &req, &output).await {
+        match audio_gen::run_job(&self.client, req, &output).await {
             Ok(result) => {
-                self.stats.record_audio(&model, None).await;
+                self.stats.record_audio(&model, None);
                 let mut env = json!({
                     "ok": true,
                     "kind": "audio",
@@ -239,7 +236,7 @@ impl OpenRouterServer {
                 Ok(res)
             }
             Err(e) => {
-                self.stats.record_audio_failure(&model, &e).await;
+                self.stats.record_audio_failure(&model, &e);
                 Err(internal_error_from(&e))
             }
         }
@@ -281,9 +278,10 @@ impl OpenRouterServer {
         let _work = self.admit_work()?;
         let req = resolve_transcribe_request(args).await?;
 
-        let outcome = audio_gen::transcribe(&self.client, &req).await;
+        let model = req.model.clone();
+        let outcome = audio_gen::transcribe(&self.client, req).await;
         self.finish_text_call(
-            &req.model,
+            &model,
             outcome,
             |r| r.cost,
             |r| {
@@ -351,9 +349,13 @@ pub(crate) async fn resolve_voice_reference(
         return Ok(None);
     }
     let (data, format) = media::load_audio_input(reference).await?;
-    audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref())
-        .map(Some)
-        .map_err(|e| invalid_params_from(&e))
+    // Decoding up to 15 MiB of base64 to check it belongs off the async runtime.
+    crate::resources::run_blocking(move || {
+        audio_gen::VoiceReference::new(&data, format.as_deref(), text.as_deref())
+    })
+    .await
+    .map(Some)
+    .map_err(|e| invalid_params_from(&e))
 }
 
 #[cfg(test)]
@@ -553,7 +555,7 @@ mod tests {
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{b64:?}");
             assert!(err.message.contains(expected), "got: {}", err.message);
         }
-        let stats = server.stats.snapshot().await;
+        let stats = server.stats.snapshot();
         assert_eq!(stats["requests_failed"], 0, "{stats}");
     }
 

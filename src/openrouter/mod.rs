@@ -289,15 +289,16 @@ pub(in crate::openrouter) fn content_type(resp: &BoundedResponse, default: &str)
 /// characters and `:` stay, everything else is percent-encoded, `/` included,
 /// so a `?`, `#`, space or slash cannot end the segment.
 pub(in crate::openrouter) fn path_segment(id: &str) -> String {
-    id.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~:".contains(&b) {
-                char::from(b).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
+    use std::fmt::Write as _;
+    let mut segment = String::with_capacity(id.len());
+    for b in id.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~:".contains(&b) {
+            segment.push(char::from(b));
+        } else {
+            write!(segment, "%{b:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    segment
 }
 
 /// A model id (`author/slug`, `:free` variants included) as URL path

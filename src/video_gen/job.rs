@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 
 use crate::image_gen::{self, InputImage};
 use crate::manifest::{self, FrameImageMeta, VideoClipMeta, VideoManifest};
-use crate::openrouter::{FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoSubmitBody};
+use crate::openrouter::{
+    FrameImage, ImageUrl, InputReference, OpenRouterClient, VideoStatus, VideoSubmitBody,
+};
 
 use super::{VideoGenRequest, VideoJobSummary, VideoSummary};
 
@@ -97,11 +99,11 @@ pub async fn run_job(
             image_url: ImageUrl {
                 url: p.data_url.clone(),
             },
-            frame_type: f.frame_type.clone(),
+            frame_type: f.frame_type,
         });
         frame_meta.push(FrameImageMeta {
             index: i + 1,
-            frame_type: f.frame_type.clone(),
+            frame_type: f.frame_type,
             source: f.path.to_string_lossy().into_owned(),
             normalized_width: p.normalized_width,
             normalized_height: p.normalized_height,
@@ -189,14 +191,11 @@ pub async fn run_job(
             "could not persist accepted video job {job_id}: {e:#}"
         ));
     }
-    let terminal = wait_for_video(
-        &job_id,
-        req.poll_interval_secs,
-        req.poll_timeout_secs,
-        || client.poll_video(&job_id),
-    )
+    let terminal = wait_for_video(&job_id, req.poll_interval, req.poll_timeout, || {
+        client.poll_video(&job_id)
+    })
     .await;
-    let interval = std::time::Duration::from_secs(req.poll_interval_secs);
+    let interval = req.poll_interval;
     let job = job_id.as_str();
     let deadline =
         super::resolve_delivery_timeout().map(|budget| tokio::time::Instant::now() + budget);
@@ -430,18 +429,21 @@ where
 /// Poll only GET requests again. Never repeat the billable submission.
 async fn wait_for_video<F, Fut>(
     job_id: &str,
-    interval_secs: u64,
-    timeout_secs: u64,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
     mut poll: F,
 ) -> Result<crate::openrouter::VideoPollResponse>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<crate::openrouter::VideoPollResponse>>,
 {
-    let interval = std::time::Duration::from_secs(interval_secs);
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs.min(super::MAX_TIMER_SECS));
-    let timed_out = || format!("video generation timed out after {timeout_secs}s (job {job_id})");
+    let deadline = tokio::time::Instant::now() + timeout.min(super::MAX_TIMER);
+    let timed_out = || {
+        format!(
+            "video generation timed out after {}s (job {job_id})",
+            timeout.as_secs()
+        )
+    };
     loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(timed_out());
@@ -450,9 +452,9 @@ where
             .await
             .with_context(timed_out)?;
         let delay = match result {
-            Ok(response) => match response.status.as_str() {
-                "completed" | "succeeded" => return Ok(response),
-                "failed" | "cancelled" | "canceled" | "expired" | "error" => {
+            Ok(response) => match response.status {
+                VideoStatus::Completed => return Ok(response),
+                VideoStatus::Failed | VideoStatus::Cancelled | VideoStatus::Expired => {
                     let error = anyhow::anyhow!(
                         "video generation {} (job {job_id}): {}",
                         response.status,
@@ -467,7 +469,7 @@ where
                     };
                     return Err(receipt.attach(error));
                 }
-                _ => interval,
+                VideoStatus::Pending | VideoStatus::InProgress | VideoStatus::Unknown => interval,
             },
             Err(error) => match poll_retry_delay(&error, interval) {
                 Some(delay) => delay,
@@ -519,7 +521,7 @@ mod tests {
             aspect_ratio: Some("16:9".to_string()),
             generate_audio: Some(true),
             seed: Some(7),
-            poll_timeout_secs: 30,
+            poll_timeout: std::time::Duration::from_secs(30),
             ..super::super::tests::request()
         }
     }
@@ -792,7 +794,7 @@ mod tests {
             aspect_ratio: None,
             frames: vec![super::super::VideoInput {
                 path: frame.clone(),
-                frame_type: "first_frame".to_string(),
+                frame_type: crate::openrouter::FrameType::FirstFrame,
             }],
             reference_audio: vec![super::super::MediaReference {
                 source: "https://cdn/song.mp3".to_string(),
@@ -968,7 +970,7 @@ mod audit_regression {
             model: "test/video".into(),
             prompt: Some("test".into()),
             duration: Some(5),
-            poll_timeout_secs: 5,
+            poll_timeout: std::time::Duration::from_secs(5),
             ..super::super::tests::request()
         }
     }
@@ -1251,6 +1253,9 @@ mod audit_regression {
         assert_eq!(saved["job_id"], "accepted-job");
         assert!(saved["cost"].is_null());
     }
+    fn secs(seconds: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(seconds)
+    }
     fn response(status: &str) -> crate::openrouter::VideoPollResponse {
         serde_json::from_value(serde_json::json!({"status":status})).unwrap()
     }
@@ -1272,19 +1277,19 @@ mod audit_regression {
             Ok(response("processing")),
             Ok(response("completed")),
         ]);
-        let done = wait_for_video("job-test", 2, 30, || {
+        let done = wait_for_video("job-test", secs(2), secs(30), || {
             std::future::ready(responses.pop_front().unwrap())
         })
         .await
         .unwrap();
-        assert_eq!(done.status, "completed");
+        assert_eq!(done.status, VideoStatus::Completed);
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(11));
         assert!(responses.is_empty());
     }
     #[tokio::test(start_paused = true)]
     async fn poll_timeout_never_exceeds_deadline_or_loses_job_id() {
         let start = tokio::time::Instant::now();
-        let error = wait_for_video("job-test", 1, 5, || {
+        let error = wait_for_video("job-test", secs(1), secs(5), || {
             std::future::ready(Err(failure(429, Some(100))))
         })
         .await
@@ -1294,13 +1299,13 @@ mod audit_regression {
     }
     #[tokio::test(start_paused = true)]
     async fn stalled_poll_is_bounded_and_permanent_errors_do_not_retry() {
-        let error = wait_for_video("stalled", 1, 5, std::future::pending)
+        let error = wait_for_video("stalled", secs(1), secs(5), std::future::pending)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("stalled"));
         for status in [401, 403, 404] {
             let mut calls = 0;
-            let error = wait_for_video("permanent", 1, 30, || {
+            let error = wait_for_video("permanent", secs(1), secs(30), || {
                 calls += 1;
                 std::future::ready(Err(failure(status, None)))
             })
@@ -1348,7 +1353,7 @@ mod audit_regression {
     }
     #[tokio::test(start_paused = true)]
     async fn absurd_poll_timeout_is_capped_instead_of_overflowing() {
-        let error = wait_for_video("capped", 1, u64::MAX, || {
+        let error = wait_for_video("capped", secs(1), std::time::Duration::MAX, || {
             std::future::ready(Err(failure(401, None)))
         })
         .await
@@ -1357,7 +1362,7 @@ mod audit_regression {
     }
     #[tokio::test(start_paused = true)]
     async fn terminal_failure_preserves_provider_explanation_and_known_cost() {
-        let error = wait_for_video("rejected",1,30,|| std::future::ready(Ok(
+        let error = wait_for_video("rejected",secs(1),secs(30),|| std::future::ready(Ok(
             serde_json::from_value(serde_json::json!({"status":"failed","error":"provider explanation","usage":{"cost":0.2}})).unwrap()
         ))).await.unwrap_err();
         assert!(format!("{error:#}").contains("provider explanation"));

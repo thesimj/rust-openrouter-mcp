@@ -48,12 +48,14 @@ pub struct ChatInputs<'a> {
     pub max_tokens: Option<u64>,
     pub images: &'a [InputImage],
     pub max_image_dimension: u32,
-    /// Documents, already resolved to `file` parts (data URLs).
-    pub files: &'a [FilePart],
+    /// Documents, already resolved to `file` parts (data URLs). Owned, like
+    /// `audio` and `videos`: each can be tens of MiB, so it moves into the
+    /// request instead of being copied.
+    pub files: Vec<FilePart>,
     /// Audio clips, already resolved to `input_audio` parts.
-    pub audio: &'a [InputAudio],
+    pub audio: Vec<InputAudio>,
     /// Videos, already resolved to `video_url` parts (URL or data URL).
-    pub videos: &'a [VideoUrl],
+    pub videos: Vec<VideoUrl>,
     /// Reasoning effort (max, xhigh, high, medium, low, minimal, none). With
     /// `reasoning_max_tokens` and `reasoning_exclude` all unset, no `reasoning`
     /// object is sent, so the model keeps its catalog default.
@@ -89,7 +91,8 @@ fn reasoning(inputs: &ChatInputs<'_>) -> Option<Reasoning> {
 /// return the reply: text, generation id, cost and token counts, plus the
 /// reasoning, annotations and finish reason when present. Errors if the
 /// model returns no choices or empty content.
-pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Result<ChatResult> {
+pub async fn complete(client: &OpenRouterClient, inputs: ChatInputs<'_>) -> Result<ChatResult> {
+    let reasoning = reasoning(&inputs);
     let mut messages = Vec::new();
     if let Some(system) = inputs.system {
         messages.push(Message {
@@ -127,22 +130,19 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         parts.extend(
             inputs
                 .files
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(|file| ContentPart::File { file }),
         );
         parts.extend(
             inputs
                 .audio
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(|input_audio| ContentPart::InputAudio { input_audio }),
         );
         parts.extend(
             inputs
                 .videos
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(|video_url| ContentPart::VideoUrl { video_url }),
         );
         Content::Parts(parts)
@@ -171,11 +171,11 @@ pub async fn complete(client: &OpenRouterClient, inputs: &ChatInputs<'_>) -> Res
         frequency_penalty: inputs.frequency_penalty,
         presence_penalty: inputs.presence_penalty,
         verbosity: inputs.verbosity.map(str::to_string),
-        response_format: inputs.response_format.clone(),
-        plugins: inputs.plugins.clone(),
-        web_search_options: inputs.web_search_options.clone(),
-        reasoning: reasoning(inputs),
-        provider: inputs.provider.clone(),
+        response_format: inputs.response_format,
+        plugins: inputs.plugins,
+        web_search_options: inputs.web_search_options,
+        reasoning,
+        provider: inputs.provider,
         audio: None,
     };
 
@@ -267,19 +267,19 @@ mod tests {
         }))
         .await;
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let inputs = ChatInputs {
+        let inputs = || ChatInputs {
             model: "m",
             prompt: "hello",
             ..Default::default()
         };
-        let result = complete(&client, &inputs).await.unwrap();
+        let result = complete(&client, inputs()).await.unwrap();
         assert_eq!(result.generation_id.as_deref(), Some("gen-chat-7"));
         assert_eq!(result.cost, Some(0.01));
 
         let server =
             mock_completion(serde_json::json!({"choices": [], "usage": {"cost": 0.01}})).await;
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let error = complete(&client, &inputs).await.unwrap_err();
+        let error = complete(&client, inputs()).await.unwrap_err();
         let receipt = crate::billing::Receipt::from_error(&error).expect("billed failure");
         assert_eq!(receipt.generation_id.as_deref(), Some("gen-chat-7"));
         assert_eq!(receipt.cost, Some(0.01));

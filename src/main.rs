@@ -21,6 +21,7 @@ mod output;
 mod pricing;
 mod resources;
 mod server;
+mod settings;
 mod stats;
 mod tasks;
 mod video_gen;

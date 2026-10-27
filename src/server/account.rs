@@ -12,7 +12,6 @@ use serde::Deserialize;
 
 use crate::server::result::{
     client_wants_inline_previews, internal_error_from, job_call_result, json_text_result,
-    snapshot_to_envelope,
 };
 use crate::server::schema::{de_bool, scalarize_nullable};
 
@@ -68,11 +67,8 @@ impl OpenRouterServer {
         task_id: String,
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.tasks.snapshot(&task_id).await {
-            Some(snap) => {
-                let env = snapshot_to_envelope(&task_id, &snap);
-                job_call_result(&env, inline_previews).await
-            }
+        match self.tasks.snapshot(&task_id) {
+            Some(snap) => job_call_result(&task_id, &snap, inline_previews).await,
             None => Err(ErrorData::invalid_params(
                 format!(
                     "unknown task_id \"{task_id}\" (tasks are in-memory per server process and lost on restart)"
@@ -151,7 +147,7 @@ impl OpenRouterServer {
         )
     )]
     pub(crate) async fn get_usage_stats(&self) -> Result<CallToolResult, ErrorData> {
-        json_text_result(&self.stats.snapshot().await)
+        json_text_result(&self.stats.snapshot())
     }
 
     #[tool(
@@ -176,7 +172,7 @@ impl OpenRouterServer {
                 None,
             ));
         }
-        self.stats.reset().await;
+        self.stats.reset();
         Ok(CallToolResult::success(vec![ContentBlock::text(
             "usage stats reset".to_string(),
         )]))

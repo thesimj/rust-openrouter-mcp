@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use std::hash::{Hash, Hasher};
 
 /// What kind of artifact a job produced - drives the filename prefix.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaKind {
     Image,
     Video,

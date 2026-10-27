@@ -211,6 +211,7 @@ pub(crate) struct MakeDecisionsArgs {
     /// later), or the alias "~typesafe/jev-latest" (the leading tilde is
     /// required). Discover them with list_models using
     /// output_modalities="decisions".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// The content to evaluate: a string, a JSON object (e.g. {"ticket": "...",
     /// "customer_tier": "enterprise"}), or an array of strings/objects. Pass

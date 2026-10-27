@@ -10,19 +10,21 @@ use super::{ImageProvider, InputReference, Usage};
 
 /// Request body for `POST /api/v1/images`. Optional fields are omitted when
 /// unset. `resolution`/`aspect_ratio` map from the tool's `image_size`/
-/// `aspect_ratio`; input images become `input_references`.
+/// `aspect_ratio`; input images become `input_references`. The prompt and the
+/// references are borrowed: every variant of a job sends the same ones, and
+/// the references can be tens of MiB of data URLs.
 #[derive(Debug, Serialize)]
-pub struct ImagesRequest {
+pub struct ImagesRequest<'a> {
     pub model: String,
-    pub prompt: String,
+    pub prompt: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub input_references: Vec<InputReference>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub input_references: &'a [InputReference],
     /// "auto" | "low" | "medium" | "high" | "xhigh" | "max". Provider support
     /// varies.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,11 +79,11 @@ mod tests {
     fn images_request_serializes_minimally() {
         let req = ImagesRequest {
             model: "openai/gpt-image-2".to_string(),
-            prompt: "an owl".to_string(),
+            prompt: "an owl",
             resolution: Some("1K".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             seed: None,
-            input_references: vec![InputReference::image(ImageUrl {
+            input_references: &[InputReference::image(ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
             })],
             quality: None,
@@ -111,11 +113,11 @@ mod tests {
     fn images_request_serializes_new_optional_knobs() {
         let req = ImagesRequest {
             model: "openai/gpt-image-2".to_string(),
-            prompt: "an owl".to_string(),
+            prompt: "an owl",
             resolution: None,
             aspect_ratio: None,
             seed: None,
-            input_references: vec![],
+            input_references: &[],
             quality: Some("high".to_string()),
             output_format: Some("webp".to_string()),
             background: Some("transparent".to_string()),
@@ -148,11 +150,11 @@ mod tests {
         );
         let req = ImagesRequest {
             model: "black-forest-labs/flux.2-pro".to_string(),
-            prompt: "an owl".to_string(),
+            prompt: "an owl",
             resolution: None,
             aspect_ratio: None,
             seed: None,
-            input_references: vec![],
+            input_references: &[],
             quality: None,
             output_format: None,
             background: None,

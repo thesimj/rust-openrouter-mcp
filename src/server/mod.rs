@@ -58,12 +58,19 @@ pub struct OpenRouterServer {
 
 impl OpenRouterServer {
     pub(crate) fn admit_work(&self) -> Result<tokio::sync::OwnedSemaphorePermit, rmcp::ErrorData> {
-        self.work.clone().try_acquire_owned().map_err(|_| {
-            rmcp::ErrorData::internal_error(
-                "Too many synchronous calls; wait for one to finish before retrying.",
-                None,
-            )
-        })
+        self.work
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => rmcp::ErrorData::internal_error(
+                    "Too many synchronous calls; wait for one to finish before retrying.",
+                    None,
+                ),
+                tokio::sync::TryAcquireError::Closed => rmcp::ErrorData::internal_error(
+                    "The server is shutting down and takes no new calls.",
+                    None,
+                ),
+            })
     }
 
     pub fn new(client: OpenRouterClient) -> Self {
@@ -128,17 +135,19 @@ impl ServerHandler for OpenRouterServer {
     }
 }
 
+/// Shutdown wait for running jobs (env `OPENROUTER_MCP_SHUTDOWN_TIMEOUT`, seconds).
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+const MAX_SHUTDOWN_GRACE_SECS: u64 = 300;
+
 /// Start the stdio MCP server and run until the client disconnects.
 pub async fn run() -> anyhow::Result<()> {
     let client = OpenRouterClient::from_env()?;
     let server = OpenRouterServer::new(client);
     let service = server.serve(stdio()).await?;
-    let grace = std::env::var("OPENROUTER_MCP_SHUTDOWN_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30)
-        .min(300);
-    supervise(service, std::time::Duration::from_secs(grace)).await
+    let grace_secs = crate::settings::env_number("OPENROUTER_MCP_SHUTDOWN_TIMEOUT")
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS)
+        .min(MAX_SHUTDOWN_GRACE_SECS);
+    supervise(service, std::time::Duration::from_secs(grace_secs)).await
 }
 
 async fn supervise(
@@ -168,6 +177,23 @@ async fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admit_work_tells_a_full_server_from_one_shutting_down() {
+        let server = test_support::server_for("http://127.0.0.1:9".to_string());
+        let _held: Vec<_> = (0..MAX_SYNC_CALLS)
+            .map(|_| server.admit_work().unwrap())
+            .collect();
+        let full = server.admit_work().unwrap_err();
+        assert!(full.message.contains("Too many"), "{}", full.message);
+        server.work.close();
+        let closed = server.admit_work().unwrap_err();
+        assert!(
+            closed.message.contains("shutting down"),
+            "{}",
+            closed.message
+        );
+    }
 
     /// Pins the handshake we advertise. A silent bump here changes what every
     /// client negotiates, so moving to `2026-07-28` must be a deliberate edit
@@ -210,7 +236,7 @@ mod lifecycle_tests {
         let server = test_support::server_for("http://127.0.0.1:9".into());
         let tasks = server.tasks.clone();
         let reservation = tasks.reserve(crate::tasks::TaskKind::Image).unwrap();
-        let id = reservation.id.clone();
+        let id = reservation.id().to_string();
         let (finish, finish_rx) = tokio::sync::oneshot::channel();
         let done = tasks
             .start(reservation, async move {
@@ -244,7 +270,7 @@ mod lifecycle_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            tasks.snapshot(&id).await.unwrap().status,
+            tasks.snapshot(&id).unwrap().status,
             crate::tasks::Status::Completed(_)
         ));
         done.await.unwrap();

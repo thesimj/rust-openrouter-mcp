@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[derive(Default)]
 struct ModelStats {
@@ -122,16 +122,22 @@ impl UsageStats {
         }
     }
 
+    /// Every update is a few additions under the lock and none can leave
+    /// `Inner` half-written, so a poisoned lock still holds valid counters.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Record one finished image job: `variants` image requests, of which
     /// `images` succeeded, with the summed `billing` of the answered requests.
-    pub async fn record_image_job(
+    pub fn record_image_job(
         &self,
         model: &str,
         variants: u64,
         images: u64,
         billing: &crate::billing::Totals,
     ) {
-        let mut s = self.inner.lock().await;
+        let mut s = self.lock();
         s.requests_total += variants;
         s.requests_failed += variants.saturating_sub(images);
         s.image_generations += variants;
@@ -145,8 +151,8 @@ impl UsageStats {
     /// transcribe_audio, embed_text, rerank_documents, make_decisions). `cost`
     /// is the reported USD `usage.cost`, if any. Failures go through
     /// [`record_text_failure`](Self::record_text_failure).
-    pub async fn record_text(&self, model: &str, cost: Option<f64>) {
-        let mut s = self.inner.lock().await;
+    pub fn record_text(&self, model: &str, cost: Option<f64>) {
+        let mut s = self.lock();
         s.requests_total += 1;
         s.text_generations += 1;
         s.account_cost(model, cost).requests += 1;
@@ -154,13 +160,8 @@ impl UsageStats {
 
     /// Record one video request and its saved clip count. An accepted job keeps
     /// its receipt even if delivery fails. Rejected submissions have no receipt.
-    pub async fn record_video(
-        &self,
-        model: &str,
-        clips: u64,
-        receipt: Option<&crate::billing::Receipt>,
-    ) {
-        let mut s = self.inner.lock().await;
+    pub fn record_video(&self, model: &str, clips: u64, receipt: Option<&crate::billing::Receipt>) {
+        let mut s = self.lock();
         s.requests_total += 1;
         s.video_generations += 1;
         if clips == 0 {
@@ -180,8 +181,8 @@ impl UsageStats {
     /// None` (the speech endpoint returns no inline usage.cost), which lands in
     /// `unknown_cost_count`; music passes the stream's `usage.cost`. Failures
     /// go through [`record_audio_failure`](Self::record_audio_failure).
-    pub async fn record_audio(&self, model: &str, cost: Option<f64>) {
-        let mut s = self.inner.lock().await;
+    pub fn record_audio(&self, model: &str, cost: Option<f64>) {
+        let mut s = self.lock();
         s.requests_total += 1;
         s.audio_generations += 1;
         s.audio_files += 1;
@@ -193,8 +194,8 @@ impl UsageStats {
     /// Record one metadata lookup (e.g. `get_generation`): it counts as a
     /// request (and a failure when `success` is false) but never as a
     /// generation or a cost - the record it fetches is some other call's bill.
-    pub async fn record_lookup(&self, success: bool) {
-        let mut s = self.inner.lock().await;
+    pub fn record_lookup(&self, success: bool) {
+        let mut s = self.lock();
         s.requests_total += 1;
         if !success {
             s.requests_failed += 1;
@@ -205,22 +206,22 @@ impl UsageStats {
     /// transcribe_audio, embed_text, rerank_documents, make_decisions): the
     /// failure counters plus whatever receipt `error` carries. The two always
     /// go together - a failed call that the provider answered is still billed.
-    pub async fn record_text_failure(&self, model: &str, error: &anyhow::Error) {
-        self.inner.lock().await.record_failure(model, error);
+    pub fn record_text_failure(&self, model: &str, error: &anyhow::Error) {
+        self.lock().record_failure(model, error);
     }
 
     /// Record one failed audio generation (`generate_audio`, `generate_music`):
     /// the failure counters plus whatever receipt `error` carries - the same
     /// pairing as [`record_text_failure`](Self::record_text_failure).
-    pub async fn record_audio_failure(&self, model: &str, error: &anyhow::Error) {
-        let mut s = self.inner.lock().await;
+    pub fn record_audio_failure(&self, model: &str, error: &anyhow::Error) {
+        let mut s = self.lock();
         s.audio_generations += 1;
         s.record_failure(model, error);
     }
 
     /// A JSON snapshot of the current counters.
-    pub async fn snapshot(&self) -> Value {
-        let s = self.inner.lock().await;
+    pub fn snapshot(&self) -> Value {
+        let s = self.lock();
         let uptime = (Utc::now() - s.started_at).num_seconds().max(0);
         let by_model: serde_json::Map<String, Value> = s
             .by_model
@@ -259,8 +260,8 @@ impl UsageStats {
     }
 
     /// Reset all counters (and the start time).
-    pub async fn reset(&self) {
-        *self.inner.lock().await = Inner::default();
+    pub fn reset(&self) {
+        *self.lock() = Inner::default();
     }
 }
 
@@ -268,19 +269,15 @@ impl UsageStats {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn record_and_snapshot_aggregates_by_model() {
+    #[test]
+    fn record_and_snapshot_aggregates_by_model() {
         let stats = UsageStats::new();
         // A 4-variant job: 3 succeeded (one without cost), 1 failed.
         let totals = |cost, unknown| crate::billing::Totals { cost, unknown };
-        stats
-            .record_image_job("model-a", 4, 3, &totals(0.20, 1))
-            .await;
-        stats
-            .record_image_job("model-b", 1, 1, &totals(0.04, 0))
-            .await;
+        stats.record_image_job("model-a", 4, 3, &totals(0.20, 1));
+        stats.record_image_job("model-b", 1, 1, &totals(0.04, 0));
 
-        let s = stats.snapshot().await;
+        let s = stats.snapshot();
         assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(s["requests_total"], 5);
         assert_eq!(s["requests_failed"], 1);
@@ -293,12 +290,12 @@ mod tests {
 
     /// A lookup (`get_generation`) is a request, never a generation or a
     /// cost: the record it fetches describes some other call's charge.
-    #[tokio::test]
-    async fn record_lookup_counts_requests_only() {
+    #[test]
+    fn record_lookup_counts_requests_only() {
         let stats = UsageStats::new();
-        stats.record_lookup(true).await;
-        stats.record_lookup(false).await;
-        let s = stats.snapshot().await;
+        stats.record_lookup(true);
+        stats.record_lookup(false);
+        let s = stats.snapshot();
         assert_eq!(s["requests_total"], 2);
         assert_eq!(s["requests_failed"], 1);
         assert_eq!(s["text_generations"], 0);
@@ -307,16 +304,14 @@ mod tests {
         assert!(s["by_model"].as_object().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn record_text_tracks_describe_calls() {
+    #[test]
+    fn record_text_tracks_describe_calls() {
         let stats = UsageStats::new();
-        stats.record_text("vision-a", Some(0.002)).await;
-        stats.record_text("vision-a", None).await; // success, cost unknown
-        stats
-            .record_text_failure("vision-b", &anyhow::anyhow!("boom"))
-            .await;
+        stats.record_text("vision-a", Some(0.002));
+        stats.record_text("vision-a", None); // success, cost unknown
+        stats.record_text_failure("vision-b", &anyhow::anyhow!("boom"));
 
-        let s = stats.snapshot().await;
+        let s = stats.snapshot();
         assert_eq!(s["requests_total"], 3);
         assert_eq!(s["requests_failed"], 1);
         assert_eq!(s["text_generations"], 2);
@@ -327,31 +322,31 @@ mod tests {
 
     /// Sub-cent charges (decisions, embeddings, rerank bill ~$0.00002 a call)
     /// must show in the snapshot, not round to 0.0; float-sum noise must not.
-    #[tokio::test]
-    async fn snapshot_shows_sub_cent_costs_without_float_noise() {
+    #[test]
+    fn snapshot_shows_sub_cent_costs_without_float_noise() {
         let stats = UsageStats::new();
-        stats.record_text("jev", Some(0.000022428)).await;
-        let s = stats.snapshot().await;
+        stats.record_text("jev", Some(0.000022428));
+        let s = stats.snapshot();
         assert_eq!(s["actual_cost_usd"], 0.000022);
         assert_eq!(s["by_model"]["jev"]["actual_cost_usd"], 0.000022);
 
-        stats.record_text("chat", Some(0.2)).await;
-        stats.record_text("chat", Some(0.04)).await;
-        let s = stats.snapshot().await;
+        stats.record_text("chat", Some(0.2));
+        stats.record_text("chat", Some(0.04));
+        let s = stats.snapshot();
         // 0.2 + 0.04 is 0.24000000000000002 in f64; the snapshot says 0.24.
         assert_eq!(s["by_model"]["chat"]["actual_cost_usd"], 0.24);
     }
 
-    #[tokio::test]
-    async fn reset_clears_counters() {
+    #[test]
+    fn reset_clears_counters() {
         let stats = UsageStats::new();
         let billing = crate::billing::Totals {
             cost: 0.1,
             unknown: 0,
         };
-        stats.record_image_job("m", 2, 2, &billing).await;
-        stats.reset().await;
-        let s = stats.snapshot().await;
+        stats.record_image_job("m", 2, 2, &billing);
+        stats.reset();
+        let s = stats.snapshot();
         assert_eq!(s["requests_total"], 0);
         assert_eq!(s["actual_cost_usd"], 0.0);
     }
@@ -361,33 +356,27 @@ mod tests {
 mod audit_regression {
     use super::*;
     use crate::billing::Receipt;
-    #[tokio::test]
-    async fn video_billing_is_per_request_and_survives_failed_delivery() {
+    #[test]
+    fn video_billing_is_per_request_and_survives_failed_delivery() {
         let stats = UsageStats::new();
-        stats
-            .record_video(
-                "video",
-                2,
-                Some(&Receipt {
-                    cost: Some(0.9),
-                    generation_id: None,
-                }),
-            )
-            .await;
-        stats
-            .record_video(
-                "video",
-                0,
-                Some(&Receipt {
-                    cost: Some(0.4),
-                    generation_id: None,
-                }),
-            )
-            .await;
-        stats
-            .record_video("video", 0, Some(&Receipt::default()))
-            .await;
-        let output = stats.snapshot().await;
+        stats.record_video(
+            "video",
+            2,
+            Some(&Receipt {
+                cost: Some(0.9),
+                generation_id: None,
+            }),
+        );
+        stats.record_video(
+            "video",
+            0,
+            Some(&Receipt {
+                cost: Some(0.4),
+                generation_id: None,
+            }),
+        );
+        stats.record_video("video", 0, Some(&Receipt::default()));
+        let output = stats.snapshot();
         assert_eq!(output["requests_total"], 3);
         assert_eq!(output["requests_failed"], 2);
         assert_eq!(output["videos_generated"], 2);
@@ -395,15 +384,15 @@ mod audit_regression {
         assert_eq!(output["unknown_cost_count"], 1);
         assert_eq!(output["by_model"]["video"]["actual_cost_usd"], 1.3);
     }
-    #[tokio::test]
-    async fn failed_text_extraction_keeps_receipt_without_double_counting_requests() {
+    #[test]
+    fn failed_text_extraction_keeps_receipt_without_double_counting_requests() {
         let stats = UsageStats::new();
         let error = anyhow::anyhow!("empty answer").context(Receipt {
             cost: Some(0.02),
             generation_id: None,
         });
-        stats.record_text_failure("chat", &error).await;
-        let output = stats.snapshot().await;
+        stats.record_text_failure("chat", &error);
+        let output = stats.snapshot();
         assert_eq!(output["requests_total"], 1);
         assert_eq!(output["requests_failed"], 1);
         assert_eq!(output["text_generations"], 0);
@@ -412,10 +401,8 @@ mod audit_regression {
 
         // Without a receipt nothing is billed and nothing is unknown: the
         // provider never answered.
-        stats
-            .record_text_failure("chat", &anyhow::anyhow!("connection reset"))
-            .await;
-        let output = stats.snapshot().await;
+        stats.record_text_failure("chat", &anyhow::anyhow!("connection reset"));
+        let output = stats.snapshot();
         assert_eq!(output["requests_failed"], 2);
         assert_eq!(output["actual_cost_usd"], 0.02);
         assert_eq!(output["unknown_cost_count"], 0);
@@ -424,17 +411,17 @@ mod audit_regression {
     /// The audio twin: a music stream that answered (and billed) but carried
     /// no audio counts as one failed audio generation with its cost booked;
     /// a receipt without a cost is an unknown charge, not a free one.
-    #[tokio::test]
-    async fn failed_audio_generation_keeps_receipt_and_counts_no_file() {
+    #[test]
+    fn failed_audio_generation_keeps_receipt_and_counts_no_file() {
         let stats = UsageStats::new();
         let billed = anyhow::anyhow!("no audio").context(Receipt {
             cost: Some(0.04),
             generation_id: Some("gen-music".into()),
         });
-        stats.record_audio_failure("lyria", &billed).await;
+        stats.record_audio_failure("lyria", &billed);
         let unknown = anyhow::anyhow!("no audio").context(Receipt::default());
-        stats.record_audio_failure("lyria", &unknown).await;
-        let output = stats.snapshot().await;
+        stats.record_audio_failure("lyria", &unknown);
+        let output = stats.snapshot();
         assert_eq!(output["requests_total"], 2);
         assert_eq!(output["requests_failed"], 2);
         assert_eq!(output["audio_generations"], 2);

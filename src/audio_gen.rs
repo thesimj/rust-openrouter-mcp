@@ -31,12 +31,12 @@ pub(crate) const INPUT_AUDIO_FORMATS: [&str; 10] = [
 /// Local decoded audio limit (25 MiB) for every audio input except the voice
 /// reference, applied to files and inline data. This bounds memory use;
 /// OpenRouter JSON requests may support larger inputs.
-const MAX_INPUT_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_INPUT_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Decoded cap for a voice-cloning reference sample sent as
 /// `input_references[].input_audio` on `/audio/speech` (OpenRouter documents
 /// 15 MiB decoded / 20 MiB base64).
-pub const MAX_VOICE_REFERENCE_BYTES: u64 = 15 * 1024 * 1024;
+pub const MAX_VOICE_REFERENCE_BYTES: usize = 15 * 1024 * 1024;
 
 /// Documented cap on the `text` part of a voice reference (the transcript of
 /// the sample).
@@ -112,7 +112,7 @@ pub async fn read_audio_file(
     let path = path.to_path_buf();
     let format = format.to_string();
     crate::resources::run_blocking(move || {
-        let bytes = crate::resources::read_file_limited(&path, MAX_INPUT_AUDIO_BYTES as usize)?;
+        let bytes = crate::resources::read_file_limited(&path, MAX_INPUT_AUDIO_BYTES)?;
         Ok((
             base64::engine::general_purpose::STANDARD.encode(bytes),
             format,
@@ -140,21 +140,21 @@ pub(crate) fn validate_inline_audio(data: &str, format: &str) -> Result<(String,
 fn validate_inline_audio_within(
     data: &str,
     format: Option<&str>,
-    limit: u64,
+    limit: usize,
     what: &str,
 ) -> Result<(String, Option<String>)> {
     let data = crate::base64_codec::compact_base64(data);
     let format = format
         .map(|f| input_audio_format(f).with_context(|| format!("unsupported audio format {f:?}")))
         .transpose()?;
-    if data.len() > crate::base64_codec::max_base64_len(limit as usize) {
+    if data.len() > crate::base64_codec::max_base64_len(limit) {
         bail!("audio exceeds the local {what} limit of {limit} decoded bytes");
     }
     let bytes = crate::base64_codec::decode_base64(&data).context("invalid base64 audio")?;
     if bytes.is_empty() {
         bail!("audio is empty");
     }
-    if bytes.len() as u64 > limit {
+    if bytes.len() > limit {
         bail!("audio exceeds the local {what} limit of {limit} decoded bytes");
     }
     Ok((data.into_owned(), format.map(str::to_string)))
@@ -222,7 +222,7 @@ impl VoiceReference {
 /// the caller (see [`validate_inline_audio`]), wherever the bytes came from.
 pub async fn transcribe(
     client: &OpenRouterClient,
-    req: &TranscribeRequest,
+    req: TranscribeRequest,
 ) -> Result<TranscribeResult> {
     // Normalize blank values and case before checking the format:
     // trim+lowercase response_format so "Verbose_json"/" json " both work, and
@@ -242,13 +242,13 @@ pub async fn transcribe(
         .collect();
 
     let body = TranscriptionBody {
-        model: req.model.clone(),
-        input_audio: req.audio.clone(),
-        language: req.language.clone(),
+        model: req.model,
+        input_audio: req.audio,
+        language: req.language,
         response_format: response_format.clone(),
         timestamp_granularities,
         temperature: req.temperature,
-        provider: req.provider.clone(),
+        provider: req.provider,
     };
     let (raw, generation_id) = client.transcribe(&body).await?;
     let cost = raw
@@ -359,14 +359,14 @@ pub(crate) fn normalize_voice(raw: Option<&str>) -> Option<String> {
 /// [`crate::audio_container::container_for`]), and write the sidecar manifest.
 pub async fn run_job(
     client: &OpenRouterClient,
-    req: &SpeechGenRequest,
+    req: SpeechGenRequest,
     output: &Path,
 ) -> Result<AudioJobResult> {
     let response_format = normalize_response_format(req.response_format.as_deref());
     let voice = normalize_voice(req.voice.as_deref());
+    let has_voice_reference = req.voice_reference.is_some();
     let input_references = req
         .voice_reference
-        .clone()
         .map(VoiceReference::into_parts)
         .unwrap_or_default();
 
@@ -405,7 +405,7 @@ pub async fn run_job(
         input: req.input.clone(),
         input_source: crate::manifest::PROMPT_SOURCE,
         voice: voice.clone(),
-        voice_reference: req.voice_reference.is_some(),
+        voice_reference: has_voice_reference,
         response_format: response_format.clone(),
         speed: req.speed,
         provider: req.provider.clone(),
@@ -491,7 +491,7 @@ mod tests {
                 provider: None,
             };
             let dir = tempfile::tempdir().unwrap();
-            let result = run_job(&client, &req, &dir.path().join("speech"))
+            let result = run_job(&client, req, &dir.path().join("speech"))
                 .await
                 .unwrap();
             let case = format!("{content_type} {bytes:?} {requested:?}");
@@ -533,7 +533,7 @@ mod tests {
         };
         // Pass an output with the "wrong" extension; the saved file is corrected.
         let base = std::env::temp_dir().join("openrouter-mcp-audio-test/speech.wav");
-        let result = run_job(&client, &req, &base).await.unwrap();
+        let result = run_job(&client, req, &base).await.unwrap();
 
         assert_eq!(result.model, "openai/gpt-4o-mini-tts");
         assert_eq!(result.audio.mime, "audio/mpeg");
@@ -572,7 +572,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-blank-format/speech.mp3");
-        let result = run_job(&client, &req, &base).await.unwrap();
+        let result = run_job(&client, req, &base).await.unwrap();
         assert_eq!(result.audio.response_format, "mp3");
     }
 
@@ -622,7 +622,7 @@ mod tests {
             }),
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-ref/speech.mp3");
-        let result = run_job(&client, &req, &base).await.unwrap();
+        let result = run_job(&client, req, &base).await.unwrap();
         assert_eq!(result.audio.voice, None);
 
         let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
@@ -667,7 +667,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-novoice/speech.mp3");
-        let result = run_job(&client, &req, &base).await.unwrap();
+        let result = run_job(&client, req, &base).await.unwrap();
         assert_eq!(result.audio.voice, None);
 
         let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
@@ -721,7 +721,7 @@ mod tests {
                 .is_ok()
         );
 
-        let too_large = "A".repeat((MAX_VOICE_REFERENCE_BYTES.div_ceil(3) * 4 + 4) as usize);
+        let too_large = "A".repeat(MAX_VOICE_REFERENCE_BYTES.div_ceil(3) * 4 + 4);
         let err = VoiceReference::new(&too_large, None, None).unwrap_err();
         assert!(err.to_string().contains("voice reference"), "got: {err}");
         assert!(
@@ -756,7 +756,7 @@ mod tests {
             provider: None,
         };
         let base = std::env::temp_dir().join("openrouter-mcp-audio-err/speech.mp3");
-        let err = match run_job(&client, &req, &base).await {
+        let err = match run_job(&client, req, &base).await {
             Err(e) => e,
             Ok(_) => panic!("provider error should propagate"),
         };
@@ -797,7 +797,7 @@ mod tests {
                 .await;
 
             let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-            let result = transcribe(&client, &transcribe_req(Some(input), &[]))
+            let result = transcribe(&client, transcribe_req(Some(input), &[]))
                 .await
                 .unwrap();
             // The gate reads the same normalized value, so verbose output is
@@ -823,7 +823,7 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let result = transcribe(&client, &transcribe_req(Some("   "), &[]))
+        let result = transcribe(&client, transcribe_req(Some("   "), &[]))
             .await
             .unwrap();
         assert!(result.verbose.is_none());
@@ -852,7 +852,7 @@ mod tests {
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         transcribe(
             &client,
-            &transcribe_req(None, &["  ", "Word", "", " Segment "]),
+            transcribe_req(None, &["  ", "Word", "", " Segment "]),
         )
         .await
         .unwrap();
@@ -872,7 +872,7 @@ mod tests {
             .await;
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
-        let result = transcribe(&client, &transcribe_req(Some("verbose_json"), &[]))
+        let result = transcribe(&client, transcribe_req(Some("verbose_json"), &[]))
             .await
             .unwrap();
         let v = result.verbose.expect("verbose object still returned");
@@ -910,7 +910,7 @@ mod audit_regression {
         ] {
             assert_eq!(validate_inline_audio("QUJD", format).unwrap().1, expected);
         }
-        let too_large = "A".repeat((MAX_INPUT_AUDIO_BYTES.div_ceil(3) * 4 + 4) as usize);
+        let too_large = "A".repeat(MAX_INPUT_AUDIO_BYTES.div_ceil(3) * 4 + 4);
         assert!(
             validate_inline_audio(&too_large, "wav")
                 .unwrap_err()

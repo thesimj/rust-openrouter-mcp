@@ -57,7 +57,7 @@ const MAX_INLINE_MEDIA: usize = 4;
 /// Largest audio file embedded inline as a base64 AudioContent block. Larger
 /// files bloat the client's context badly, so they are reported by path only
 /// (the file is always saved to disk regardless).
-pub(crate) const MAX_INLINE_AUDIO_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_INLINE_AUDIO_BYTES: usize = 4 * 1024 * 1024;
 
 /// Render `value` as a pretty-JSON text block: the first (often only)
 /// content block of a tool result. Media tools append their inline blocks
@@ -94,11 +94,11 @@ impl OpenRouterServer {
     ) -> Result<CallToolResult, ErrorData> {
         match outcome {
             Ok(result) => {
-                self.stats.record_text(model, cost(&result)).await;
+                self.stats.record_text(model, cost(&result));
                 render(result)
             }
             Err(e) => {
-                self.stats.record_text_failure(model, &e).await;
+                self.stats.record_text_failure(model, &e);
                 Err(internal_error_from(&e))
             }
         }
@@ -249,17 +249,19 @@ pub(crate) fn client_wants_inline_previews(ctx: &RequestContext<RoleServer>) -> 
     !client.contains("claude-code")
 }
 
-/// Build the full tool result for a job envelope: the JSON metadata as a text
-/// block, followed (when `inline_previews` and the job completed) by an inline
-/// image preview of each generated image.
+/// Build the full tool result for a task: its [`snapshot_to_envelope`] JSON as
+/// a text block, followed (when `inline_previews` and the job completed) by an
+/// inline preview of each generated image or a link to each clip.
 pub(crate) async fn job_call_result(
-    env: &serde_json::Value,
+    task_id: &str,
+    snap: &TaskSnapshot,
     inline_previews: bool,
 ) -> Result<CallToolResult, ErrorData> {
-    let mut result = json_text_result(env)?;
+    let env = snapshot_to_envelope(task_id, snap);
+    let mut result = json_text_result(&env)?;
     let blocks = &mut result.content;
 
-    if inline_previews && env.get("status").and_then(|s| s.as_str()) == Some("completed") {
+    if inline_previews && matches!(snap.status, Status::Completed(_)) {
         static PREVIEW_CAPACITY: std::sync::OnceLock<tokio::sync::Semaphore> =
             std::sync::OnceLock::new();
         let Ok(_preview_permit) = PREVIEW_CAPACITY
@@ -271,19 +273,18 @@ pub(crate) async fn job_call_result(
             ));
             return Ok(result);
         };
-        match env.get("kind").and_then(|k| k.as_str()) {
-            Some("video") => {
-                let paths = envelope_video_paths(env);
+        match snap.kind {
+            TaskKind::Video => {
+                let paths = envelope_video_paths(&env);
                 // A filesystem stat per clip is blocking I/O; keep it off the worker.
                 let links =
                     crate::resources::run_blocking(move || Ok(video_resource_link_blocks(&paths)))
                         .await
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        .map_err(|e| internal_error_from(&e))?;
                 blocks.extend(links);
             }
-            // "image" (and the historical default) get inline image previews.
-            _ => {
-                let paths = envelope_image_paths(env);
+            TaskKind::Image => {
+                let paths = envelope_image_paths(&env);
                 let total = paths.len();
                 // Reading + decoding + resizing + re-encoding images is blocking CPU
                 // and disk I/O; run it off the async worker so concurrent tool calls
@@ -291,7 +292,7 @@ pub(crate) async fn job_call_result(
                 let previews =
                     crate::resources::run_blocking(move || Ok(encode_preview_blocks(&paths)))
                         .await
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        .map_err(|e| internal_error_from(&e))?;
                 let shown = previews.len();
                 blocks.extend(previews);
                 if total > MAX_INLINE_PREVIEWS {
@@ -309,7 +310,7 @@ pub(crate) async fn job_call_result(
 /// Wrap a task snapshot into the response envelope returned by `generate_image`
 /// (fast path) and `get_result`: the completed result, an error, or a pending
 /// note - always carrying `task_id`, `status`, and `kind`.
-pub(crate) fn snapshot_to_envelope(task_id: &str, snap: &TaskSnapshot) -> serde_json::Value {
+fn snapshot_to_envelope(task_id: &str, snap: &TaskSnapshot) -> serde_json::Value {
     let mut env = match &snap.status {
         Status::Completed(result) => result.clone(),
         Status::Failed(error) => json!({ "ok": false, "error": error }),
@@ -375,8 +376,8 @@ impl OpenRouterServer {
         F: FnOnce(OpenRouterClientCtx) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = JobOutcome> + Send + 'static,
     {
-        let task_id = reservation.id.clone();
-        let kind = reservation.kind;
+        let task_id = reservation.id().to_string();
+        let kind = reservation.kind();
         let ctx = OpenRouterClientCtx {
             client: self.client.clone(),
             stats: self.stats.clone(),
@@ -395,10 +396,8 @@ impl OpenRouterServer {
         let snap = self
             .tasks
             .snapshot(&task_id)
-            .await
             .unwrap_or_else(|| TaskSnapshot::pending(kind));
-        let env = snapshot_to_envelope(&task_id, &snap);
-        let mut result = job_call_result(&env, inline_previews).await?;
+        let mut result = job_call_result(&task_id, &snap, inline_previews).await?;
         // A lookup may succeed for a failed job, but the original generation failed.
         if matches!(snap.status, Status::Failed(_)) {
             result.is_error = Some(true);
@@ -424,7 +423,7 @@ pub(crate) async fn inline_audio_block(
 ) -> Result<Option<ContentBlock>, ErrorData> {
     crate::resources::run_blocking(move || {
         Ok(
-            crate::resources::read_file_limited(&path, MAX_INLINE_AUDIO_BYTES as usize)
+            crate::resources::read_file_limited(&path, MAX_INLINE_AUDIO_BYTES)
                 .ok()
                 .map(|bytes| {
                     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -433,7 +432,7 @@ pub(crate) async fn inline_audio_block(
         )
     })
     .await
-    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    .map_err(|e| internal_error_from(&e))
 }
 
 #[cfg(test)]
@@ -508,13 +507,14 @@ mod tests {
         // (rmcp 3 has no native video block) when the client wants inline media.
         let clip = std::env::temp_dir().join("openrouter-mcp-clip.mp4");
         std::fs::write(&clip, b"FAKE-MP4-BYTES").unwrap();
-        let env = json!({
-            "status": "completed",
-            "kind": "video",
-            "videos": [ { "path": clip.to_string_lossy() } ],
-        });
+        let snap = TaskSnapshot {
+            kind: TaskKind::Video,
+            status: Status::Completed(json!({
+                "videos": [ { "path": clip.to_string_lossy() } ],
+            })),
+        };
 
-        let res = job_call_result(&env, true).await.unwrap();
+        let res = job_call_result("task-v", &snap, true).await.unwrap();
         let link = serde_json::to_value(&res).unwrap()["content"]
             .as_array()
             .unwrap()
@@ -526,7 +526,7 @@ mod tests {
         assert!(link["uri"].as_str().unwrap().starts_with("file://"));
 
         // With inline media off, only the JSON text block remains.
-        let res_off = job_call_result(&env, false).await.unwrap();
+        let res_off = job_call_result("task-v", &snap, false).await.unwrap();
         assert!(
             !serde_json::to_value(&res_off).unwrap()["content"]
                 .as_array()
@@ -543,10 +543,12 @@ mod tests {
             .decode(valid_png_b64())
             .unwrap();
         std::fs::write(&good, &png).unwrap();
-        let env = json!({
-            "status": "completed",
-            "images": [ { "path": good.to_string_lossy() } ],
-        });
+        let snap = TaskSnapshot {
+            kind: TaskKind::Image,
+            status: Status::Completed(json!({
+                "images": [ { "path": good.to_string_lossy() } ],
+            })),
+        };
 
         let has_image = |res: &CallToolResult| {
             serde_json::to_value(res).unwrap()["content"]
@@ -556,12 +558,16 @@ mod tests {
                 .any(|c| c["type"] == "image")
         };
         // Desktop-style: previews on. CLI-style: text only.
-        assert!(has_image(&job_call_result(&env, true).await.unwrap()));
-        assert!(!has_image(&job_call_result(&env, false).await.unwrap()));
+        let result = |snap, previews| job_call_result("task-i", snap, previews);
+        assert!(has_image(&result(&snap, true).await.unwrap()));
+        assert!(!has_image(&result(&snap, false).await.unwrap()));
 
         // A pending job never carries a preview, even with previews enabled.
-        let pending = json!({ "status": "pending", "images": [] });
-        assert!(!has_image(&job_call_result(&pending, true).await.unwrap()));
+        let pending = TaskSnapshot {
+            kind: TaskKind::Image,
+            status: Status::Pending,
+        };
+        assert!(!has_image(&result(&pending, true).await.unwrap()));
     }
 }
 

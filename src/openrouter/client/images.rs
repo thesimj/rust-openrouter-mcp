@@ -16,7 +16,7 @@ impl OpenRouterClient {
     /// is surfaced (bounded to `MAX_ERROR_BODY_CHARS`) (OpenRouter wraps provider errors there).
     pub async fn generate_images(
         &self,
-        req: &ImagesRequest,
+        req: &ImagesRequest<'_>,
     ) -> Result<(ImagesResponse, Option<String>)> {
         let rb = self.request(Method::POST, "/images").json(req);
         self.send_json_receipted(rb, "/images").await
@@ -31,14 +31,14 @@ mod tests {
 
     use crate::openrouter::{ImagesRequest, OpenRouterClient};
 
-    fn request() -> ImagesRequest {
+    fn request() -> ImagesRequest<'static> {
         ImagesRequest {
             model: "openai/gpt-image-2".to_string(),
-            prompt: "an owl".to_string(),
+            prompt: "an owl",
             resolution: Some("1K".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             seed: None,
-            input_references: vec![],
+            input_references: &[],
             quality: None,
             output_format: None,
             background: None,

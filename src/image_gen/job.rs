@@ -111,10 +111,9 @@ pub fn variant_output_path(
 pub struct ImageSummary {
     pub path: PathBuf,
     pub seed: Option<u64>,
-    pub width: u32,
-    pub height: u32,
-    pub actual_aspect_ratio: String,
-    pub actual_image_size: &'static str,
+    /// `None` when the size of a saved SVG cannot be read.
+    pub dimensions: Option<(u32, u32)>,
+    pub check: Option<image_io::DimensionCheck>,
 }
 
 /// Result of a full generation job: the saved images, the manifest path, plus
@@ -216,28 +215,33 @@ async fn deliver_variant(
             // the whole batch (the image was generated and paid for).
             match crate::output::write_bytes(&path, &img.bytes).await {
                 Ok(()) => {
-                    let check = image_io::check_dimensions(
-                        img.width,
-                        img.height,
-                        req.aspect_ratio.as_deref(),
-                        req.image_size.as_deref(),
-                    );
-                    for w in check.warnings.iter().chain(&img.warnings) {
+                    let check = img.dimensions.map(|(width, height)| {
+                        image_io::check_dimensions(
+                            width,
+                            height,
+                            req.aspect_ratio.as_deref(),
+                            req.image_size.as_deref(),
+                        )
+                    });
+                    let check_warnings = check.iter().flat_map(|check| &check.warnings);
+                    for w in check_warnings.chain(&img.warnings) {
                         warnings.push(format!("variant {}: {w}", outcome.index + 1));
                     }
                     meta.path = Some(path.to_string_lossy().into_owned());
                     meta.mime_type = Some(img.mime.clone());
-                    meta.width = Some(img.width);
-                    meta.height = Some(img.height);
-                    meta.actual_aspect_ratio = Some(check.actual_aspect_ratio.clone());
-                    meta.actual_image_size = Some(check.actual_image_size.to_string());
+                    meta.width = img.dimensions.map(|(width, _)| width);
+                    meta.height = img.dimensions.map(|(_, height)| height);
+                    meta.actual_aspect_ratio = check
+                        .as_ref()
+                        .map(|check| check.actual_aspect_ratio.clone());
+                    meta.actual_image_size = check
+                        .as_ref()
+                        .map(|check| check.actual_image_size.to_string());
                     image = Some(ImageSummary {
                         path,
                         seed: outcome.seed,
-                        width: img.width,
-                        height: img.height,
-                        actual_aspect_ratio: check.actual_aspect_ratio,
-                        actual_image_size: check.actual_image_size,
+                        dimensions: img.dimensions,
+                        check,
                     });
                 }
                 Err(e) => {
@@ -437,8 +441,7 @@ mod audit_regression {
         let image = |cost, id: &str| GeneratedImage {
             bytes: vec![1, 2, 3],
             mime: "image/png".into(),
-            width: 1,
-            height: 1,
+            dimensions: Some((1, 1)),
             cost,
             generation_id: Some(id.into()),
             warnings: vec!["provider note".into()],
@@ -485,6 +488,45 @@ mod audit_regression {
         assert_eq!(manifest["variants"][2]["generation_id"], "decode-failed");
     }
 
+    /// An SVG whose size cannot be read gets no size check: no "0:0" aspect
+    /// and no "requested image_size 1K but image is ~0.5K" warning.
+    #[tokio::test]
+    async fn unknown_svg_size_skips_the_dimension_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("vector.svg");
+        let req = GenerateRequest {
+            image_size: Some("1K".into()),
+            aspect_ratio: Some("1:1".into()),
+            ..request()
+        };
+        let outcome = VariantOutcome {
+            index: 0,
+            seed: None,
+            duration_ms: 1,
+            result: Ok(GeneratedImage {
+                bytes: b"<svg".to_vec(),
+                mime: "image/svg+xml".into(),
+                dimensions: None,
+                cost: None,
+                generation_id: None,
+                warnings: vec!["could not read the SVG's size".into()],
+            }),
+        };
+        let summary = save_outcomes(&req, &base, vec![], vec![], vec![outcome]).await;
+        assert_eq!(summary.images.len(), 1);
+        assert!(summary.images[0].check.is_none());
+        assert_eq!(
+            summary.warnings,
+            vec!["variant 1: could not read the SVG's size"]
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary.manifest_path).unwrap()).unwrap();
+        let variant = &manifest["variants"][0];
+        assert!(variant["path"].is_string());
+        assert!(variant.get("actual_aspect_ratio").is_none(), "{variant}");
+        assert!(variant.get("width").is_none(), "{variant}");
+    }
+
     #[test]
     fn extreme_seed_variants_keep_distinct_output_paths() {
         let paths: std::collections::HashSet<_> = (0..16)
@@ -520,7 +562,7 @@ mod audit_regression {
                 12,
                 GenContent {
                     prompt: "test".into(),
-                    reference_urls: vec![],
+                    input_references: vec![],
                 },
             )
             .await
@@ -572,7 +614,7 @@ mod audit_regression {
             3,
             GenContent {
                 prompt: "test".into(),
-                reference_urls: vec![],
+                input_references: vec![],
             },
         )
         .await;

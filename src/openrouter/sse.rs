@@ -40,11 +40,13 @@ impl SseParser {
     /// Flush an event left unterminated when the body ended (no final blank
     /// line). A trailing partial `data` line is included.
     pub(crate) fn finish(&mut self) -> Option<String> {
-        if !self.line.is_empty() {
-            // A non-blank line never completes an event, so nothing is returned.
-            self.end_line();
-        }
-        self.dispatch()
+        // A lone `\r` left from a cut `\r\n` is a blank line that completes the event.
+        let completed = if self.line.is_empty() {
+            None
+        } else {
+            self.end_line()
+        };
+        completed.or_else(|| self.dispatch())
     }
 
     /// Consume the buffered line: a blank line completes the event, a `data`
@@ -127,5 +129,12 @@ mod tests {
         let mut parser = SseParser::default();
         assert!(parser.push(b"data: kept\n: trailing comment").is_empty());
         assert_eq!(parser.finish().as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn finish_keeps_an_event_whose_crlf_blank_line_was_cut_after_the_cr() {
+        let mut parser = SseParser::default();
+        assert!(parser.push(b"data: x\r\n\r").is_empty());
+        assert_eq!(parser.finish().as_deref(), Some("x"));
     }
 }

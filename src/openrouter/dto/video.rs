@@ -52,13 +52,20 @@ pub struct MediaUrl {
     pub url: String,
 }
 
-/// A first/last frame for image-to-video (`frame_type` is `first_frame` or
-/// `last_frame`), sent as a data-URL `image_url`.
+/// A first/last frame for image-to-video, sent as a data-URL `image_url`.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename = "image_url")]
 pub struct FrameImage {
     pub image_url: ImageUrl,
-    pub frame_type: String,
+    pub frame_type: FrameType,
+}
+
+/// Which end of the clip a frame image pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameType {
+    FirstFrame,
+    LastFrame,
 }
 
 /// A reference for reference-to-video: an image (data-URL `image_url`), or an
@@ -104,7 +111,7 @@ pub struct VideoSubmitResponse {
 pub struct VideoPollResponse {
     #[serde(default)]
     pub generation_id: Option<String>,
-    pub status: String,
+    pub status: VideoStatus,
     /// Documented as a string; tolerate an object (`{code, message}`) too, since
     /// a decode failure here would lose the terminal status and its receipt.
     #[serde(default, deserialize_with = "lenient_error")]
@@ -113,6 +120,40 @@ pub struct VideoPollResponse {
     pub unsigned_urls: Vec<String>,
     #[serde(default)]
     pub usage: Option<VideoUsage>,
+}
+
+/// Job state from `GET /videos/{jobId}`. The spec lists `pending`,
+/// `in_progress`, `completed`, `failed`, `cancelled` and `expired`, and allows
+/// other values. The aliases are spellings other providers use for the same
+/// state. An unknown value keeps the job polling until its timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStatus {
+    Pending,
+    InProgress,
+    #[serde(alias = "succeeded")]
+    Completed,
+    #[serde(alias = "error")]
+    Failed,
+    #[serde(alias = "canceled")]
+    Cancelled,
+    Expired,
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for VideoStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 fn lenient_error<'de, D: serde::Deserializer<'de>>(
@@ -144,7 +185,7 @@ mod tests {
             image_url: ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
             },
-            frame_type: "first_frame".to_string(),
+            frame_type: FrameType::FirstFrame,
         };
         assert_eq!(
             serde_json::to_value(&fi).unwrap(),
@@ -265,5 +306,20 @@ mod audit_regression {
             Some(r#"{"code":500}"#)
         );
         assert_eq!(parse(serde_json::Value::Null).error, None);
+    }
+
+    #[test]
+    fn poll_status_reads_spec_values_aliases_and_unknown_states() {
+        let status = |raw: &str| -> VideoStatus {
+            serde_json::from_value::<VideoPollResponse>(serde_json::json!({"status": raw}))
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("in_progress"), VideoStatus::InProgress);
+        assert_eq!(status("expired"), VideoStatus::Expired);
+        assert_eq!(status("succeeded"), VideoStatus::Completed);
+        assert_eq!(status("canceled"), VideoStatus::Cancelled);
+        assert_eq!(status("error"), VideoStatus::Failed);
+        assert_eq!(status("processing"), VideoStatus::Unknown);
     }
 }

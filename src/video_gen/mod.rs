@@ -8,6 +8,7 @@
 //! alpha).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 
@@ -17,20 +18,20 @@ mod job;
 
 pub(crate) use job::run_job;
 
-/// Default seconds between poll attempts (env `OPENROUTER_VIDEO_POLL_INTERVAL`).
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
-/// Default ceiling on the background poll loop (env `OPENROUTER_VIDEO_POLL_TIMEOUT`).
-const DEFAULT_POLL_TIMEOUT_SECS: u64 = 600;
-/// A local image used as a video frame (first/last). `frame_type` is
-/// `first_frame` or `last_frame`.
+/// Default time between poll attempts (env `OPENROUTER_VIDEO_POLL_INTERVAL`, seconds).
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Default ceiling on the background poll loop (env `OPENROUTER_VIDEO_POLL_TIMEOUT`, seconds).
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(600);
+/// A local image used as a video frame (first/last).
 #[derive(Debug, Clone)]
 pub struct VideoInput {
     pub path: PathBuf,
-    pub frame_type: String,
+    pub frame_type: crate::openrouter::FrameType,
 }
 
-/// An audio or video reference as the caller gave it (`source`, recorded in
-/// the manifest) and as it goes on the wire (`url`: the URL itself, or a local
+/// An audio or video reference as the caller named it (`source`, recorded in
+/// the manifest; a `data:` URL is recorded by its media type only, see
+/// `server::media::reference_label`) and as it goes on the wire (`url`: the URL itself, or a local
 /// file inlined as a data URL). The tool layer resolves it, with the same caps
 /// and MIME rules as the chat inputs.
 #[derive(Debug, Clone)]
@@ -69,13 +70,13 @@ pub struct VideoGenRequest {
     /// Per-provider passthrough (`provider.options.<slug>`), already validated.
     pub provider: Option<ProviderOptions>,
     pub max_image_dimension: u32,
-    /// Seconds between status polls; always >= 1 (from
+    /// Time between status polls; always >= 1 s (from
     /// [`resolve_poll_interval`], the only production source), so the job
     /// applies no floor of its own.
-    pub poll_interval_secs: u64,
-    /// Seconds to wait for the job before giving up; capped at 30 days when
-    /// the deadline is computed.
-    pub poll_timeout_secs: u64,
+    pub poll_interval: Duration,
+    /// Time to wait for the job before giving up; at most [`MAX_TIMER`] (from
+    /// [`resolve_poll_timeout`]).
+    pub poll_timeout: Duration,
 }
 
 impl VideoGenRequest {
@@ -121,39 +122,46 @@ impl VideoGenRequest {
 
 /// Longest timer budget honored for the operator-supplied poll and delivery
 /// timeouts: an unbounded value would overflow `Instant + Duration`.
-const MAX_TIMER_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_TIMER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Parse a poll setting (seconds) from a raw env value, falling back to
-/// `default`; floored at 1 so a zero never busy-loops. This is the only floor:
-/// the job trusts the interval it is given.
-fn parse_secs(raw: Option<&str>, default: u64) -> u64 {
-    raw.and_then(|v| v.parse().ok()).unwrap_or(default).max(1)
+/// A poll setting given in seconds, else `default`. Floored at 1 s so a zero
+/// never busy-loops (this is the only floor: the job trusts the interval it is
+/// given), and capped at [`MAX_TIMER`].
+fn poll_setting(seconds: Option<u64>, default: Duration) -> Duration {
+    seconds
+        .map_or(default, Duration::from_secs)
+        .clamp(Duration::from_secs(1), MAX_TIMER)
 }
 
-/// Poll interval: `OPENROUTER_VIDEO_POLL_INTERVAL`, else [`DEFAULT_POLL_INTERVAL_SECS`].
-pub fn resolve_poll_interval() -> u64 {
-    let raw = std::env::var("OPENROUTER_VIDEO_POLL_INTERVAL").ok();
-    parse_secs(raw.as_deref(), DEFAULT_POLL_INTERVAL_SECS)
+/// Poll interval: `OPENROUTER_VIDEO_POLL_INTERVAL`, else [`DEFAULT_POLL_INTERVAL`].
+pub fn resolve_poll_interval() -> Duration {
+    poll_setting(
+        crate::settings::env_number("OPENROUTER_VIDEO_POLL_INTERVAL"),
+        DEFAULT_POLL_INTERVAL,
+    )
 }
 
-/// Poll timeout: `OPENROUTER_VIDEO_POLL_TIMEOUT`, else [`DEFAULT_POLL_TIMEOUT_SECS`].
-pub fn resolve_poll_timeout() -> u64 {
-    let raw = std::env::var("OPENROUTER_VIDEO_POLL_TIMEOUT").ok();
-    parse_secs(raw.as_deref(), DEFAULT_POLL_TIMEOUT_SECS)
+/// Poll timeout: `OPENROUTER_VIDEO_POLL_TIMEOUT`, else [`DEFAULT_POLL_TIMEOUT`].
+pub fn resolve_poll_timeout() -> Duration {
+    poll_setting(
+        crate::settings::env_number("OPENROUTER_VIDEO_POLL_TIMEOUT"),
+        DEFAULT_POLL_TIMEOUT,
+    )
 }
 
-/// Optional wall-clock budget for all clip downloads and retry waits.
-/// Zero, unset, or invalid values leave progressing downloads unrestricted.
-/// Cap enabled budgets at 30 days to keep timer arithmetic representable.
-fn parse_delivery_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
-    raw.and_then(|value| value.trim().parse::<u64>().ok())
+/// Optional wall-clock budget for all clip downloads and retry waits, given in
+/// seconds. Zero or unset leaves progressing downloads unrestricted. An enabled
+/// budget is capped at [`MAX_TIMER`].
+fn delivery_timeout(seconds: Option<u64>) -> Option<Duration> {
+    seconds
         .filter(|seconds| *seconds > 0)
-        .map(|seconds| std::time::Duration::from_secs(seconds.min(MAX_TIMER_SECS)))
+        .map(|seconds| Duration::from_secs(seconds).min(MAX_TIMER))
 }
 
-fn resolve_delivery_timeout() -> Option<std::time::Duration> {
-    let raw = std::env::var("OPENROUTER_VIDEO_DELIVERY_TIMEOUT").ok();
-    parse_delivery_timeout(raw.as_deref())
+fn resolve_delivery_timeout() -> Option<Duration> {
+    delivery_timeout(crate::settings::env_number(
+        "OPENROUTER_VIDEO_DELIVERY_TIMEOUT",
+    ))
 }
 
 /// One saved clip in a job's lean summary.
@@ -185,25 +193,23 @@ mod tests {
 
     #[test]
     fn delivery_timeout_is_optional_and_bounded() {
-        assert_eq!(parse_delivery_timeout(None), None);
-        assert_eq!(parse_delivery_timeout(Some("0")), None);
-        assert_eq!(parse_delivery_timeout(Some("bad")), None);
-        assert_eq!(
-            parse_delivery_timeout(Some(" 12 ")),
-            Some(std::time::Duration::from_secs(12))
-        );
-        assert_eq!(
-            parse_delivery_timeout(Some(&u64::MAX.to_string())),
-            Some(std::time::Duration::from_secs(MAX_TIMER_SECS))
-        );
+        assert_eq!(delivery_timeout(None), None);
+        assert_eq!(delivery_timeout(Some(0)), None);
+        assert_eq!(delivery_timeout(Some(12)), Some(Duration::from_secs(12)));
+        assert_eq!(delivery_timeout(Some(u64::MAX)), Some(MAX_TIMER));
     }
 
     #[test]
-    fn parse_secs_defaults_and_floors_at_one() {
-        assert_eq!(parse_secs(None, 5), 5, "unset -> default");
-        assert_eq!(parse_secs(Some("9"), 5), 9);
-        assert_eq!(parse_secs(Some("0"), 5), 1, "floors at 1, never busy-loops");
-        assert_eq!(parse_secs(Some("nope"), 5), 5, "garbage -> default");
+    fn poll_setting_defaults_floors_at_one_second_and_caps() {
+        let default = Duration::from_secs(5);
+        assert_eq!(poll_setting(None, default), default, "unset -> default");
+        assert_eq!(poll_setting(Some(9), default), Duration::from_secs(9));
+        assert_eq!(
+            poll_setting(Some(0), default),
+            Duration::from_secs(1),
+            "floors at 1 s, never busy-loops"
+        );
+        assert_eq!(poll_setting(Some(u64::MAX), default), MAX_TIMER);
     }
 
     /// A text-to-video request for model "m" with prompt "p" and every other
@@ -226,8 +232,8 @@ mod tests {
             upscale_factor: None,
             provider: None,
             max_image_dimension: 800,
-            poll_interval_secs: 1,
-            poll_timeout_secs: 1,
+            poll_interval: Duration::from_secs(1),
+            poll_timeout: Duration::from_secs(1),
         }
     }
 
@@ -251,7 +257,7 @@ mod tests {
             prompt: None,
             frames: vec![VideoInput {
                 path: "f.png".into(),
-                frame_type: "first_frame".into(),
+                frame_type: crate::openrouter::FrameType::FirstFrame,
             }],
             ..request()
         };

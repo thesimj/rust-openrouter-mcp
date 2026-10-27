@@ -106,12 +106,32 @@ pub struct AudioProvider {
     /// Zero-data-retention endpoints only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zdr: Option<bool>,
-    /// `"allow"` or `"deny"`; `deny` routes only to providers that do not
-    /// store user data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_collection: Option<String>,
+    pub data_collection: Option<DataCollection>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub options: ProviderOptionsMap,
+}
+
+/// Data-policy routing: `deny` routes only to providers that do not store
+/// user data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DataCollection {
+    Allow,
+    Deny,
+}
+
+impl std::str::FromStr for DataCollection {
+    type Err = String;
+
+    /// Case-insensitive; the error lists the accepted values.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            _ => Err(format!("must be one of allow, deny; got {value:?}")),
+        }
+    }
 }
 
 impl AudioProvider {
@@ -227,7 +247,7 @@ mod tests {
     fn audio_provider_emits_data_policy_and_options_and_drops_when_empty() {
         let p = AudioProvider {
             zdr: Some(true),
-            data_collection: Some("deny".into()),
+            data_collection: Some(DataCollection::Deny),
             options: options("deepgram", json!({"diarize": true})),
         };
         assert_eq!(

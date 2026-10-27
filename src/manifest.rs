@@ -175,7 +175,7 @@ pub struct VideoManifest {
 #[derive(Debug, Serialize)]
 pub struct FrameImageMeta {
     pub index: usize,
-    pub frame_type: String,
+    pub frame_type: crate::openrouter::FrameType,
     pub source: String,
     pub normalized_width: u32,
     pub normalized_height: u32,

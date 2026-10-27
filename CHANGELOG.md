@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+OpenRouter API changes (checked against openapi.json and the changelog on
+2026-10-26):
+
+- `get_generation`: a `403` (documented since 2026-10-23 for a key without
+  permission to read the record) says to set `OPENROUTER_API_KEY` to a key with
+  access, instead of a bare internal error.
+
+Fixes (tested unless marked):
+
+- `generate_music`: a stream cut between the `\r` and `\n` of its final
+  blank line no longer loses the last event (the cost chunk).
+- `generate_video`: a `data:` URL reference is named `inline data URL (<mime>)`
+  in errors and the manifest; its payload (up to 20 MiB) was copied into both.
+- `generate_image`: an SVG whose size cannot be read reports no width, height,
+  `actual_aspect_ratio` or `actual_image_size` (they were `0`, `"0:0"` and a
+  false "image is ~0.5K" warning).
+- Every tool with a `model` argument rejects a blank model while decoding the
+  arguments, before any job slot or upstream call.
+- URL inputs: an IPv6 address that carries a blocked IPv4 address
+  (IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`), `2001:db8::/32`
+  and `fec0::/10` are refused. The DNS lookup no longer holds a slot of the
+  shared file and image pool (not tested).
+- A numeric environment setting that does not parse (`20m`, `-5`) is reported
+  on stderr instead of being ignored silently (the parse is tested, the
+  warning text is not).
+- During shutdown a new call is told the server is shutting down, not that
+  there are too many calls.
+
+Internal:
+
+- The video poll status is an enum matched exhaustively; poll interval and
+  timeout are `Duration`s; `frame_type` and `data_collection` are enums.
+- Usage stats use a std mutex and sync methods; task registry reads are sync.
+- Large inputs move instead of being copied: chat files, audio and video,
+  speech voice references, transcription audio, and image references (shared
+  by all variants of a job).
+
+Dependencies:
+
+- `resvg` 0.48 -> 0.49 and patch updates (`cc`, `openssl-probe`, `roxmltree`,
+  `smallvec`, `webpki-root-certs`). `uuid` stays at 1.26 (1.29 needs Rust
+  1.89).
+
 ## 0.14.0
 
 OpenRouter API changes (checked against openapi.json on 2026-10-22):

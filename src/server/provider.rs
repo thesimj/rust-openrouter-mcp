@@ -21,8 +21,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::openrouter::{
-    AudioProvider, ImageProvider, ProviderOptions, ProviderOptionsMap, ProviderRouting,
-    ProviderSort,
+    AudioProvider, DataCollection, ImageProvider, ProviderOptions, ProviderOptionsMap,
+    ProviderRouting, ProviderSort,
 };
 use crate::server::schema::{clean_list, de_lenient, de_opt_bool, non_blank, scalarize_nullable};
 
@@ -30,8 +30,6 @@ use crate::server::schema::{clean_list, de_lenient, de_opt_bool, non_blank, scal
 const SORT_VALUES: [&str; 4] = ["price", "throughput", "latency", "exacto"];
 /// Accepted `sort_partition` values (`sort.partition` in the object form).
 const SORT_PARTITIONS: [&str; 2] = ["model", "none"];
-/// Accepted `data_collection` values on the audio endpoints.
-const DATA_COLLECTION_VALUES: [&str; 2] = ["allow", "deny"];
 
 /// Routing `provider` block for chat completions, `/embeddings`, `/rerank`
 /// and `/api/alpha/decisions`: routing keys plus per-provider `options`.
@@ -162,18 +160,12 @@ pub(crate) struct AudioProviderArgs {
 impl AudioProviderArgs {
     /// Validate and convert; `Ok(None)` when nothing is set.
     pub(crate) fn into_audio_provider(self) -> Result<Option<AudioProvider>, ErrorData> {
-        let data_collection = non_blank(self.data_collection).map(|s| s.to_ascii_lowercase());
-        if let Some(value) = &data_collection
-            && !DATA_COLLECTION_VALUES.contains(&value.as_str())
-        {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "provider.data_collection must be one of {}; got {value:?}",
-                    DATA_COLLECTION_VALUES.join(", ")
-                ),
-                None,
-            ));
-        }
+        let data_collection = non_blank(self.data_collection)
+            .map(|value| value.parse::<DataCollection>())
+            .transpose()
+            .map_err(|e| {
+                ErrorData::invalid_params(format!("provider.data_collection {e}"), None)
+            })?;
         Ok(AudioProvider {
             zdr: self.zdr,
             data_collection,
@@ -477,7 +469,7 @@ mod tests {
             args.into_audio_provider().unwrap(),
             Some(AudioProvider {
                 zdr: Some(true),
-                data_collection: Some("deny".into()),
+                data_collection: Some(DataCollection::Deny),
                 options: opts("deepgram", json!({"diarize": true})),
             })
         );

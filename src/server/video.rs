@@ -39,6 +39,7 @@ use super::OpenRouterServer;
 pub(crate) struct GenerateVideoArgs {
     /// Video model id, e.g. "google/veo-3.1". Use list_models with
     /// output_modalities="video" to discover them.
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// Prompt text describing the video to generate. Required unless a
     /// first_frame/last_frame or a reference (reference_images, reference_audio,
@@ -253,13 +254,13 @@ impl OpenRouterServer {
         if let Some(p) = &args.first_frame {
             frames.push(VideoInput {
                 path: p.into(),
-                frame_type: "first_frame".to_string(),
+                frame_type: crate::openrouter::FrameType::FirstFrame,
             });
         }
         if let Some(p) = &args.last_frame {
             frames.push(VideoInput {
                 path: p.into(),
-                frame_type: "last_frame".to_string(),
+                frame_type: crate::openrouter::FrameType::LastFrame,
             });
         }
         let req = VideoGenRequest {
@@ -289,8 +290,8 @@ impl OpenRouterServer {
             upscale_factor: args.upscale_factor,
             provider,
             max_image_dimension: image_gen::resolve_max_dimension(args.max_image_dimension),
-            poll_interval_secs: video_gen::resolve_poll_interval(),
-            poll_timeout_secs: video_gen::resolve_poll_timeout(),
+            poll_interval: video_gen::resolve_poll_interval(),
+            poll_timeout: video_gen::resolve_poll_timeout(),
         };
         // Conditional prompt and upscale_factor > 0: the same check run_job
         // makes, surfaced here as invalid params before a job is spawned.
@@ -327,13 +328,11 @@ impl OpenRouterServer {
             move |ctx| async move {
                 match video_gen::run_job(&ctx.client, &req, &base).await {
                     Ok(summary) => {
-                        ctx.stats
-                            .record_video(
-                                &model,
-                                summary.videos.len() as u64,
-                                Some(&summary.billing),
-                            )
-                            .await;
+                        ctx.stats.record_video(
+                            &model,
+                            summary.videos.len() as u64,
+                            Some(&summary.billing),
+                        );
                         if summary.videos.is_empty() {
                             return Err(format!(
                                 "video job {} failed: {}; recovery manifest: {}",
@@ -346,8 +345,7 @@ impl OpenRouterServer {
                     }
                     Err(e) => {
                         ctx.stats
-                            .record_video(&model, 0, crate::billing::Receipt::from_error(&e))
-                            .await;
+                            .record_video(&model, 0, crate::billing::Receipt::from_error(&e));
                         Err(format!("{e:#}"))
                     }
                 }
@@ -367,12 +365,13 @@ async fn resolve_references(
 ) -> Result<Vec<MediaReference>, ErrorData> {
     let mut references = Vec::with_capacity(sources.len());
     for source in sources {
+        let label = media::reference_label(&source).into_owned();
         let url = media::resolve_media_reference(kind, &source)
             .await
             .map_err(|e| {
-                ErrorData::invalid_params(format!("{field} {source}: {}", e.message), None)
+                ErrorData::invalid_params(format!("{field} {label}: {}", e.message), None)
             })?;
-        references.push(MediaReference { source, url });
+        references.push(MediaReference { source: label, url });
     }
     Ok(references)
 }
@@ -469,7 +468,7 @@ mod tests {
             let envelope = tool_result_json(&result);
             assert_eq!(envelope["status"], "failed");
             assert!(envelope.get("job_id").is_none());
-            let stats = server.stats.snapshot().await;
+            let stats = server.stats.snapshot();
             assert_eq!(stats["requests_total"], 1);
             assert_eq!(stats["requests_failed"], 1);
             assert_eq!(stats["unknown_cost_count"], u64::from(status == 202));
@@ -545,6 +544,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("reference_videos"), "{}", err.message);
+    }
+
+    /// A `data:` reference can be tens of MiB: neither the error text nor the
+    /// recorded source may carry its payload.
+    #[tokio::test]
+    async fn data_url_references_are_labeled_not_echoed() {
+        let payload = "QUJD".repeat(64);
+        let resolved = resolve_references(
+            InputKind::Audio,
+            "reference_audio",
+            vec![format!("data:audio/mpeg;base64,{payload}")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved[0].source, "inline data URL (audio/mpeg)");
+        assert!(resolved[0].url.contains(&payload));
+
+        let err = resolve_references(
+            InputKind::Audio,
+            "reference_audio",
+            vec![format!("data:audio/mpeg;base64,{payload}!!")],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("reference_audio"), "{}", err.message);
+        assert!(!err.message.contains(&payload), "{}", err.message);
     }
 
     #[tokio::test]

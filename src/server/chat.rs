@@ -21,7 +21,7 @@ use crate::openrouter::{JsonSchemaSpec, PdfOptions, Plugin, ResponseFormat, WebS
 use crate::server::provider::ProviderRoutingArgs;
 use crate::server::schema::{
     RequireFields, clean_list, de_lenient, de_opt_bool, de_opt_f64, de_opt_uint, non_blank,
-    require_all, scalarize_nullable,
+    require_text, scalarize_nullable,
 };
 
 use super::OpenRouterServer;
@@ -41,6 +41,7 @@ const PDF_ENGINES: [&str; 3] = ["mistral-ocr", "cloudflare-ai", "native"];
 pub(crate) struct ChatCompletionArgs {
     /// Chat/text model id, e.g. "openai/gpt-5.4" or "anthropic/claude-sonnet-4.6".
     /// Discover ids with list_models.
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// REQUIRED: the user message / prompt text to send to the model.
     #[serde(default)]
@@ -435,17 +436,12 @@ impl OpenRouterServer {
         Parameters(args): Parameters<ChatCompletionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let mut missing: Vec<&str> = Vec::new();
-        if args
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        {
-            missing.push("prompt (the user message)");
-        }
-        require_all("chat_completion", "text", &missing)?;
+        let prompt = require_text(
+            "chat_completion",
+            "text",
+            "prompt (the user message)",
+            args.prompt,
+        )?;
 
         // Argument-level contradictions and vocabulary, all before any network.
         // A blank effort is "unset" everywhere below (the repo-wide rule).
@@ -492,12 +488,11 @@ impl OpenRouterServer {
             image_gen::resolve_max_dimension(args.max_image_dimension)
         };
 
-        let prompt = args.prompt.unwrap_or_default();
         let system = non_blank(args.system);
         let verbosity = non_blank(args.verbosity);
         let outcome = chat_gen::complete(
             &self.client,
-            &chat_gen::ChatInputs {
+            chat_gen::ChatInputs {
                 model: &args.model,
                 system: system.as_deref(),
                 prompt: &prompt,
@@ -505,9 +500,9 @@ impl OpenRouterServer {
                 max_tokens: args.max_tokens,
                 images: &images,
                 max_image_dimension: max_dim,
-                files: &files,
-                audio: &audio,
-                videos: &videos,
+                files,
+                audio,
+                videos,
                 reasoning_effort: reasoning_effort.as_deref(),
                 reasoning_max_tokens: args.reasoning_max_tokens,
                 reasoning_exclude: args.reasoning_exclude,
@@ -525,14 +520,11 @@ impl OpenRouterServer {
             },
         )
         .await;
+        let decisions_model = outcome.as_ref().is_err_and(is_decisions_model_rejection);
         self.finish_chat_call(&args.model, outcome)
             .await
             .map_err(|mut err| {
-                // OpenRouter's 400 for a decisions model (TypeSafe Jev) names it
-                // as such; those models live on /api/alpha/decisions, which
-                // `make_decisions` reaches. A substring check is enough: the
-                // phrase does not occur in any other upstream error.
-                if err.message.to_ascii_lowercase().contains("decisions model") {
+                if decisions_model {
                     err.message = format!(
                         "{} Use the make_decisions tool for this model.",
                         err.message
@@ -624,6 +616,21 @@ fn check_modality(model: &str, modalities: &[String], kind: InputKind) -> Result
         ));
     }
     Ok(())
+}
+
+/// OpenRouter's 400 for a decisions model (TypeSafe Jev) names it as such;
+/// those models live on /api/alpha/decisions, which `make_decisions` reaches.
+/// A phrase check on that 400 body is enough: no other upstream error uses it.
+fn is_decisions_model_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::openrouter::HttpFailure>()
+        .is_some_and(|failure| {
+            failure.status == reqwest::StatusCode::BAD_REQUEST
+                && failure
+                    .body
+                    .to_ascii_lowercase()
+                    .contains("decisions model")
+        })
 }
 
 #[cfg(test)]

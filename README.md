@@ -233,6 +233,9 @@ defaults.
 | `OPENROUTER_MCP_SHUTDOWN_TIMEOUT` | Seconds to let running jobs finish after the client disconnects (max 300). | `30` |
 | `OPENROUTER_HTTP_REFERER`, `OPENROUTER_X_TITLE` | App attribution headers shown in OpenRouter rankings. | this repo |
 
+A numeric setting that does not parse as a whole number is ignored with a
+warning on stderr, and its default applies.
+
 **Limits worth knowing.** Input images: 16 per request, 20 MiB each, 64 MiB per
 batch. Audio for transcription, and audio attached to chat: 25 MiB. A
 voice-cloning sample: 15 MiB. Files and video attached to chat: 20 MiB each. At

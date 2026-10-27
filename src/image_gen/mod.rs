@@ -160,13 +160,13 @@ pub fn check_size_conflict(
 /// result is clamped to `1..=`[`MAX_DIMENSION_CEILING`], so an argument or env
 /// override can raise the cap above the default but not past the ceiling.
 pub fn resolve_max_dimension(explicit: Option<u32>) -> u32 {
-    explicit
-        .or_else(|| {
-            std::env::var("OPENROUTER_IMAGE_MAX_DIMENSION")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(DEFAULT_MAX_DIMENSION)
+    max_dimension_or_default(
+        explicit.or_else(|| crate::settings::env_number("OPENROUTER_IMAGE_MAX_DIMENSION")),
+    )
+}
+
+fn max_dimension_or_default(cap: Option<u32>) -> u32 {
+    cap.unwrap_or(DEFAULT_MAX_DIMENSION)
         .clamp(1, MAX_DIMENSION_CEILING)
 }
 
@@ -177,8 +177,8 @@ pub struct GeneratedImage {
     /// MIME type sniffed from the decoded bytes (e.g. `image/png`), cross-checked
     /// against the declared `media_type`.
     pub mime: String,
-    pub width: u32,
-    pub height: u32,
+    /// Pixel `(width, height)`; `None` for an SVG whose size cannot be read.
+    pub dimensions: Option<(u32, u32)>,
     /// Actual USD cost from `usage.cost`, when present.
     pub cost: Option<f64>,
     /// OpenRouter generation id, recorded in the manifest.
@@ -316,12 +316,12 @@ pub(crate) async fn prepare_inputs_async(
 }
 
 /// Pre-built inputs for one generation, computed once and shared across
-/// variants: the assembled prompt and the reference-image data URLs (sent as
-/// `input_references`), in the Images API request shape.
+/// variants: the assembled prompt and the reference images (data URLs), in
+/// the Images API request shape.
 #[derive(Debug)]
 pub(crate) struct GenContent {
     prompt: String,
-    reference_urls: Vec<String>,
+    input_references: Vec<InputReference>,
 }
 
 /// Canonicalize a provider-declared MIME to the form [`image_io::sniff_mime`]
@@ -345,7 +345,14 @@ pub(crate) fn build_gen_content(
 ) -> GenContent {
     GenContent {
         prompt: assemble_prompt(prompt, images),
-        reference_urls: prepared.iter().map(|p| p.data_url.clone()).collect(),
+        input_references: prepared
+            .iter()
+            .map(|p| {
+                InputReference::image(ImageUrl {
+                    url: p.data_url.clone(),
+                })
+            })
+            .collect(),
     }
 }
 
@@ -370,18 +377,13 @@ pub(crate) async fn generate_core(
     seed: Option<u64>,
     content: &GenContent,
 ) -> Result<GeneratedImage> {
-    let input_references = content
-        .reference_urls
-        .iter()
-        .map(|url| InputReference::image(ImageUrl { url: url.clone() }))
-        .collect();
     let request = ImagesRequest {
         model: req.model.clone(),
-        prompt: content.prompt.clone(),
+        prompt: &content.prompt,
         resolution: req.image_size.as_deref().map(resolution_for),
         aspect_ratio: req.aspect_ratio.clone(),
         seed,
-        input_references,
+        input_references: &content.input_references,
         quality: req.quality.clone(),
         output_format: req.output_format.clone(),
         background: req.background.clone(),
@@ -437,22 +439,23 @@ fn decode_generated(
         }
         None => declared_canonical.unwrap_or_else(|| "image/png".to_string()),
     };
-    let (width, height) = if mime == "image/svg+xml" {
-        image_io::svg_dimensions(&bytes).unwrap_or_else(|| {
+    let dimensions = if mime == "image/svg+xml" {
+        let dimensions = image_io::svg_dimensions(&bytes);
+        if dimensions.is_none() {
             warnings.push(
-                "could not read the SVG's size; width and height are reported as 0".to_string(),
+                "could not read the SVG's size; width, height and the size check are skipped"
+                    .to_string(),
             );
-            (0, 0)
-        })
+        }
+        dimensions
     } else {
-        image_io::decode_dimensions(&bytes)?
+        Some(image_io::decode_dimensions(&bytes)?)
     };
 
     Ok(GeneratedImage {
         bytes,
         mime,
-        width,
-        height,
+        dimensions,
         cost,
         generation_id,
         warnings,
@@ -491,7 +494,7 @@ pub async fn describe_image(
     }
     chat_gen::complete(
         client,
-        &chat_gen::ChatInputs {
+        chat_gen::ChatInputs {
             model: &req.model,
             system: req.system.as_deref(),
             prompt: &assemble_prompt(&req.prompt, &req.images),

@@ -10,7 +10,7 @@
 //! SSRF-hardened URL fetch. `server::image` builds its `ImageInput` on the
 //! same [`resolve_source`], so images behave exactly as before.
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use rmcp::ErrorData;
@@ -129,7 +129,7 @@ pub(crate) async fn resolve_source(
             decode_inline(kind, &b64, limit).map_err(|e| anyhow::anyhow!(e.message))
         })
         .await
-        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        .map_err(|e| invalid_params_from(&e))?;
         return Ok(Resolved::Bytes(MediaBytes {
             bytes,
             name: "inline".to_string(),
@@ -245,7 +245,8 @@ fn decode_inline(
 
 /// True for IPs a fetched URL must never reach (SSRF guard): loopback, private
 /// (RFC1918), CGNAT (100.64/10), link-local (incl. cloud metadata 169.254.169.254),
-/// unspecified, broadcast, documentation, multicast, and IPv6 ULA/link-local.
+/// unspecified, broadcast, documentation, multicast, IPv6 ULA/link-local/
+/// site-local, and any IPv6 address whose embedded IPv4 address is blocked.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -262,15 +263,39 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            if let Some(v4) = embedded_ipv4(v6) {
                 return is_blocked_ip(IpAddr::V4(v4));
             }
+            let segments = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || (segments[0] & 0xffc0) == 0xfec0 // fec0::/10 (site-local)
+                || segments[..2] == [0x2001, 0x0db8] // 2001:db8::/32 (documentation)
         }
+    }
+}
+
+/// The IPv4 address an IPv6 address routes to: IPv4-mapped (`::ffff:a.b.c.d`),
+/// IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::a.b.c.d`) or 6to4
+/// (`2002:aabb:ccdd::`).
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let [.., a, b, c, d] = v6.octets();
+    match v6.segments() {
+        // `::` and `::1` are unspecified and loopback, not IPv4-compatible.
+        [0, 0, 0, 0, 0, 0, high, low] if high != 0 || low > 1 => Some(Ipv4Addr::new(a, b, c, d)),
+        [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(Ipv4Addr::new(a, b, c, d)),
+        [0x2002, high, low, ..] => {
+            let [a, b] = high.to_be_bytes();
+            let [c, d] = low.to_be_bytes();
+            Some(Ipv4Addr::new(a, b, c, d))
+        }
+        _ => None,
     }
 }
 
@@ -302,18 +327,21 @@ async fn fetch_url(kind: InputKind, url: &str, limit: usize) -> Result<Vec<u8>, 
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(REMOTE_FETCH_TIMEOUT_SECS);
 
-    // Resolve off the async runtime, then refuse internal/private targets.
+    // Resolve off the async runtime, then refuse internal/private targets. Not
+    // through `run_blocking`: a lookup stuck past the timeout would keep one of
+    // its few slots and stall file reads and image work.
     let lookup = host.clone();
     let addrs: Vec<SocketAddr> = tokio::time::timeout_at(
         deadline,
-        crate::resources::run_blocking(move || {
-            Ok((lookup.as_str(), port)
-                .to_socket_addrs()?
-                .collect::<Vec<_>>())
+        tokio::task::spawn_blocking(move || {
+            (lookup.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect::<Vec<_>>)
         }),
     )
     .await
     .map_err(|_| invalid(format!("{noun} URL DNS lookup timed out")))?
+    .map_err(|e| ErrorData::internal_error(format!("{noun} URL DNS lookup failed: {e}"), None))?
     .map_err(|e| invalid(format!("could not resolve {noun} url host: {e}")))?;
 
     if addrs.is_empty() {
@@ -642,12 +670,7 @@ pub(crate) async fn resolve_media_reference(
             None,
         ));
     }
-    // Checked on the prefix only: a `data:` reference can be tens of MiB.
-    let starts_with = |prefix: &str| {
-        source
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    };
+    let starts_with = |prefix: &str| starts_with_ignore_case(source, prefix);
     if starts_with("http://") || starts_with("https://") {
         return Ok(source.to_string());
     }
@@ -670,6 +693,29 @@ pub(crate) async fn resolve_media_reference(
         _ => video_mime(&media.bytes, &media.name, declared),
     };
     Ok(crate::base64_codec::data_url(&media.bytes, &mime))
+}
+
+/// Checked on the prefix only: a `data:` reference can be tens of MiB.
+fn starts_with_ignore_case(source: &str, prefix: &str) -> bool {
+    source
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// How a media reference appears in error text and the manifest: a `data:`
+/// URL is named by its media type, never copied with its payload.
+pub(crate) fn reference_label(source: &str) -> std::borrow::Cow<'_, str> {
+    const MAX_MIME_CHARS: usize = 64;
+    let source = source.trim();
+    if !starts_with_ignore_case(source, "data:") {
+        return source.into();
+    }
+    let header: String = source["data:".len()..]
+        .chars()
+        .take_while(|c| !matches!(c, ';' | ','))
+        .take(MAX_MIME_CHARS)
+        .collect();
+    format!("inline data URL ({header})").into()
 }
 
 /// The file name a URL or path implies: its last segment without a query.
@@ -921,6 +967,24 @@ mod tests {
         // Allowed: public addresses.
         assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
         assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
+    }
+
+    /// An IPv6 address that carries an IPv4 one is judged by that IPv4
+    /// address: IPv4-compatible, NAT64 (64:ff9b::/96) and 6to4 (2002::/16).
+    #[test]
+    fn is_blocked_ip_checks_ipv4_embedded_in_ipv6() {
+        use std::net::Ipv6Addr;
+        let v6 = |text: &str| -> IpAddr { text.parse::<Ipv6Addr>().unwrap().into() };
+        assert!(is_blocked_ip(v6("::127.0.0.1")));
+        assert!(is_blocked_ip(v6("64:ff9b::10.0.0.1")));
+        assert!(is_blocked_ip(v6("64:ff9b::169.254.169.254")));
+        assert!(is_blocked_ip(v6("2002:c0a8:101::1"))); // 6to4 of 192.168.1.1
+        assert!(is_blocked_ip(v6("2001:db8::1"))); // documentation
+        assert!(is_blocked_ip(v6("fec0::1"))); // deprecated site-local
+        assert!(is_blocked_ip(v6("::")));
+        assert!(!is_blocked_ip(v6("64:ff9b::8.8.8.8")));
+        assert!(!is_blocked_ip(v6("2002:0808:0808::1"))); // 6to4 of 8.8.8.8
+        assert!(!is_blocked_ip(v6("2606:4700:4700::1111")));
     }
 
     #[tokio::test]

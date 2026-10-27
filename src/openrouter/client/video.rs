@@ -150,7 +150,7 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(server.uri(), "test-key");
         let poll = client.poll_video("vid-1").await.unwrap();
-        assert_eq!(poll.status, "completed");
+        assert_eq!(poll.status, crate::openrouter::VideoStatus::Completed);
         assert_eq!(poll.generation_id.as_deref(), Some("gen-7"));
         assert_eq!(poll.unsigned_urls.len(), 2);
         assert_eq!(poll.usage.unwrap().cost, Some(0.9));

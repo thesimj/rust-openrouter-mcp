@@ -16,7 +16,7 @@ use crate::server::result::{
     json_text_result,
 };
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_uint, require_all, scalarize_nullable,
+    RequireFields, de_lenient, de_opt_uint, require_text, scalarize_nullable,
 };
 
 use super::OpenRouterServer;
@@ -30,6 +30,7 @@ pub(crate) struct GenerateMusicArgs {
     /// "google/lyria-3-pro-preview" (full song). Music models are chat models
     /// whose output_modalities include "audio" - discover them with list_models
     /// using output_modalities="audio".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// REQUIRED (no default): the musical description - genre, mood, tempo,
     /// instruments, structure, and lyrics if the track should have any.
@@ -104,22 +105,17 @@ impl OpenRouterServer {
         inline_previews: bool,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
-        let prompt = args
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty());
-        let mut missing: Vec<&str> = Vec::new();
-        if prompt.is_none() {
-            missing
-                .push("prompt (the musical description: genre, mood, tempo, instruments, lyrics)");
-        }
-        require_all("generate_music", "audio", &missing)?;
+        let prompt = require_text(
+            "generate_music",
+            "audio",
+            "prompt (the musical description: genre, mood, tempo, instruments, lyrics)",
+            args.prompt,
+        )?;
 
         let model = args.model.clone();
         let req = MusicGenRequest {
             model: args.model,
-            prompt: prompt.unwrap_or_default().to_string(),
+            prompt: prompt.trim().to_string(),
             format: args.format,
             seed: args.seed,
             provider: args.provider.into_routing()?,
@@ -139,7 +135,7 @@ impl OpenRouterServer {
 
         match music_gen::run_job(&self.client, &req, &output).await {
             Ok(result) => {
-                self.stats.record_audio(&model, result.cost).await;
+                self.stats.record_audio(&model, result.cost);
                 let mut env = json!({
                     "ok": true,
                     "kind": "music",
@@ -171,7 +167,7 @@ impl OpenRouterServer {
                 Ok(res)
             }
             Err(e) => {
-                self.stats.record_audio_failure(&model, &e).await;
+                self.stats.record_audio_failure(&model, &e);
                 Err(internal_error_from(&e))
             }
         }

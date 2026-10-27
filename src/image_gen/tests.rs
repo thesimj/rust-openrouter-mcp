@@ -96,20 +96,20 @@ fn assemble_prompt_prepends_label_block_when_labeled() {
 }
 
 #[test]
-fn resolve_max_dimension_defaults_and_clamps_to_ceiling() {
+fn max_dimension_defaults_and_clamps_to_ceiling() {
     // Default when nothing is supplied.
-    assert_eq!(resolve_max_dimension(None), 1536);
+    assert_eq!(max_dimension_or_default(None), 1536);
     // Values at or below the ceiling pass through unchanged.
-    assert_eq!(resolve_max_dimension(Some(640)), 640);
+    assert_eq!(max_dimension_or_default(Some(640)), 640);
     // An explicit value above the default raises the cap. This is the point of
     // the argument: 800px destroys dense text and small-print OCR.
-    assert_eq!(resolve_max_dimension(Some(2048)), 2048);
-    assert_eq!(resolve_max_dimension(Some(4096)), 4096);
+    assert_eq!(max_dimension_or_default(Some(2048)), 2048);
+    assert_eq!(max_dimension_or_default(Some(4096)), 4096);
     // Anything above the ceiling is clamped down to it.
-    assert_eq!(resolve_max_dimension(Some(8192)), 4096);
-    assert_eq!(resolve_max_dimension(Some(u32::MAX)), 4096);
+    assert_eq!(max_dimension_or_default(Some(8192)), 4096);
+    assert_eq!(max_dimension_or_default(Some(u32::MAX)), 4096);
     // A zero cap is unusable; clamp it up to a valid minimum.
-    assert_eq!(resolve_max_dimension(Some(0)), 1);
+    assert_eq!(max_dimension_or_default(Some(0)), 1);
 }
 
 #[tokio::test]
@@ -146,7 +146,7 @@ async fn generate_image_sends_request_and_decodes_response() {
         ..generate_request("google/gemini-3.1-flash-image-preview")
     };
     let img = generate_image(&client, &req).await.unwrap();
-    assert_eq!((img.width, img.height), (1, 1));
+    assert_eq!(img.dimensions, Some((1, 1)));
     // No media_type in the response -> the PNG magic bytes are sniffed.
     assert_eq!(img.mime, "image/png");
     assert_eq!(img.cost, Some(0.0684));
@@ -286,7 +286,7 @@ async fn captured_describe_body(
 async fn describe_image_downscales_input_to_the_resolved_cap() {
     const SRC: (u32, u32) = (2000, 1000);
 
-    let body = captured_describe_body(SRC, resolve_max_dimension(None), None).await;
+    let body = captured_describe_body(SRC, max_dimension_or_default(None), None).await;
     assert_eq!(sent_image(&body).1, (1536, 768));
 
     // An explicit cap above the old 800 ceiling is applied, not clamped down.
@@ -408,7 +408,7 @@ async fn generate_image_honors_declared_media_type_for_vector() {
     // No raster sniffer recognizes SVG text, so the declared type decides, and
     // the SVG dimensions come from the viewBox.
     assert_eq!(img.mime, "image/svg+xml");
-    assert_eq!((img.width, img.height), (120, 60));
+    assert_eq!(img.dimensions, Some((120, 60)));
 }
 
 /// `image/jpg` is a real-world alias for `image/jpeg`, which is what
@@ -600,7 +600,7 @@ fn decode_generated_trusts_raster_bytes_over_a_declared_svg() {
     .unwrap();
     let img = decode_generated(resp, None, None).unwrap();
     assert_eq!(img.mime, "image/png");
-    assert_eq!((img.width, img.height), (2, 2));
+    assert_eq!(img.dimensions, Some((2, 2)));
     assert!(
         img.warnings.iter().any(|w| w.contains("image/svg+xml")),
         "{:?}",
@@ -608,8 +608,8 @@ fn decode_generated_trusts_raster_bytes_over_a_declared_svg() {
     );
 }
 
-/// An SVG whose size cannot be read is still saved, but the 0x0 it reports
-/// comes with a warning saying why, instead of passing for a real size.
+/// An SVG whose size cannot be read is still saved, with no size and a warning
+/// saying why, instead of a 0x0 that passes for a real size.
 #[test]
 fn decode_generated_warns_when_an_svg_size_cannot_be_read() {
     let resp: crate::openrouter::ImagesResponse = serde_json::from_value(json!({
@@ -621,7 +621,7 @@ fn decode_generated_warns_when_an_svg_size_cannot_be_read() {
     .unwrap();
     let img = decode_generated(resp, None, None).unwrap();
     assert_eq!(img.mime, "image/svg+xml");
-    assert_eq!((img.width, img.height), (0, 0));
+    assert_eq!(img.dimensions, None);
     assert!(
         img.warnings.iter().any(|w| w.contains("SVG")),
         "{:?}",

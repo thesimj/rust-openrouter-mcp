@@ -14,7 +14,7 @@ use crate::server::naming;
 use crate::server::provider::{ImageProviderArgs, ProviderRoutingArgs};
 use crate::server::result::{
     DEFAULT_WAIT_SECONDS, attach_warnings_errors, client_wants_inline_previews,
-    resolve_wait_seconds,
+    invalid_params_from, resolve_wait_seconds,
 };
 use crate::server::schema::{
     AtLeastOneOf, de_lenient, de_opt_f64, de_opt_uint, non_blank, require_all, scalarize_nullable,
@@ -112,6 +112,7 @@ pub(crate) async fn resolve_image_inputs(
 #[schemars(transform = scalarize_nullable)]
 pub(crate) struct GenerateImageArgs {
     /// Image model id, e.g. "google/gemini-3.1-flash-image-preview".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// Prompt text describing the image to generate (or the edit to apply).
     pub prompt: String,
@@ -199,6 +200,7 @@ pub(crate) struct GenerateImageArgs {
 pub(crate) struct DescribeImageArgs {
     /// Vision-capable model id (image input, text output), e.g.
     /// "google/gemini-2.5-flash" or "anthropic/claude-sonnet-4.6".
+    #[serde(deserialize_with = "crate::server::schema::de_model_id")]
     pub model: String,
     /// Image(s) to describe (at least one required). Each takes exactly one of:
     /// path (local file), url (http/https), or base64 (data: URL or raw base64).
@@ -240,8 +242,8 @@ pub(crate) struct DescribeImageArgs {
 /// vs actual, manifest pointer, plus warnings/errors when present).
 fn image_job_result_json(
     summary: &image_gen::JobSummary,
-    aspect_ratio: &Option<String>,
-    image_size: &Option<String>,
+    aspect_ratio: Option<&str>,
+    image_size: Option<&str>,
 ) -> serde_json::Value {
     let images: Vec<_> = summary
         .images
@@ -250,12 +252,12 @@ fn image_job_result_json(
             json!({
                 "path": img.path.to_string_lossy(),
                 "seed": img.seed,
-                "width": img.width,
-                "height": img.height,
+                "width": img.dimensions.map(|(width, _)| width),
+                "height": img.dimensions.map(|(_, height)| height),
                 "aspect_ratio": aspect_ratio,
                 "image_size": image_size,
-                "actual_aspect_ratio": img.actual_aspect_ratio,
-                "actual_image_size": img.actual_image_size,
+                "actual_aspect_ratio": img.check.as_ref().map(|check| &check.actual_aspect_ratio),
+                "actual_image_size": img.check.as_ref().map(|check| check.actual_image_size),
             })
         })
         .collect();
@@ -354,7 +356,7 @@ impl OpenRouterServer {
             args.image_size.as_deref(),
             args.aspect_ratio.as_deref(),
         )
-        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        .map_err(|e| invalid_params_from(&e))?;
         let provider = args.provider.into_image_provider()?;
 
         let Some(reservation) = self.tasks.reserve(TaskKind::Image) else {
@@ -411,26 +413,27 @@ impl OpenRouterServer {
             move |ctx| async move {
                 match image_gen::run_job(&ctx.client, &req, variants, &base).await {
                     Ok(summary) => {
-                        ctx.stats
-                            .record_image_job(
-                                &model,
-                                variants_u64,
-                                summary.images.len() as u64,
-                                &summary.billing,
-                            )
-                            .await;
+                        ctx.stats.record_image_job(
+                            &model,
+                            variants_u64,
+                            summary.images.len() as u64,
+                            &summary.billing,
+                        );
                         if summary.images.is_empty() {
                             return Err(format!(
                                 "all {variants} variant(s) failed: {}",
                                 summary.errors.join("; ")
                             ));
                         }
-                        Ok(image_job_result_json(&summary, &aspect_ratio, &image_size))
+                        Ok(image_job_result_json(
+                            &summary,
+                            aspect_ratio.as_deref(),
+                            image_size.as_deref(),
+                        ))
                     }
                     Err(e) => {
                         ctx.stats
-                            .record_image_job(&model, variants_u64, 0, &Default::default())
-                            .await;
+                            .record_image_job(&model, variants_u64, 0, &Default::default());
                         Err(format!("{e:#}"))
                     }
                 }

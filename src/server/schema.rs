@@ -32,8 +32,8 @@ pub(crate) fn scalarize_nullable(schema: &mut schemars::Schema) {
             .filter(|t| t.as_str() != Some("null"))
             .cloned()
             .collect();
-        if non_null.len() == 1 {
-            obj.insert("type".to_string(), non_null.into_iter().next().unwrap());
+        if let [only] = non_null.as_slice() {
+            obj.insert("type".to_string(), only.clone());
             if obj.get("default") == Some(&serde_json::Value::Null) {
                 obj.remove("default");
             }
@@ -119,6 +119,23 @@ fn coerce_bool<E: serde::de::Error>(v: &serde_json::Value) -> Result<bool, E> {
         },
         other => Err(E::custom(format!("expected a boolean, got {other}"))),
     }
+}
+
+/// Deserialize a required model id, trimmed. A blank id is rejected while the
+/// arguments are decoded, so no tool takes a job slot or calls upstream for it.
+pub(crate) fn de_model_id<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let model = String::deserialize(d)?;
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err(serde::de::Error::custom(
+            "model is required: an exact id such as \"author/slug\" (list_models finds one)",
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Deserialize a required `bool`, tolerating stringified booleans.
@@ -242,14 +259,31 @@ pub(crate) fn require_all(tool: &str, modality: &str, missing: &[&str]) -> Resul
     if missing.is_empty() {
         return Ok(());
     }
-    Err(ErrorData::invalid_params(
+    Err(missing_params(tool, modality, missing))
+}
+
+/// One required text argument, returned as given. Absent or blank fails with
+/// the [`require_all`] message naming `param`.
+pub(crate) fn require_text(
+    tool: &str,
+    modality: &str,
+    param: &str,
+    value: Option<String>,
+) -> Result<String, ErrorData> {
+    value
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| missing_params(tool, modality, &[param]))
+}
+
+fn missing_params(tool: &str, modality: &str, missing: &[&str]) -> ErrorData {
+    ErrorData::invalid_params(
         format!(
             "{tool} has no defaults - specify every parameter explicitly. Missing: {}. \
              Use list_models with output_modalities=\"{modality}\" to choose a model.",
             missing.join("; ")
         ),
         None,
-    ))
+    )
 }
 
 /// The generated tool-args schema of `T` as a plain JSON value (rmcp's
@@ -472,6 +506,20 @@ mod tests {
         let r =
             std::panic::catch_unwind(|| super::assert_client_safe_schema(&bad_value, "BadValue"));
         assert!(r.is_err(), "Option<Value> must be rejected: {bad_value}");
+    }
+
+    #[test]
+    fn de_model_id_trims_and_rejects_a_blank_id() {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            #[serde(deserialize_with = "super::de_model_id")]
+            model: String,
+        }
+        let parse =
+            |model: &str| serde_json::from_value::<Args>(serde_json::json!({"model": model}));
+        assert_eq!(parse(" openai/gpt-5 ").unwrap().model, "openai/gpt-5");
+        let err = parse("  ").err().expect("blank model must fail");
+        assert!(err.to_string().contains("model is required"), "{err}");
     }
 
     #[test]

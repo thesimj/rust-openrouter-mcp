@@ -65,12 +65,13 @@ impl OpenRouterClient {
     /// token-based `/models` pricing object (which is `0` for video).
     pub async fn video_model_detail(&self, model_id: &str) -> Result<Option<Value>> {
         let rb = self.request(Method::GET, "/videos/models");
-        let body: Value = self.send_json(rb, "/videos/models").await?;
-        let found = body.get("data").and_then(Value::as_array).and_then(|arr| {
-            arr.iter()
-                .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
-                .cloned()
-        });
+        let mut body: Value = self.send_json(rb, "/videos/models").await?;
+        let found = match body.get_mut("data").map(Value::take) {
+            Some(Value::Array(models)) => models
+                .into_iter()
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id)),
+            _ => None,
+        };
         Ok(found)
     }
 
