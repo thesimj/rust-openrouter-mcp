@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0
 
 `transcribe_audio` saves long transcripts to disk (requested after a run of
 14 diarized 19-minute chunks returned about 322 KB each):
