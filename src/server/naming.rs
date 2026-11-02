@@ -11,7 +11,7 @@
 //! regardless of the server process's working directory - which is undefined in
 //! the Claude Desktop / `.mcpb` runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use std::hash::{Hash, Hasher};
@@ -23,6 +23,7 @@ pub(crate) enum MediaKind {
     Video,
     Audio,
     Music,
+    Transcript,
 }
 
 impl MediaKind {
@@ -32,6 +33,7 @@ impl MediaKind {
             MediaKind::Video => "vid",
             MediaKind::Audio => "aud",
             MediaKind::Music => "mus",
+            MediaKind::Transcript => "transcript",
         }
     }
 }
@@ -132,9 +134,22 @@ pub(crate) fn resolve_output_base(
     config: &[&str],
     seed: Option<u64>,
 ) -> PathBuf {
+    resolve_output_base_in(&output_dir(), output, kind, model, config, seed)
+}
+
+/// [`resolve_output_base`] with the auto-named file under `dir`, for a caller
+/// that read [`output_dir`] once at startup.
+pub(crate) fn resolve_output_base_in(
+    dir: &Path,
+    output: Option<String>,
+    kind: MediaKind,
+    model: &str,
+    config: &[&str],
+    seed: Option<u64>,
+) -> PathBuf {
     match output {
         Some(o) if !o.trim().is_empty() => PathBuf::from(o),
-        _ => output_dir().join(auto_base_name(kind, model, config, seed, Utc::now())),
+        _ => dir.join(auto_base_name(kind, model, config, seed, Utc::now())),
     }
 }
 
@@ -206,6 +221,23 @@ mod tests {
             n.starts_with("mus_20260617-172245_lyria-3-clip-preview_mp3_"),
             "{n}"
         );
+    }
+
+    #[test]
+    fn transcript_has_its_own_prefix_under_the_given_directory() {
+        let dir = PathBuf::from("/tmp/transcripts");
+        let p = resolve_output_base_in(
+            &dir,
+            None,
+            MediaKind::Transcript,
+            "elevenlabs/scribe-v2",
+            &[],
+            None,
+        );
+        assert_eq!(p.parent(), Some(dir.as_path()));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("transcript_"), "{name}");
+        assert!(name.contains("_scribe-v2_"), "{name}");
     }
 
     #[test]

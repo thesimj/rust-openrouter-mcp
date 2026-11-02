@@ -53,6 +53,8 @@ pub struct OpenRouterServer {
     /// model that does not take it before the chat call. See
     /// `chat::input_modalities` for the lookup rules.
     pub(crate) model_caps: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    /// When `transcribe_audio` saves a response the caller did not ask to save.
+    pub(crate) transcript_auto_save: audio::TranscriptAutoSave,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -80,6 +82,7 @@ impl OpenRouterServer {
             work: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SYNC_CALLS)),
             stats: UsageStats::new(),
             model_caps: Default::default(),
+            transcript_auto_save: audio::TranscriptAutoSave::from_env(),
             tool_router: Self::models_router()
                 + Self::image_router()
                 + Self::video_router()

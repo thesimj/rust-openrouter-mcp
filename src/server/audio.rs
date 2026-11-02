@@ -1,6 +1,9 @@
 //! The `generate_audio` (text-to-speech) and `transcribe_audio` (speech-to-text)
 //! tools and their argument structs.
 
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 use rmcp::{
     ErrorData, RoleServer,
     handler::server::wrapper::Parameters,
@@ -10,9 +13,11 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
-use crate::audio_gen::{self, SpeechGenRequest};
+use crate::audio_gen::{self, SpeechGenRequest, TranscribeResult};
+use crate::billing::Receipt;
+use crate::openrouter::HttpFailure;
 use crate::server::naming;
 use crate::server::provider::AudioProviderArgs;
 use crate::server::result::{
@@ -20,8 +25,9 @@ use crate::server::result::{
     invalid_params_from, json_text_result,
 };
 use crate::server::schema::{
-    RequireFields, de_lenient, de_opt_f64, non_blank, require_text, scalarize_nullable,
+    RequireFields, de_bool, de_lenient, de_opt_f64, non_blank, require_text, scalarize_nullable,
 };
+use crate::{output, transcript};
 
 use super::OpenRouterServer;
 use super::media;
@@ -50,27 +56,73 @@ pub(crate) struct TranscribeAudioArgs {
     /// Optional ISO-639-1 language hint (e.g. "en", "ja"); improves accuracy.
     #[serde(default)]
     pub language: Option<String>,
-    /// "json" (default) or "verbose_json" (adds language/duration/segments/words -
-    /// OpenAI-compatible providers only; others reject it with a 400).
+    /// "json" (default) or "verbose_json" (adds language/duration/segments/words).
+    /// Support varies by model: e.g. microsoft/mai-transcribe-2 returns it, while
+    /// openai/gpt-4o-transcribe and microsoft/mai-transcribe-1.5 reject it with a
+    /// 400, as do providers without structured output.
     #[serde(default)]
     pub response_format: Option<String>,
-    /// "segment" and/or "word": per-segment/word timestamps. Only honored with
-    /// response_format="verbose_json" on an OpenAI-compatible provider.
+    /// "segment" and/or "word": per-segment/word timestamps. Ignored unless
+    /// response_format="verbose_json"; which fields come back varies by provider.
     #[serde(default)]
     pub timestamp_granularities: Vec<String>,
     /// Sampling temperature (select providers only).
     #[serde(default, deserialize_with = "de_opt_f64")]
     pub temperature: Option<f64>,
     /// Provider block for this request: {"zdr": bool, "data_collection":
-    /// "allow"|"deny", "options": {"<provider-slug>": {...}}}; describe_model lists each
-    /// endpoint's allowed_passthrough_parameters. Only the slug that serves the
-    /// request is forwarded. Speaker diarization:
-    /// {"options": {"deepgram": {"diarize": true}}} or
-    /// {"options": {"azure": {"diarization": {"enabled": true}}}}; with
-    /// response_format="verbose_json" the segments/words then carry a "speaker"
-    /// index. Groq takes vocabulary hints as {"options": {"groq": {"prompt": "..."}}}.
+    /// "allow"|"deny", "options": {"<provider-slug>": {...}}}. The slug is the
+    /// endpoint `tag` that describe_model reports (e.g. "azure", "deepgram",
+    /// "elevenlabs"). Only the slug that serves the request is forwarded, under
+    /// that provider's own field names. Speaker diarization:
+    /// {"options": {"deepgram": {"diarize": true}}},
+    /// {"options": {"azure": {"diarization": {"enabled": true}}}} or
+    /// {"options": {"elevenlabs": {"diarize": true}}}; with
+    /// response_format="verbose_json" the segments and/or words then carry a
+    /// "speaker" index, depending on the provider (ElevenLabs labels words only).
+    /// Groq takes vocabulary hints as {"options": {"groq": {"prompt": "..."}}}.
     #[serde(default, deserialize_with = "de_lenient")]
     pub provider: AudioProviderArgs,
+    /// Save the full response body to this path as pretty-printed JSON (the
+    /// extension is forced to .json) and return a compact summary in place of
+    /// the response. When the call fails, the error is saved beside it as
+    /// <stem>.error.json. Optional: without it, a response larger than
+    /// OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX bytes (default 65536) is auto-saved
+    /// under OPENROUTER_MCP_OUTPUT_DIR and summarized the same way; smaller ones
+    /// are returned inline.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// With a saved response, also return the plain transcript text inline as
+    /// its own content block. Default false.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub include_text: bool,
+    /// Add a "turns" array of {speaker, start, end, text} to the response,
+    /// built from its words: a new turn starts when the speaker changes or
+    /// after a pause longer than 4 s. Needs word timestamps
+    /// (response_format="verbose_json"). Default false.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub normalize: bool,
+}
+
+/// Default of env `OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX`.
+const DEFAULT_TRANSCRIPT_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// When `transcribe_audio` saves a response the caller gave no `output` for,
+/// and where. Read once when the server starts.
+#[derive(Debug, Clone)]
+pub(crate) struct TranscriptAutoSave {
+    /// A larger inline reply is saved and summarized instead.
+    pub inline_max_bytes: usize,
+    pub dir: PathBuf,
+}
+
+impl TranscriptAutoSave {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            inline_max_bytes: crate::settings::env_number("OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX")
+                .unwrap_or(DEFAULT_TRANSCRIPT_INLINE_MAX_BYTES),
+            dir: naming::output_dir(),
+        }
+    }
 }
 
 /// Arguments for the `generate_audio` tool.
@@ -251,54 +303,273 @@ impl OpenRouterServer {
         by provider), with a local 25 MiB limit for both paths and inline data. An optional `language` \
         hint (ISO-639-1, e.g. \"en\") improves accuracy. Returns the transcript text by default \
         (response_format=\"json\"). Set response_format=\"verbose_json\" to get the full \
-        response object (language, duration, segments, words, ...) instead - this needs an \
-        OpenAI-compatible provider; other providers reject it with a 400. When OpenRouter \
+        response object (language, duration, segments, words, usage, ...) instead; support \
+        varies by model (e.g. microsoft/mai-transcribe-2 returns it, while \
+        openai/gpt-4o-transcribe and microsoft/mai-transcribe-1.5 reject it with a 400). \
+        microsoft/mai-transcribe-2 accepts only wav, mp3 and flac. OpenRouter documents a \
+        60-second upstream timeout per request, so split long recordings. When OpenRouter \
         reports a generation id, a second block carries {\"generation_id\"} for \
         get_generation. \
-        timestamp_granularities (\"segment\"/\"word\") is only honored alongside verbose_json on \
-        an OpenAI-compatible provider. `provider.zdr` and `provider.data_collection` \
+        Set `output` to save the full response body as pretty JSON (extension forced to .json; a \
+        failed call leaves <stem>.error.json beside it) and get a compact summary back instead \
+        (saved path, bytes, cost, word and speaker counts, speaker_seconds, first/last word times, \
+        max_gap_s, a preview), plus the plain text when include_text=true; without `output`, a \
+        response over OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX bytes (default 65536) is auto-saved \
+        under OPENROUTER_MCP_OUTPUT_DIR and summarized the same way. normalize=true adds a \
+        `turns` array ({speaker, start, end, text}; a new turn on a speaker change or a pause over \
+        4 s) built from the verbose_json words. \
+        timestamp_granularities (\"segment\"/\"word\") is ignored unless \
+        response_format=\"verbose_json\". `provider.zdr` and `provider.data_collection` \
         (\"allow\"/\"deny\") restrict routing by data policy. Provider-specific settings go \
         in `provider.options` keyed \
-        by provider slug - e.g. speaker diarization with {\"deepgram\": {\"diarize\": true}} or \
-        {\"azure\": {\"diarization\": {\"enabled\": true}}}; when the provider diarizes, \
-        verbose_json segments and words carry a \"speaker\" index. Discover \
+        by provider slug (the endpoint `tag` from describe_model) - e.g. speaker diarization \
+        with {\"deepgram\": {\"diarize\": true}}, {\"azure\": {\"diarization\": {\"enabled\": \
+        true}}} or {\"elevenlabs\": {\"diarize\": true}}; when the provider diarizes, \
+        verbose_json segments and/or words carry a \"speaker\" index (Azure labels both, \
+        ElevenLabs only words). describe_model's supports_diarization is false for some models \
+        that do diarize (e.g. deepgram/nova-3, google/gemini-3.5-transcribe, \
+        x-ai/grok-stt-1.0), so do not rely on it. Discover \
         STT models with list_models using output_modalities=\"transcription\" - they are not in \
         the default model list. To create speech from text instead, use generate_audio.",
         annotations(
             title = "Transcribe Audio",
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
         )
     )]
     pub(crate) async fn transcribe_audio(
         &self,
-        Parameters(args): Parameters<TranscribeAudioArgs>,
+        Parameters(mut args): Parameters<TranscribeAudioArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let _work = self.admit_work()?;
+        let output = non_blank(args.output.take());
+        let options = TranscriptOptions {
+            include_text: args.include_text,
+            normalize: args.normalize,
+        };
         let req = resolve_transcribe_request(args).await?;
 
         let model = req.model.clone();
-        let outcome = audio_gen::transcribe(&self.client, req).await;
+        let output = output.map(|o| self.transcript_path(Some(o), &model));
+        let mut unsaved_error = None;
+        let outcome = match audio_gen::transcribe(&self.client, req).await {
+            Ok(result) => {
+                let receipt = Receipt {
+                    cost: result.cost,
+                    generation_id: result.generation_id.clone(),
+                };
+                self.deliver_transcript(result, &model, output, options)
+                    .await
+                    .map_err(|error| receipt.attach(error))
+            }
+            Err(error) => {
+                if let Some(path) = &output {
+                    unsaved_error = save_error_report(path, &error).await.err();
+                }
+                Err(error)
+            }
+        };
         self.finish_text_call(
             &model,
             outcome,
-            |r| r.cost,
-            |r| {
-                let mut result = match r.verbose {
-                    // verbose_json: return the full response object, not just text.
-                    Some(v) => json_text_result(&v)?,
-                    None => CallToolResult::success(vec![ContentBlock::text(r.text)]),
-                };
-                if let Some(id) = r.generation_id {
-                    let meta = serde_json::json!({ "generation_id": id });
-                    result.content.push(ContentBlock::text(meta.to_string()));
-                }
-                Ok(result)
-            },
+            |reply| reply.cost,
+            |reply| Ok(reply.result),
         )
         .await
+        .map_err(|mut error| {
+            if let Some(unsaved) = unsaved_error {
+                error.message = format!("{}; {unsaved:#}", error.message).into();
+            }
+            error
+        })
     }
+}
+
+/// How `transcribe_audio` shapes a reply, beyond where it saves it.
+#[derive(Debug, Clone, Copy)]
+struct TranscriptOptions {
+    include_text: bool,
+    normalize: bool,
+}
+
+/// A delivered transcription and its cost for the usage stats.
+struct TranscriptReply {
+    cost: Option<f64>,
+    result: CallToolResult,
+}
+
+const NO_WORDS_FOR_TURNS: &str = "normalize was requested but the response has no words to \
+     build turns from; request response_format=\"verbose_json\" (and word timestamps where the \
+     provider needs them)";
+
+impl OpenRouterServer {
+    /// The .json path a transcription is saved to: `output` as given, else an
+    /// auto-named file under the auto-save directory.
+    fn transcript_path(&self, output: Option<String>, model: &str) -> PathBuf {
+        naming::resolve_output_base_in(
+            &self.transcript_auto_save.dir,
+            output,
+            naming::MediaKind::Transcript,
+            model,
+            &[],
+            None,
+        )
+        .with_extension("json")
+    }
+
+    /// Save the response body and return its summary when the caller gave
+    /// `output` or the inline reply would exceed the auto-save limit;
+    /// otherwise return the reply inline as before.
+    async fn deliver_transcript(
+        &self,
+        result: TranscribeResult,
+        model: &str,
+        output: Option<PathBuf>,
+        options: TranscriptOptions,
+    ) -> anyhow::Result<TranscriptReply> {
+        let TranscribeResult {
+            text,
+            cost,
+            generation_id,
+            mut body,
+            verbose,
+            mut warnings,
+        } = result;
+        if options.normalize {
+            add_turns(&mut body, &mut warnings);
+        }
+        let (path, saved, note) = match output {
+            Some(path) => (path, serde_json::to_vec_pretty(&body)?, None),
+            None => {
+                let pretty_body = verbose
+                    .then(|| serde_json::to_vec_pretty(&body))
+                    .transpose()?;
+                let inline_bytes = pretty_body.as_ref().map_or(text.len(), Vec::len);
+                let limit = self.transcript_auto_save.inline_max_bytes;
+                if inline_bytes <= limit {
+                    let result = inline_transcript(text, body, verbose, warnings, generation_id)?;
+                    return Ok(TranscriptReply { cost, result });
+                }
+                let saved = match pretty_body {
+                    Some(saved) => saved,
+                    None => serde_json::to_vec_pretty(&body)?,
+                };
+                let note = format!(
+                    "auto-saved: the {inline_bytes}-byte response is larger than \
+                     OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX ({limit} bytes); pass output to \
+                     choose the path"
+                );
+                (self.transcript_path(None, model), saved, Some(note))
+            }
+        };
+        output::write_bytes(&path, &saved)
+            .await
+            .with_context(|| format!("could not save the transcription to {}", path.display()))?;
+
+        let mut summary = transcript::summarize(&body);
+        summary.insert("saved".into(), path.to_string_lossy().into());
+        summary.insert("bytes".into(), saved.len().into());
+        summary.insert("model".into(), model.into());
+        if let Some(id) = &generation_id {
+            summary.insert("generation_id".into(), id.as_str().into());
+        }
+        if !warnings.is_empty() {
+            summary.insert("warnings".into(), warnings.into());
+        }
+        if let Some(note) = note {
+            summary.insert("note".into(), note.into());
+        }
+        let mut content = vec![ContentBlock::text(serde_json::to_string_pretty(&summary)?)];
+        content.extend(generation_id_block(generation_id, Vec::new()));
+        if options.include_text {
+            content.push(ContentBlock::text(text));
+        }
+        Ok(TranscriptReply {
+            cost,
+            result: CallToolResult::success(content),
+        })
+    }
+}
+
+/// Add the `turns` built from the body's words, or say why there are none.
+fn add_turns(body: &mut Value, warnings: &mut Vec<String>) {
+    let turns = transcript::turns(body);
+    match body.as_object_mut() {
+        Some(fields) if !turns.is_empty() => {
+            fields.insert("turns".into(), turns.into());
+        }
+        _ => warnings.push(NO_WORDS_FOR_TURNS.to_string()),
+    }
+}
+
+/// The reply when nothing is saved: the transcript text, or the whole body
+/// for verbose_json, then the generation id block. Warnings ride in the
+/// verbose body, else in the generation id block.
+fn inline_transcript(
+    text: String,
+    mut body: Value,
+    verbose: bool,
+    warnings: Vec<String>,
+    generation_id: Option<String>,
+) -> anyhow::Result<CallToolResult> {
+    let (first, block_warnings) = if verbose {
+        append_warnings(&mut body, warnings);
+        (serde_json::to_string_pretty(&body)?, Vec::new())
+    } else {
+        (text, warnings)
+    };
+    let mut content = vec![ContentBlock::text(first)];
+    content.extend(generation_id_block(generation_id, block_warnings));
+    Ok(CallToolResult::success(content))
+}
+
+/// Add `warnings` to the body's `warnings` array, creating it when absent.
+/// A provider's own non-array `warnings` field is left untouched.
+fn append_warnings(body: &mut Value, warnings: Vec<String>) {
+    if warnings.is_empty() {
+        return;
+    }
+    let Some(fields) = body.as_object_mut() else {
+        return;
+    };
+    if let Value::Array(existing) = fields
+        .entry("warnings")
+        .or_insert_with(|| Value::Array(Vec::new()))
+    {
+        existing.extend(warnings.into_iter().map(Value::from));
+    }
+}
+
+/// The `{"generation_id"}` block for get_generation, carrying `warnings`
+/// when there are any; `None` when there is nothing to carry.
+fn generation_id_block(
+    generation_id: Option<String>,
+    warnings: Vec<String>,
+) -> Option<ContentBlock> {
+    let mut meta = Map::new();
+    if let Some(id) = generation_id {
+        meta.insert("generation_id".into(), id.into());
+    }
+    if !warnings.is_empty() {
+        meta.insert("warnings".into(), warnings.into());
+    }
+    (!meta.is_empty()).then(|| ContentBlock::text(Value::Object(meta).to_string()))
+}
+
+/// Write `<stem>.error.json` beside the transcript path: the error message,
+/// plus the HTTP status and (truncated) body when OpenRouter answered with
+/// an error status.
+async fn save_error_report(transcript: &Path, error: &anyhow::Error) -> anyhow::Result<()> {
+    let mut report = json!({ "error": format!("{error:#}") });
+    if let Some(failure) = error.downcast_ref::<HttpFailure>() {
+        report["status"] = failure.status.as_u16().into();
+        report["body"] = failure.body.as_str().into();
+    }
+    let path = transcript.with_extension("error.json");
+    output::write_bytes(&path, &serde_json::to_vec_pretty(&report)?)
+        .await
+        .with_context(|| format!("could not save the error to {}", path.display()))
 }
 
 /// Resolve `transcribe_audio` arguments to a [`audio_gen::TranscribeRequest`]:
@@ -471,6 +742,9 @@ mod tests {
                 timestamp_granularities: vec![],
                 temperature: None,
                 provider: Default::default(),
+                output: None,
+                include_text: false,
+                normalize: false,
             }))
             .await
             .unwrap();
@@ -501,6 +775,9 @@ mod tests {
                 timestamp_granularities: vec![],
                 temperature: None,
                 provider: Default::default(),
+                output: None,
+                include_text: false,
+                normalize: false,
             })
         };
 
@@ -593,6 +870,9 @@ mod tests {
                 timestamp_granularities: vec!["word".to_string(), "segment".to_string()],
                 temperature: None,
                 provider: Default::default(),
+                output: None,
+                include_text: false,
+                normalize: false,
             }))
             .await
             .unwrap();
@@ -639,6 +919,9 @@ mod tests {
                 timestamp_granularities: vec![],
                 temperature: None,
                 provider: Default::default(),
+                output: None,
+                include_text: false,
+                normalize: false,
             }))
             .await
             .unwrap();
@@ -772,6 +1055,9 @@ mod tests {
             timestamp_granularities: vec![],
             temperature: None,
             provider,
+            output: None,
+            include_text: false,
+            normalize: false,
         };
         server
             .transcribe_audio(Parameters(args(provider)))
@@ -985,5 +1271,463 @@ mod tests {
         args.voice_reference.base64 = Some("not base64!".to_string());
         let err = server.run_generate_audio(args, false).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    /// A mock transcription endpoint that answers every request with `body`
+    /// and the generation id "gen-stt".
+    async fn mock_transcription(body: serde_json::Value) -> MockServer {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "gen-stt")
+                    .set_body_json(body),
+            )
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    /// verbose_json arguments for inline MP3 audio, saved to `output` when given.
+    fn verbose_args(output: Option<&std::path::Path>) -> TranscribeAudioArgs {
+        TranscribeAudioArgs {
+            model: "elevenlabs/scribe-v2".to_string(),
+            path: None,
+            base64: Some("data:audio/mp3;base64,QUJD".to_string()),
+            format: None,
+            language: None,
+            response_format: Some("verbose_json".to_string()),
+            timestamp_granularities: vec![],
+            temperature: None,
+            provider: Default::default(),
+            output: output.map(|p| p.to_string_lossy().into_owned()),
+            include_text: false,
+            normalize: false,
+        }
+    }
+
+    /// The ElevenLabs Scribe shape: speakers on the words only, one segment
+    /// with no speaker.
+    fn scribe_body() -> serde_json::Value {
+        serde_json::json!({
+            "text": "hello there friend",
+            "language": "eng",
+            "duration": 4.0,
+            "segments": [{"id": 0, "start": 0.0, "end": 4.0, "text": "hello there friend"}],
+            "words": [
+                {"word": "hello", "start": 0.0, "end": 0.5, "speaker": 0, "type": "word"},
+                {"word": "there", "start": 0.6, "end": 1.0, "speaker": 0, "type": "word"},
+                {"word": "friend", "start": 3.0, "end": 4.0, "speaker": 1, "type": "word"}
+            ],
+            "usage": {"cost": 0.0717, "seconds": 4.0}
+        })
+    }
+
+    /// The content blocks of a tool result, as JSON.
+    fn content_blocks(res: &CallToolResult) -> Vec<serde_json::Value> {
+        serde_json::to_value(res).unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_with_output_writes_the_raw_response_and_returns_a_summary() {
+        let mock = mock_transcription(scribe_body()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("chunk0.scribe.json");
+        let server = server_for(mock.uri());
+        let res = server
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+
+        assert_eq!(read_json(&out), scribe_body());
+        let summary = tool_result_json(&res);
+        assert_eq!(summary["saved"], out.to_string_lossy().as_ref());
+        assert_eq!(summary["bytes"], std::fs::metadata(&out).unwrap().len());
+        assert_eq!(summary["model"], "elevenlabs/scribe-v2");
+        assert_eq!(summary["generation_id"], "gen-stt");
+        assert_eq!(summary["cost"], 0.0717);
+        assert_eq!(summary["usage_seconds"], 4.0);
+        assert_eq!(summary["words"], 3, "a count, not the word list");
+        assert_eq!(summary["segments"], 1);
+        assert_eq!(summary["speakers"], serde_json::json!([0, 1]));
+        assert!(summary.get("text").is_none(), "{summary}");
+        let blocks = content_blocks(&res);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[1]["text"], r#"{"generation_id":"gen-stt"}"#);
+
+        let stats = tool_result_json(&server.get_usage_stats().await.unwrap());
+        assert_eq!(stats["text_generations"], 1);
+        assert_eq!(stats["actual_cost_usd"], 0.0717);
+    }
+
+    /// The saved file keeps the provider's key order, not alphabetical order,
+    /// so it reads like the response OpenRouter sent.
+    #[tokio::test]
+    async fn transcribe_audio_output_keeps_the_provider_key_order() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"text":"hi","words":[{"word":"hi","start":0.0,"end":0.5}],"usage":{"seconds":0.5,"cost":0.01}}"#,
+                "application/json",
+            ))
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("ordered.json");
+        server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+
+        let saved = std::fs::read_to_string(&out).unwrap();
+        let expected = r#"{
+  "text": "hi",
+  "words": [
+    {
+      "word": "hi",
+      "start": 0.0,
+      "end": 0.5
+    }
+  ],
+  "usage": {
+    "seconds": 0.5,
+    "cost": 0.01
+  }
+}"#;
+        assert_eq!(saved, expected);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_summary_reads_speakers_from_words_when_segments_have_none() {
+        let mock = mock_transcription(scribe_body()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("scribe.json");
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+        let summary = tool_result_json(&res);
+        assert_eq!(summary["speakers"], serde_json::json!([0, 1]));
+        assert_eq!(
+            summary["speaker_seconds"],
+            serde_json::json!({"0": 0.9, "1": 1.0})
+        );
+        assert_eq!(summary["first_word_s"], 0.0);
+        assert_eq!(summary["last_word_s"], 4.0);
+        assert_eq!(summary["max_gap_s"], 2.0);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_summary_reads_speakers_from_segments() {
+        let mock = mock_transcription(serde_json::json!({
+            "text": "hello there",
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.5, "text": "hello", "speaker": 0},
+                {"id": 1, "start": 1.5, "end": 4.0, "text": "there", "speaker": 1}
+            ],
+            "words": [
+                {"word": "hello", "start": 0.0, "end": 1.5},
+                {"word": "there", "start": 1.5, "end": 4.0}
+            ]
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("azure.json");
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+        let summary = tool_result_json(&res);
+        assert_eq!(summary["speakers"], serde_json::json!([0, 1]));
+        assert_eq!(
+            summary["speaker_seconds"],
+            serde_json::json!({"0": 1.5, "1": 2.5})
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_summary_omits_speakers_without_diarization() {
+        let mock = mock_transcription(serde_json::json!({
+            "text": "hello",
+            "segments": [{"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}],
+            "words": [{"word": "hello", "start": 0.0, "end": 0.5}]
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("plain.json");
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+        let summary = tool_result_json(&res);
+        assert_eq!(summary["words"], 1);
+        assert!(summary.get("speakers").is_none(), "{summary}");
+        assert!(summary.get("speaker_seconds").is_none(), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_output_creates_parent_dirs_and_forces_json_extension() {
+        let mock = mock_transcription(scribe_body()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a/b/chunk0.txt");
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+        let saved = dir.path().join("a/b/chunk0.json");
+        assert_eq!(
+            tool_result_json(&res)["saved"],
+            saved.to_string_lossy().as_ref()
+        );
+        assert_eq!(read_json(&saved), scribe_body());
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_include_text_returns_text_inline_with_the_summary() {
+        let mock = mock_transcription(scribe_body()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = verbose_args(Some(&dir.path().join("chunk.json")));
+        args.include_text = true;
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(args))
+            .await
+            .unwrap();
+        let blocks = content_blocks(&res);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(tool_result_json(&res)["saved"].is_string());
+        assert_eq!(blocks[1]["text"], r#"{"generation_id":"gen-stt"}"#);
+        assert_eq!(blocks[2]["text"], "hello there friend");
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_error_with_output_saves_error_json_and_returns_the_error() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"message":"upstream overloaded"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("chunk0.scribe.json");
+        let server = server_for(mock.uri());
+        let err = server
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("503"), "got: {}", err.message);
+        assert!(
+            !err.message.contains("could not save"),
+            "got: {}",
+            err.message
+        );
+
+        assert!(!out.exists());
+        let report = read_json(&dir.path().join("chunk0.scribe.error.json"));
+        assert_eq!(report["error"], err.message.as_ref());
+        assert_eq!(report["status"], 503);
+        assert_eq!(
+            report["body"],
+            r#"{"error":{"message":"upstream overloaded"}}"#
+        );
+        assert_eq!(server.stats.snapshot()["requests_failed"], 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_error_keeps_the_original_error_when_the_error_file_fails() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the parent directory should be.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        let server = server_for(mock.uri());
+        let err = server
+            .transcribe_audio(Parameters(verbose_args(Some(&blocker.join("chunk.json")))))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message
+                .starts_with("OpenRouter /audio/transcriptions returned 503"),
+            "got: {}",
+            err.message
+        );
+        assert!(err.message.contains("overloaded"), "got: {}", err.message);
+        assert!(
+            err.message.contains("chunk.error.json"),
+            "got: {}",
+            err.message
+        );
+        assert_eq!(server.stats.snapshot()["requests_failed"], 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_without_output_stays_inline_below_the_limit() {
+        let mock = mock_transcription(serde_json::json!({
+            "text": "short clip", "usage": {"cost": 0.001}
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = server_for(mock.uri());
+        server.transcript_auto_save = TranscriptAutoSave {
+            inline_max_bytes: "short clip".len(),
+            dir: dir.path().to_path_buf(),
+        };
+        let mut args = verbose_args(None);
+        args.response_format = None;
+        let res = server.transcribe_audio(Parameters(args)).await.unwrap();
+        let blocks = content_blocks(&res);
+        assert_eq!(blocks[0]["text"], "short clip");
+        assert_eq!(blocks[1]["text"], r#"{"generation_id":"gen-stt"}"#);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_without_output_auto_saves_above_the_limit() {
+        let body = serde_json::json!({ "text": "short clip", "usage": {"cost": 0.001} });
+        let mock = mock_transcription(body.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = server_for(mock.uri());
+        server.transcript_auto_save = TranscriptAutoSave {
+            inline_max_bytes: "short clip".len() - 1,
+            dir: dir.path().to_path_buf(),
+        };
+        let mut args = verbose_args(None);
+        args.response_format = None;
+        let res = server.transcribe_audio(Parameters(args)).await.unwrap();
+        let summary = tool_result_json(&res);
+        let saved = std::path::PathBuf::from(summary["saved"].as_str().unwrap());
+        assert_eq!(saved.parent(), Some(dir.path()));
+        let name = saved.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("transcript_"), "{name}");
+        assert!(name.ends_with(".json"), "{name}");
+        assert_eq!(read_json(&saved), body);
+        let note = summary["note"].as_str().unwrap();
+        assert!(note.contains("auto-saved"), "{note}");
+        assert!(
+            note.contains("OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_saves_cyrillic_text_unescaped() {
+        let body = serde_json::json!({
+            "text": "Чи були твого агента",
+            "words": [{"word": "Чи", "start": 0.0, "end": 0.3, "speaker": 0}]
+        });
+        let mock = mock_transcription(body.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("uk.json");
+        let res = server_for(mock.uri())
+            .transcribe_audio(Parameters(verbose_args(Some(&out))))
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        assert!(raw.contains("Чи були твого агента"), "{raw}");
+        assert!(!raw.contains("\\u"), "{raw}");
+        assert_eq!(read_json(&out), body);
+        assert_eq!(tool_result_json(&res)["preview"], "Чи були твого агента");
+    }
+
+    /// The ignored-verbose_json warning stays on the inline object, as before,
+    /// but goes to the summary, not the file, when the body is saved.
+    #[tokio::test]
+    async fn transcribe_audio_puts_the_ignored_verbose_json_warning_beside_the_body() {
+        let body = serde_json::json!({ "text": "hi", "usage": {"cost": 0.001} });
+        let mock = mock_transcription(body.clone()).await;
+        let server = server_for(mock.uri());
+
+        let inline = tool_result_json(
+            &server
+                .transcribe_audio(Parameters(verbose_args(None)))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inline["text"], "hi");
+        assert!(inline["warnings"][0].as_str().unwrap().contains("ignored"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hi.json");
+        let summary = tool_result_json(
+            &server
+                .transcribe_audio(Parameters(verbose_args(Some(&out))))
+                .await
+                .unwrap(),
+        );
+        assert!(summary["warnings"][0].as_str().unwrap().contains("ignored"));
+        assert_eq!(read_json(&out), body);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_normalize_adds_turns_to_the_saved_file_and_the_inline_object() {
+        let mock = mock_transcription(scribe_body()).await;
+        let server = server_for(mock.uri());
+        let expected = serde_json::json!([
+            {"speaker": 0, "start": 0.0, "end": 1.0, "text": "hello there"},
+            {"speaker": 1, "start": 3.0, "end": 4.0, "text": "friend"}
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("turns.json");
+        let mut args = verbose_args(Some(&out));
+        args.normalize = true;
+        let summary = tool_result_json(&server.transcribe_audio(Parameters(args)).await.unwrap());
+        assert!(summary.get("warnings").is_none(), "{summary}");
+        assert_eq!(read_json(&out)["turns"], expected);
+
+        let mut args = verbose_args(None);
+        args.normalize = true;
+        let inline = tool_result_json(&server.transcribe_audio(Parameters(args)).await.unwrap());
+        assert_eq!(inline["turns"], expected);
+        assert!(inline["words"].is_array());
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_normalize_without_words_warns() {
+        let mock = mock_transcription(serde_json::json!({ "text": "hi" })).await;
+        let server = server_for(mock.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("no-words.json");
+        let mut args = verbose_args(Some(&out));
+        args.response_format = None;
+        args.normalize = true;
+        let summary = tool_result_json(&server.transcribe_audio(Parameters(args)).await.unwrap());
+        assert!(
+            summary["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("normalize")
+        );
+        assert!(read_json(&out).get("turns").is_none());
+
+        let mut args = verbose_args(None);
+        args.response_format = None;
+        args.normalize = true;
+        let res = server.transcribe_audio(Parameters(args)).await.unwrap();
+        let blocks = content_blocks(&res);
+        assert_eq!(blocks[0]["text"], "hi");
+        let meta: serde_json::Value =
+            serde_json::from_str(blocks[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["generation_id"], "gen-stt");
+        assert!(meta["warnings"][0].as_str().unwrap().contains("normalize"));
     }
 }

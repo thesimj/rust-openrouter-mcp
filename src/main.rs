@@ -24,6 +24,7 @@ mod server;
 mod settings;
 mod stats;
 mod tasks;
+mod transcript;
 mod video_gen;
 
 #[tokio::main]

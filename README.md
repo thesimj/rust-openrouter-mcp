@@ -105,7 +105,7 @@ Generic MCP client config:
 | `generate_video` | Text-, image- or reference-to-video. Required: `model`, `duration`, `with_audio`. `prompt` is optional when a frame or reference is given. Optional `resolution`, `aspect_ratio`, `size`, `seed`, `creativity`, `upscale_factor`. Almost always returns a `task_id` (after `wait_seconds`, default 20); poll `get_result`. |
 | `generate_audio` | Text-to-speech. `voice` is model-specific. Voice cloning: pass a sample as `voice_reference` plus an optional transcript. |
 | `generate_music` | Text-to-music with Google Lyria. Returns the track, the lyrics text, and the per-track cost. |
-| `transcribe_audio` | Speech-to-text from a file or base64. Optional `language`, `response_format: "verbose_json"` with `timestamp_granularities`, and speaker labels via `provider.options`. |
+| `transcribe_audio` | Speech-to-text from a file or base64. Optional `language`, `response_format: "verbose_json"` with `timestamp_granularities`, and speaker labels via `provider.options`. `output` saves the full response as JSON and returns a summary. `normalize` adds speaker `turns`. |
 | `chat_completion` | Send a prompt to any chat model. Attach `images`, `files`, `audio`, `videos`. Ask for `json_mode` or a `json_schema`. Turn on `web_search`. Control sampling and reasoning. |
 | `describe_image` | Describe one or more images with a vision model. |
 | `embed_text` | Float vectors for a list of texts. |
@@ -225,6 +225,7 @@ defaults.
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | Your OpenRouter key. | required |
 | `OPENROUTER_MCP_OUTPUT_DIR` | Where generated files land when you give no `output` path. | `$HOME/Downloads/openrouter-mcp`, else the system temp dir |
+| `OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX` | Largest `transcribe_audio` reply, in bytes, returned inline when you give no `output` path. A larger reply is saved under `OPENROUTER_MCP_OUTPUT_DIR`, and the tool returns a summary. | `65536` |
 | `OPENROUTER_MCP_IMAGE_PREVIEWS` | Embed previews of generated media in tool results: `auto`, `always`, `never`. `auto` embeds for every client except Claude Code, which can open the saved file itself. | `auto` |
 | `OPENROUTER_IMAGE_MAX_DIMENSION` | Longest side, in pixels, that input images are scaled down to before upload. Hard ceiling 4096. | `1536` |
 | `OPENROUTER_VIDEO_POLL_INTERVAL` | Seconds between video status checks. | `5` |

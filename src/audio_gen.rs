@@ -68,22 +68,29 @@ pub struct TranscribeRequest {
     pub language: Option<String>,
     /// "json" (default, when `None`) or "verbose_json".
     pub response_format: Option<String>,
-    /// "segment"/"word"; verbose_json + OpenAI-compatible providers only.
+    /// "segment"/"word"; ignored unless `response_format` is "verbose_json".
     pub timestamp_granularities: Vec<String>,
     pub temperature: Option<f64>,
     /// Data policy and per-provider passthrough, already validated.
     pub provider: Option<AudioProvider>,
 }
 
-/// A transcript plus the reported USD cost, when present. `verbose` carries the
-/// full response object (language/duration/segments/words/...) only when
-/// `response_format` was "verbose_json"; the default path leaves it `None`.
+/// A transcript plus the reported USD cost, when present, and the response
+/// body as OpenRouter returned it.
 pub struct TranscribeResult {
     pub text: String,
     pub cost: Option<f64>,
     /// OpenRouter's `X-Generation-Id` header, when the response carried one.
     pub generation_id: Option<String>,
-    pub verbose: Option<serde_json::Value>,
+    /// The full response body for either format: `{text, usage}` for "json",
+    /// plus language/duration/segments/words/... for "verbose_json".
+    pub body: serde_json::Value,
+    /// Whether "verbose_json" was requested, so the caller is owed the whole
+    /// body rather than just `text`.
+    pub verbose: bool,
+    /// Problems found in the response, such as a provider that ignored
+    /// verbose_json. Kept out of `body`.
+    pub warnings: Vec<String>,
 }
 
 /// Read a local audio file into `(base64, format)` for [`TranscribeRequest`],
@@ -267,38 +274,30 @@ pub async fn transcribe(
     if text.trim().is_empty() {
         return Err(receipt.attach(anyhow::anyhow!("model returned an empty transcript")));
     }
-    let mut verbose = (response_format.as_deref() == Some("verbose_json")).then_some(raw);
+    let verbose = response_format.as_deref() == Some("verbose_json");
+    let mut warnings = Vec::new();
     // A provider that silently ignores verbose_json returns the bare json
     // shape; say so instead of handing back an object missing the promised
     // fields with no signal.
-    if let Some(v) = verbose.as_mut()
-        && v.get("segments").is_none()
-        && v.get("words").is_none()
-        && v.get("duration").is_none()
-        && v.get("language").is_none()
-        && let Some(map) = v.as_object_mut()
+    if verbose
+        && ["segments", "words", "duration", "language"]
+            .iter()
+            .all(|field| raw.get(field).is_none())
     {
-        let msg = serde_json::Value::String(
+        warnings.push(
             "verbose_json was requested but the response carries none of \
              segments/words/duration/language - the provider likely ignored it \
-             (verbose_json needs an OpenAI-compatible provider)"
+             (support for verbose_json varies by model)"
                 .to_string(),
         );
-        // The repo-wide warnings shape is a JSON array; append rather than
-        // clobber in case a provider ever emits its own warnings field.
-        match map.get_mut("warnings") {
-            Some(serde_json::Value::Array(a)) => a.push(msg),
-            Some(_) => {} // foreign non-array field: leave it untouched
-            None => {
-                map.insert("warnings".to_string(), serde_json::Value::Array(vec![msg]));
-            }
-        }
     }
     Ok(TranscribeResult {
         text,
         cost,
         generation_id,
+        body: raw,
         verbose,
+        warnings,
     })
 }
 
@@ -802,12 +801,8 @@ mod tests {
                 .unwrap();
             // The gate reads the same normalized value, so verbose output is
             // returned regardless of how the caller spelled/cased it.
-            assert!(
-                result.verbose.is_some(),
-                "input {input:?} got: {:?}",
-                result.verbose
-            );
-            assert_eq!(result.verbose.unwrap()["language"], "english");
+            assert!(result.verbose, "input {input:?}");
+            assert_eq!(result.body["language"], "english");
         }
     }
 
@@ -826,7 +821,7 @@ mod tests {
         let result = transcribe(&client, transcribe_req(Some("   "), &[]))
             .await
             .unwrap();
-        assert!(result.verbose.is_none());
+        assert!(!result.verbose);
 
         let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
             .body_json()
@@ -859,7 +854,8 @@ mod tests {
     }
 
     /// A provider that silently ignores verbose_json returns the bare json
-    /// shape; the verbose object must then carry an explicit warning.
+    /// shape; the result must then carry an explicit warning, kept out of the
+    /// response body so a saved body stays as the provider returned it.
     #[tokio::test]
     async fn transcribe_warns_when_the_provider_ignores_verbose_json() {
         let server = MockServer::start().await;
@@ -875,8 +871,9 @@ mod tests {
         let result = transcribe(&client, transcribe_req(Some("verbose_json"), &[]))
             .await
             .unwrap();
-        let v = result.verbose.expect("verbose object still returned");
-        let w = v["warnings"][0].as_str().expect("warnings array injected");
+        assert!(result.verbose, "verbose output is still returned");
+        assert!(result.body.get("warnings").is_none(), "{}", result.body);
+        let w = &result.warnings[0];
         assert!(w.contains("verbose_json"), "got: {w}");
         assert!(w.contains("ignored"), "got: {w}");
         assert!(w.contains("language"), "got: {w}");

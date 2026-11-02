@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+`transcribe_audio` saves long transcripts to disk (requested after a run of
+14 diarized 19-minute chunks returned about 322 KB each):
+
+- `output`: the tool saves the full response body as pretty UTF-8 JSON
+  (extension forced to `.json`) and returns a compact summary: saved path,
+  bytes, model, generation id, cost, `usage_seconds`, language, duration,
+  text, segment and word counts, `speakers`, `speaker_seconds`,
+  `first_word_s`, `last_word_s`, `max_gap_s` and a 300-character preview.
+  Speakers come from `words[].speaker` (else `speaker_label`), else from the
+  segments. `audio_event` entries do not count as words.
+- A failed call with `output` leaves `<stem>.error.json` beside it, with the
+  HTTP status and body when OpenRouter answered with an error status. The tool
+  returns the error as before.
+- `include_text`: with a saved response, the tool also returns the plain text.
+- `normalize`: adds a `turns` array (`speaker`, `start`, `end`, `text`) built
+  from the words. A new turn starts on a speaker change or after a pause of
+  more than 4 s.
+- Without `output`, a reply larger than `OPENROUTER_MCP_TRANSCRIPT_INLINE_MAX`
+  bytes (default 65536) is saved under `OPENROUTER_MCP_OUTPUT_DIR` and
+  summarized, with a note. Smaller replies do not change.
+- `read_only_hint` is now `false`, because the tool can write files.
+
+Tool description (checked against openapi.json and the STT guide on
+2026-11-02):
+
+- `verbose_json` support varies by model. It is not limited to
+  OpenAI-compatible providers: `microsoft/mai-transcribe-2` returns it, while
+  `openai/gpt-4o-transcribe` and `microsoft/mai-transcribe-1.5` reject it.
+- `timestamp_granularities` is ignored unless the format is `verbose_json`.
+- Adds the ElevenLabs diarization example `{"elevenlabs": {"diarize": true}}`,
+  the wav/mp3/flac limit of `microsoft/mai-transcribe-2`, and the documented
+  60 s upstream timeout. Notes that `supports_diarization` is `false` for some
+  models that do diarize.
+- The pointer to `allowed_passthrough_parameters` is gone: STT endpoints do
+  not report it.
+
+Dependencies:
+
+- `serde_json` enables `preserve_order` (adds `foldhash`), so a saved
+  transcript keeps the provider's key order. Every JSON reply now lists keys in
+  insertion order, not sorted by key.
+
 ## 0.14.1
 
 OpenRouter API changes (checked against openapi.json and the changelog on
